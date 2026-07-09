@@ -30,6 +30,16 @@ const AGENT_TYPE_ALIASES = new Map<string, string>([
   ["explore", "scout"],
 ]);
 
+const BRIDGE_ACCEPTANCE_CONFIG = {
+  level: "none",
+  reason:
+    "pi-tasks bridge manages task lifecycle and result propagation; do not require pi-subagents acceptance reports.",
+} as const;
+
+const BRIDGE_CONTROL_CONFIG = {
+  enabled: false,
+} as const;
+
 interface BridgeOptions {
   spawnTimeoutMs?: number;
 }
@@ -314,6 +324,15 @@ export function registerBridge(
       async: true,
       clarify: false,
       context: "fresh",
+      // pi-tasks has its own task/result contract and no channel for pi-subagents'
+      // structured acceptance gate. Without this override, async write-capable runs
+      // infer reviewed/checked acceptance and can pause on a missing
+      // `acceptance-report` even when the task itself succeeded.
+      acceptance: BRIDGE_ACCEPTANCE_CONFIG,
+      // TaskExecute is fire-and-forget orchestration, not an interactive subagent
+      // supervisor. Disable pi-subagents live control nudges so background tasks
+      // do not surface misleading 60s "needs attention" prompts through the bridge.
+      control: BRIDGE_CONTROL_CONFIG,
       ...(model ? { model } : {}),
       ...(maxTurns ? { turnBudget: { maxTurns } } : {}),
     };

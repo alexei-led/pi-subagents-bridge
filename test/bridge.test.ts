@@ -47,6 +47,12 @@ test("spawn forwards the normalized pi-tasks request and returns the launched ru
     async: true,
     clarify: false,
     context: "fresh",
+    acceptance: {
+      level: "none",
+      reason:
+        "pi-tasks bridge manages task lifecycle and result propagation; do not require pi-subagents acceptance reports.",
+    },
+    control: { enabled: false },
     model: "anthropic/claude-sonnet-4",
     turnBudget: { maxTurns: 5 },
   });
@@ -62,7 +68,7 @@ test("spawn forwards the normalized pi-tasks request and returns the launched ru
   assert.deepEqual(await reply, { success: true, data: { id: "run-1" } });
 });
 
-test("spawn supports documented aliases and keeps custom agent names unchanged", async () => {
+test("spawn supports documented aliases, keeps custom agent names unchanged, and disables pi-subagents acceptance/control gates", async () => {
   const cases = [
     { type: "general-purpose", expectedAgent: "delegate" },
     { type: "Explore", expectedAgent: "scout" },
@@ -85,6 +91,12 @@ test("spawn supports documented aliases and keeps custom agent names unchanged",
     assert.ok(isRecord(request));
     assert.ok(isRecord(request.params));
     assert.equal(request.params.agent, expectedAgent);
+    assert.deepEqual(request.params.acceptance, {
+      level: "none",
+      reason:
+        "pi-tasks bridge manages task lifecycle and result propagation; do not require pi-subagents acceptance reports.",
+    });
+    assert.deepEqual(request.params.control, { enabled: false });
 
     bus.emit(nbReplyChannel(String(request.requestId)), {
       version: 1,

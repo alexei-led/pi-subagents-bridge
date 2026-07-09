@@ -62,6 +62,8 @@ Bridge decisions:
 - Forward spawn as v1 RPC on `subagents:rpc:v1:request`.
 - Use v1 reply channel `subagents:rpc:v1:reply:<requestId>`.
 - Read async spawn id from `data.details.runId` first, then `data.details.asyncId`, with top-level fallbacks for resilience.
+- Override spawn acceptance to `{ level: "none", reason: ... }` because pi-tasks has no structured acceptance-report channel and should not inherit pi-subagents' async acceptance gate.
+- Override spawn control to `{ enabled: false }` because pi-tasks TaskExecute is queue-style background orchestration, not interactive subagent supervision.
 - Forward stop fire-and-forget using `{ id: agentId }`; pi-tasks ignores stop failures and expects local success.
 
 ## pi-subagents async completion payload

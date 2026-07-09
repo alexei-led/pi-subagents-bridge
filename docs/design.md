@@ -68,10 +68,18 @@ Reason:
    - `async: true`
    - `clarify: false`
    - `context: "fresh"`
+   - `acceptance: { level: "none", reason: ... }`
+   - `control: { enabled: false }`
    - optional `model`
    - optional `turnBudget.maxTurns`
 4. Bridge reads the returned run ID from `data.details.runId`, with `details.asyncId` and top-level fallbacks as backup.
 5. Bridge stores the run ID in `ownedRunIds` and replies to pi-tasks with `{ id: runId }`.
+
+Reason:
+
+- pi-tasks already owns task completion and result storage.
+- pi-subagents' async acceptance gate expects a structured `acceptance-report` that pi-tasks never asked for and does not consume.
+- pi-subagents' live `needs_attention` / `active_long_running` notices are useful in direct subagent supervision, but they are noisy and misleading in TaskExecute's fire-and-forget queue model.
 
 ### Stop
 

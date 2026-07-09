@@ -30,11 +30,15 @@ TaskExecute(task_ids=["1"])
 - `Explore` / `explore` → `scout`
 - anything else passes through unchanged
 
+Use an execution-capable agent type for execution tasks. Read-only agents such as `reviewer` are fine for read-only tasks, but they will not run builds, tests, or other commands just because the task prompt asks them to.
+
 ## Behavior
 
 - tracks only run IDs spawned through this bridge
 - ignores unrelated pi-subagents runs
 - keeps completion text from async-complete payloads
+- disables pi-subagents acceptance gates for TaskExecute runs
+- disables pi-subagents live control nudges for TaskExecute runs
 - stop is best-effort cancel
 
 ## Details
