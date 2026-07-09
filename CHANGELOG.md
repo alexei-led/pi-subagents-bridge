@@ -4,6 +4,12 @@
 
 - None.
 
+## 0.1.4 - 2026-07-09
+
+- Added a fallback completion poll so bridge-owned `TaskExecute` runs still update pi-tasks when the `subagent:async-complete` event is missed.
+- Read pi-subagents `status` result files to translate polled run completion into the same `subagents:completed` / `subagents:failed` events used by the normal async-complete path.
+- Added a regression test that exercises the status-poll fallback without relying on the async-complete event.
+
 ## 0.1.3 - 2026-07-09
 
 - Disabled pi-subagents acceptance gating for bridge-spawned `TaskExecute` runs so pi-tasks jobs no longer pause on missing `acceptance-report` output.

@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -23,6 +24,7 @@ const NB_REQUEST_CHANNEL = "subagents:rpc:v1:request";
 const NB_COMPLETE_EVENT = "subagent:async-complete";
 const NB_REPLY_PREFIX = "subagents:rpc:v1:reply:";
 const DEFAULT_SPAWN_TIMEOUT_MS = 24_000;
+const DEFAULT_COMPLETION_POLL_INTERVAL_MS = 2_000;
 
 const AGENT_TYPE_ALIASES = new Map<string, string>([
   ["general-purpose", "delegate"],
@@ -42,6 +44,7 @@ const BRIDGE_CONTROL_CONFIG = {
 
 interface BridgeOptions {
   spawnTimeoutMs?: number;
+  completionPollIntervalMs?: number;
 }
 
 type BridgeHost = Pick<ExtensionAPI, "events">;
@@ -173,7 +176,7 @@ function resolveAgentType(type: string): string {
 
 function requestNicobailonRpc<T>(
   events: BridgeHost["events"],
-  method: "spawn",
+  method: "spawn" | "status",
   params: Record<string, unknown>,
   timeoutMs: number,
   signal?: AbortSignal,
@@ -249,6 +252,41 @@ function normalizeSpawnOptions(raw: unknown): SpawnOptionsRaw | undefined {
   return isRecord(raw) ? raw : undefined;
 }
 
+function extractRpcText(reply: unknown): string | undefined {
+  return isRecord(reply) ? text(reply.text) : undefined;
+}
+
+function parseStatusState(statusText: string): string | undefined {
+  const match = /^State:\s+(.+)$/im.exec(statusText);
+  return match?.[1]?.trim().toLowerCase();
+}
+
+function parseResultPath(statusText: string): string | undefined {
+  const match = /^Result:\s+(.+)$/im.exec(statusText);
+  return match?.[1]?.trim();
+}
+
+function classifyStatusText(statusText: string): CompletionKind | undefined {
+  const state = parseStatusState(statusText);
+  if (!state) return undefined;
+  if (state === "paused" || state === "stopped") return "stopped";
+  if (state === "failed" || state === "aborted") return "failed";
+  if (state === "complete") return "completed";
+  return undefined;
+}
+
+function readResultPayload(
+  resultPath: string | undefined,
+): AsyncCompleteRaw | undefined {
+  if (!resultPath || !fs.existsSync(resultPath)) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function getBridgeState(events: BridgeHost["events"]): BridgeState {
   const existing = bridgeStates.get(events);
   if (existing) return existing;
@@ -270,14 +308,124 @@ export function registerBridge(
     requestedSpawnTimeoutMs !== undefined && requestedSpawnTimeoutMs > 0
       ? requestedSpawnTimeoutMs
       : DEFAULT_SPAWN_TIMEOUT_MS;
+  const requestedCompletionPollIntervalMs = options.completionPollIntervalMs;
+  const completionPollIntervalMs =
+    requestedCompletionPollIntervalMs !== undefined &&
+    requestedCompletionPollIntervalMs > 0
+      ? requestedCompletionPollIntervalMs
+      : DEFAULT_COMPLETION_POLL_INTERVAL_MS;
 
   const { ownedRunIds, completedRunIds } = getBridgeState(pi.events);
-  const pendingSpawnControllers = new Set<AbortController>();
+  const pendingRpcControllers = new Set<AbortController>();
+  const completionPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const unsubscribes: Unsubscribe[] = [];
   let disposed = false;
 
   const track = (unsubscribe: Unsubscribe | void): void => {
     if (typeof unsubscribe === "function") unsubscribes.push(unsubscribe);
+  };
+
+  const clearCompletionPoll = (runId: string): void => {
+    const timer = completionPollTimers.get(runId);
+    if (timer) clearTimeout(timer);
+    completionPollTimers.delete(runId);
+  };
+
+  const shouldStopPolling = (runId: string): boolean =>
+    disposed || completedRunIds.has(runId) || !ownedRunIds.has(runId);
+
+  const emitCompletion = (
+    runId: string,
+    kind: CompletionKind,
+    payload?: AsyncCompleteRaw,
+  ): void => {
+    if (!ownedRunIds.has(runId) || completedRunIds.has(runId)) return;
+
+    completedRunIds.add(runId);
+    ownedRunIds.delete(runId);
+    clearCompletionPoll(runId);
+
+    if (kind === "stopped") {
+      const result = payload ? extractStoppedResult(payload) : undefined;
+      pi.events.emit(FAILED_EVENT, {
+        id: runId,
+        ...(result ? { result } : {}),
+        status: "stopped",
+      });
+      return;
+    }
+
+    if (kind === "failed") {
+      pi.events.emit(FAILED_EVENT, {
+        id: runId,
+        error: payload ? extractFailureError(payload) : "Agent failed",
+        status: "failed",
+      });
+      return;
+    }
+
+    const result = payload ? extractCompletedResult(payload) : undefined;
+    pi.events.emit(COMPLETED_EVENT, {
+      id: runId,
+      ...(result ? { result } : {}),
+    });
+  };
+
+  const pollRunCompletion = async (runId: string): Promise<void> => {
+    completionPollTimers.delete(runId);
+    if (shouldStopPolling(runId)) {
+      clearCompletionPoll(runId);
+      return;
+    }
+
+    const controller = new AbortController();
+    pendingRpcControllers.add(controller);
+
+    try {
+      const reply = await requestNicobailonRpc<unknown>(
+        pi.events,
+        "status",
+        { id: runId },
+        spawnTimeoutMs,
+        controller.signal,
+      );
+      if (shouldStopPolling(runId)) {
+        clearCompletionPoll(runId);
+        return;
+      }
+
+      const statusText = extractRpcText(reply);
+      const kind = statusText ? classifyStatusText(statusText) : undefined;
+      if (kind && statusText) {
+        const payload = readResultPayload(parseResultPath(statusText));
+        emitCompletion(runId, kind, payload);
+        return;
+      }
+    } catch {
+      if (disposed) return;
+    } finally {
+      pendingRpcControllers.delete(controller);
+    }
+
+    if (shouldStopPolling(runId)) {
+      clearCompletionPoll(runId);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      void pollRunCompletion(runId);
+    }, completionPollIntervalMs);
+    timer.unref();
+    completionPollTimers.set(runId, timer);
+  };
+
+  const ensureCompletionPoll = (runId: string): void => {
+    if (completionPollTimers.has(runId)) return;
+    const timer = setTimeout(() => {
+      void pollRunCompletion(runId);
+    }, completionPollIntervalMs);
+    timer.unref();
+    completionPollTimers.set(runId, timer);
   };
 
   // pi-subagents/src/agents/agents.ts exposes exact runtime names and has no
@@ -338,7 +486,7 @@ export function registerBridge(
     };
 
     const controller = new AbortController();
-    pendingSpawnControllers.add(controller);
+    pendingRpcControllers.add(controller);
 
     try {
       // pi-subagents rpc.ts: dataFromToolResult keeps async spawn metadata under details,
@@ -357,6 +505,7 @@ export function registerBridge(
         throw new Error("nicobailon spawn reply did not include a run id");
 
       ownedRunIds.add(runId);
+      ensureCompletionPoll(runId);
       emitReply(pi.events, SPAWN_CHANNEL, requestId, {
         success: true,
         data: { id: runId },
@@ -369,7 +518,7 @@ export function registerBridge(
         error: error instanceof Error ? error.message : String(error),
       });
     } finally {
-      pendingSpawnControllers.delete(controller);
+      pendingRpcControllers.delete(controller);
     }
   };
 
@@ -415,39 +564,11 @@ export function registerBridge(
       if (!runId || !ownedRunIds.has(runId) || completedRunIds.has(runId))
         return;
 
-      completedRunIds.add(runId);
-      ownedRunIds.delete(runId);
-
-      const kind = classifyCompleteEvent(payload);
-      if (kind === "stopped") {
-        // pi-subagents result-watcher.ts emits state="paused" for interrupted runs and still
-        // includes the partial child output in results[].output. pi-tasks treats subagents:failed
-        // with status="stopped" as a completed task with partial result.
-        const result = extractStoppedResult(payload);
-        pi.events.emit(FAILED_EVENT, {
-          id: runId,
-          ...(result ? { result } : {}),
-          status: "stopped",
-        });
-        return;
-      }
-
-      if (kind === "failed") {
-        pi.events.emit(FAILED_EVENT, {
-          id: runId,
-          error: extractFailureError(payload),
-          status: "failed",
-        });
-        return;
-      }
-
-      const result = extractCompletedResult(payload);
-      pi.events.emit(COMPLETED_EVENT, {
-        id: runId,
-        ...(result ? { result } : {}),
-      });
+      emitCompletion(runId, classifyCompleteEvent(payload), payload);
     }),
   );
+
+  for (const runId of ownedRunIds) ensureCompletionPoll(runId);
 
   pi.events.emit(READY_EVENT, {});
 
@@ -455,10 +576,15 @@ export function registerBridge(
     dispose() {
       disposed = true;
 
-      for (const controller of pendingSpawnControllers) {
+      for (const controller of pendingRpcControllers) {
         controller.abort();
       }
-      pendingSpawnControllers.clear();
+      pendingRpcControllers.clear();
+
+      for (const timer of completionPollTimers.values()) {
+        clearTimeout(timer);
+      }
+      completionPollTimers.clear();
 
       while (unsubscribes.length > 0) {
         const unsubscribe = unsubscribes.pop();

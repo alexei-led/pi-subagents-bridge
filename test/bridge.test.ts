@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { registerBridge } from "../src/index.js";
 
@@ -443,6 +446,73 @@ test("completion events use the documented result and error fallbacks", async ()
 
     assert.deepEqual(await failed, stoppedCase.expected);
   }
+});
+
+test("status polling emits completion when async-complete never arrives", async (t) => {
+  const bus = new FakeEventBus();
+  const bridge = registerBridge(
+    { events: bus },
+    { completionPollIntervalMs: 1 },
+  );
+  t.after(() => bridge.dispose());
+
+  const tempDir = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-status-"));
+  t.after(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const resultPath = join(tempDir, "run-polled.json");
+  writeFileSync(
+    resultPath,
+    JSON.stringify({
+      runId: "run-polled",
+      success: true,
+      state: "complete",
+      summary: "polled output",
+    }),
+    "utf8",
+  );
+
+  const statusSeen = new Promise<void>((resolve) => {
+    bus.on(NB_REQUEST_CHANNEL, (payload) => {
+      if (!isRecord(payload) || payload.method !== "status") return;
+      bus.emit(nbReplyChannel(String(payload.requestId)), {
+        version: 1,
+        requestId: payload.requestId,
+        method: "status",
+        success: true,
+        data: {
+          text: `Run: run-polled\nState: complete\nResult: ${resultPath}`,
+        },
+      });
+      resolve();
+    });
+  });
+
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-polled"));
+  const completed = once(bus, COMPLETED_EVENT, 250);
+  bus.emit(SPAWN_CHANNEL, {
+    requestId: "spawn-polled",
+    type: "general-purpose",
+    prompt: "Do the task",
+  });
+
+  const request = bus.lastPayload(NB_REQUEST_CHANNEL);
+  assert.ok(isRecord(request));
+  bus.emit(nbReplyChannel(String(request.requestId)), {
+    version: 1,
+    requestId: request.requestId,
+    method: "spawn",
+    success: true,
+    data: { details: { runId: "run-polled" } },
+  });
+
+  assert.deepEqual(await reply, { success: true, data: { id: "run-polled" } });
+  await statusSeen;
+  assert.deepEqual(await completed, {
+    id: "run-polled",
+    result: "polled output",
+  });
 });
 
 test("completion handling supports runId fallbacks, ignores unrelated events, and dedupes repeats", async () => {
