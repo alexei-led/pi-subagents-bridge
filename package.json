@@ -1,29 +1,66 @@
 {
-  "name": "pi-subagents-bridge",
+  "name": "@alexeiled/pi-subagents-bridge",
   "version": "0.1.0",
-  "description": "Bridge nicobailon/pi-subagents to @tintinweb/pi-tasks RPC protocols",
+  "description": "Protocol adapter that lets @tintinweb/pi-tasks TaskExecute spawn nicobailon/pi-subagents.",
   "type": "module",
   "main": "./src/index.ts",
-  "files": [
-    "src",
-    "LICENSE",
-    "README.md"
-  ],
+  "exports": "./src/index.ts",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "npm@11.18.0",
   "keywords": [
-    "pi",
     "pi-package",
     "pi-extension",
-    "subagents",
-    "tasks",
-    "bridge"
+    "pi-subagents",
+    "pi-tasks",
+    "bridge",
+    "rpc"
   ],
-  "license": "MIT",
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+  "files": [
+    "src/**/*.ts",
+    "assets/**/*.svg",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "lint": "eslint . --cache --cache-strategy content",
+    "check": "tsc --noEmit",
+    "test": "node --import jiti/register --test test/*.test.ts",
+    "pack:dry": "npm pack --dry-run",
+    "publish:dry": "npm publish --dry-run",
+    "test:all": "npm run lint && npm run check && npm test && npm run pack:dry"
   },
   "pi": {
     "extensions": [
       "./src/index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/alexei-led/pi-subagents-bridge/main/assets/bridge.svg"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.10.0",
+    "eslint": "^10.6.0",
+    "globals": "^17.7.0",
+    "jiti": "^2.7.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.62.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alexei-led/pi-subagents-bridge.git"
+  },
+  "homepage": "https://github.com/alexei-led/pi-subagents-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/alexei-led/pi-subagents-bridge/issues"
   }
 }

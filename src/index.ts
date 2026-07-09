@@ -1,200 +1,394 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-/**
- * Bridge @tintinweb/pi-tasks RPC (v2) → nicobailon/pi-subagents RPC (v1).
- *
- * pi-tasks emits:    subagents:rpc:ping  subagents:rpc:spawn  subagents:rpc:stop
- * nicobailon hears:  subagents:rpc:v1:request {method: "spawn" | "stop"}
- *
- * The bridge answers ping locally, forwards spawn/stop to nicobailon,
- * and translates nicobailon's async-complete events back to tintinweb's
- * subagents:completed / subagents:failed events.
- *
- * Only agents spawned through this bridge are tracked — nicobailon's own
- * chain/parallel runs (e.g. pi-fusion) are left untouched.
- */
+// Protocol evidence (installed sources verified against npm pack pi-subagents@0.34.0):
+// - @tintinweb/pi-tasks src/index.ts:103-119 reply channel/envelope,
+//   126-133 spawn/stop params, 137-157 strict PROTOCOL_VERSION=2,
+//   207-260 completed/failed/stopped fields.
+// - pi-subagents src/extension/rpc.ts:13-18 v1 channel/methods,
+//   32-45 reply envelope, 128-132 spawn details, 141-147 id/runId stop target,
+//   193-204 async-only spawn/no clarify.
+// - pi-subagents src/runs/background/result-watcher.ts:49-57 result file fields,
+//   141-164 child output/status normalization, 193-204 async-complete payload;
+//   subagent-runner.ts:3066-3073 complete/failed/paused state values.
+// - pi-subagents src/agents/agents.ts:31-40 builtin names and
+//   src/agents/agent-selection.ts:4-19 exact-name merge; pi-tasks examples need aliases.
+const PING_CHANNEL = "subagents:rpc:ping";
+const SPAWN_CHANNEL = "subagents:rpc:spawn";
+const STOP_CHANNEL = "subagents:rpc:stop";
+const COMPLETED_EVENT = "subagents:completed";
+const FAILED_EVENT = "subagents:failed";
+const READY_EVENT = "subagents:ready";
+const NB_REQUEST_CHANNEL = "subagents:rpc:v1:request";
+const NB_COMPLETE_EVENT = "subagent:async-complete";
+const NB_REPLY_PREFIX = "subagents:rpc:v1:reply:";
+const DEFAULT_SPAWN_TIMEOUT_MS = 24_000;
 
-// ── tintinweb v2 channels ────────────────────────────────────────────────────
-const T_PING      = "subagents:rpc:ping";
-const T_SPAWN     = "subagents:rpc:spawn";
-const T_STOP      = "subagents:rpc:stop";
-const T_COMPLETED = "subagents:completed";
-const T_FAILED    = "subagents:failed";
+const AGENT_TYPE_ALIASES = new Map<string, string>([
+  ["general-purpose", "delegate"],
+  ["Explore", "scout"],
+  ["explore", "scout"],
+]);
 
-/** tintinweb reply channel: <channel>:reply:<requestId> */
-const tReply = (ch: string, id: string) => `${ch}:reply:${id}`;
-
-// ── nicobailon v1 channels ───────────────────────────────────────────────────
-const NB_REQUEST  = "subagents:rpc:v1:request";
-const NB_COMPLETE = "subagent:async-complete";
-
-/** nicobailon reply channel: subagents:rpc:v1:reply:<requestId> */
-const nbReply = (id: string) => `subagents:rpc:v1:reply:${id}`;
-
-// ── Types ────────────────────────────────────────────────────────────────────
-
-type TReplyOk<T>  = { success: true; data: T };
-type TReplyErr    = { success: false; error: string };
-type TReply<T>    = TReplyOk<T> | TReplyErr;
-
-interface NbComplete {
-  runId?:   string;
-  asyncId?: string;
-  id?:      string;
-  success?: boolean;
-  state?:   string;
-  summary?: string;
-  output?:  string;
-  error?:   string;
-  results?: Array<{ output?: string }>;
+interface BridgeOptions {
+  spawnTimeoutMs?: number;
 }
 
-// ── Nicobailon RPC helper ─────────────────────────────────────────────────────
+type BridgeHost = Pick<ExtensionAPI, "events">;
+type Unsubscribe = () => void;
+type RpcReply<T> =
+  { success: true; data: T } | { success: false; error: string };
+type CompletionKind = "completed" | "failed" | "stopped";
 
-function nbRpc<T>(
-  events: ExtensionAPI["events"],
-  method: string,
+interface SpawnOptionsRaw {
+  model?: unknown;
+  maxTurns?: unknown;
+}
+
+interface AsyncCompleteRaw {
+  runId?: unknown;
+  asyncId?: unknown;
+  id?: unknown;
+  success?: unknown;
+  state?: unknown;
+  summary?: unknown;
+  output?: unknown;
+  error?: unknown;
+  results?: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : undefined;
+}
+
+function replyChannel(channel: string, requestId: string): string {
+  return `${channel}:reply:${requestId}`;
+}
+
+function nbReplyChannel(requestId: string): string {
+  return `${NB_REPLY_PREFIX}${requestId}`;
+}
+
+function emitReply<T>(
+  events: BridgeHost["events"],
+  channel: string,
+  requestId: string,
+  reply: RpcReply<T>,
+): void {
+  events.emit(replyChannel(channel, requestId), reply);
+}
+
+function extractSpawnRunId(reply: unknown): string | undefined {
+  if (!isRecord(reply)) return undefined;
+
+  const details = isRecord(reply.details) ? reply.details : undefined;
+  return (
+    text(details?.runId) ??
+    text(details?.asyncId) ??
+    text(reply.runId) ??
+    text(reply.asyncId)
+  );
+}
+
+function extractRunId(payload: AsyncCompleteRaw): string | undefined {
+  return text(payload.runId) ?? text(payload.asyncId) ?? text(payload.id);
+}
+
+function extractChildOutputs(payload: AsyncCompleteRaw): string[] {
+  if (!Array.isArray(payload.results)) return [];
+
+  const outputs: string[] = [];
+  for (const result of payload.results) {
+    if (!isRecord(result)) continue;
+    const output = text(result.output) ?? text(result.error);
+    if (output) outputs.push(output);
+  }
+  return outputs;
+}
+
+function extractCompletedResult(payload: AsyncCompleteRaw): string | undefined {
+  return (
+    text(payload.summary) ??
+    text(payload.output) ??
+    (extractChildOutputs(payload).join("\n\n") || undefined)
+  );
+}
+
+function extractStoppedResult(payload: AsyncCompleteRaw): string | undefined {
+  return (
+    (extractChildOutputs(payload).join("\n\n") || undefined) ??
+    text(payload.output) ??
+    text(payload.summary)
+  );
+}
+
+function extractFailureError(payload: AsyncCompleteRaw): string {
+  const error = text(payload.error);
+  if (error) return error;
+  if (Array.isArray(payload.results)) {
+    for (const result of payload.results) {
+      if (!isRecord(result)) continue;
+      const error = text(result.error);
+      if (error) return error;
+    }
+  }
+  return "Agent failed";
+}
+
+function classifyCompleteEvent(payload: AsyncCompleteRaw): CompletionKind {
+  const state = text(payload.state);
+  if (state === "paused" || state === "stopped") return "stopped";
+  if (state === "failed" || state === "aborted" || payload.success === false)
+    return "failed";
+  if (state === "complete" || payload.success === true) return "completed";
+  return "failed";
+}
+
+function resolveAgentType(type: string): string {
+  return AGENT_TYPE_ALIASES.get(type) ?? type;
+}
+
+function requestNicobailonRpc<T>(
+  events: BridgeHost["events"],
+  method: "spawn",
   params: Record<string, unknown>,
   timeoutMs: number,
 ): Promise<T> {
-  const id = randomUUID();
+  const requestId = randomUUID();
 
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      unsub?.();
-      reject(new Error(`nicobailon "${method}" RPC timed out after ${timeoutMs}ms`));
+    const timeout = setTimeout(() => {
+      unsubscribe();
+      reject(
+        new Error(`nicobailon "${method}" RPC timed out after ${timeoutMs}ms`),
+      );
     }, timeoutMs);
 
-    const unsub = events.on(nbReply(id), (raw: unknown) => {
-      unsub?.();
-      clearTimeout(timer);
-      const r = raw as { success: boolean; data?: T; error?: { message?: string } | string };
-      if (r.success) {
-        resolve(r.data as T);
-      } else {
-        const msg = typeof r.error === "object" ? r.error?.message : r.error;
-        reject(new Error(msg || "nicobailon RPC error"));
+    const unsubscribe = events.on(nbReplyChannel(requestId), (raw: unknown) => {
+      unsubscribe();
+      clearTimeout(timeout);
+
+      if (!isRecord(raw) || typeof raw.success !== "boolean") {
+        reject(new Error("Malformed nicobailon RPC reply."));
+        return;
       }
+
+      if (raw.success) {
+        resolve(raw.data as T);
+        return;
+      }
+
+      const message = isRecord(raw.error)
+        ? text(raw.error.message)
+        : text(raw.error);
+      reject(new Error(message ?? "nicobailon RPC error"));
     });
 
-    events.emit(NB_REQUEST, { version: 1, requestId: id, method, params });
+    events.emit(NB_REQUEST_CHANNEL, {
+      version: 1,
+      requestId,
+      method,
+      params,
+    });
   });
 }
 
-// ── Result extraction ─────────────────────────────────────────────────────────
-
-function extractResult(p: NbComplete): string | undefined {
-  if (p.summary?.trim()) return p.summary.trim();
-  if (p.output?.trim())  return p.output.trim();
-  const first = p.results?.[0];
-  if (first?.output?.trim()) return first.output.trim();
-  return undefined;
+function normalizeSpawnOptions(raw: unknown): SpawnOptionsRaw | undefined {
+  return isRecord(raw) ? raw : undefined;
 }
 
-// ── Extension ────────────────────────────────────────────────────────────────
+export function registerBridge(
+  pi: BridgeHost,
+  options: BridgeOptions = {},
+): { dispose: () => void } {
+  const requestedSpawnTimeoutMs = options.spawnTimeoutMs;
+  const spawnTimeoutMs =
+    requestedSpawnTimeoutMs !== undefined && requestedSpawnTimeoutMs > 0
+      ? requestedSpawnTimeoutMs
+      : DEFAULT_SPAWN_TIMEOUT_MS;
 
-export default function registerBridge(pi: ExtensionAPI): void {
-  /** runIds spawned through this bridge — used to filter async-complete events. */
-  const spawned = new Set<string>();
-  /** Seen completions — prevents double-processing if nicobailon fires twice. */
-  const seen = new Set<string>();
+  const ownedRunIds = new Set<string>();
+  const completedRunIds = new Set<string>();
+  const unsubscribes: Unsubscribe[] = [];
 
-  // PING — answered locally; no nicobailon call needed.
-  // pi-tasks checks protocol version here; we declare v2 (what pi-tasks expects).
-  pi.events.on(T_PING, (raw: unknown) => {
-    const req = raw as { requestId?: string };
-    if (!req?.requestId) return;
-    const reply: TReply<{ version: number }> = { success: true, data: { version: 2 } };
-    pi.events.emit(tReply(T_PING, req.requestId), reply);
-  });
+  const track = (unsubscribe: Unsubscribe | void): void => {
+    if (typeof unsubscribe === "function") unsubscribes.push(unsubscribe);
+  };
 
-  // SPAWN — translate tintinweb → nicobailon and track the returned runId.
-  pi.events.on(T_SPAWN, async (raw: unknown) => {
-    const req = raw as {
-      requestId?: string;
-      type?: string;
-      prompt?: string;
-      options?: { description?: string; model?: string; maxTurns?: number };
-    };
-    const { requestId, type, prompt, options = {} } = req ?? {};
-    if (!requestId || !type || !prompt) return;
+  // pi-subagents/src/agents/agents.ts exposes exact runtime names and has no
+  // general-purpose/Explore builtins. Keep only these pi-tasks compatibility aliases.
+  track(
+    pi.events.on(PING_CHANNEL, (raw: unknown) => {
+      if (!isRecord(raw)) return;
+      const requestId = text(raw.requestId);
+      if (!requestId) return;
 
-    try {
-      const data = await nbRpc<{ details?: { runId?: string; asyncId?: string } }>(
-        pi.events,
-        "spawn",
-        {
-          agent:   type,
-          task:    prompt,
-          async:   true,
-          clarify: false,
-          context: "fresh",
-          description: options.description ?? prompt.slice(0, 80),
-          ...(options.model    ? { model: options.model }                          : {}),
-          ...(options.maxTurns ? { turnBudget: { maxTurns: options.maxTurns } }   : {}),
-        },
-        24_000, // pi-tasks spawn timeout is 30s; give nicobailon 24s
-      );
+      emitReply(pi.events, PING_CHANNEL, requestId, {
+        success: true,
+        data: { version: 2 },
+      } satisfies RpcReply<{ version: number }>);
+    }),
+  );
 
-      const runId = data?.details?.runId ?? data?.details?.asyncId;
-      if (!runId) throw new Error("nicobailon spawn returned no runId in details");
-
-      spawned.add(runId);
-      pi.events.emit(tReply(T_SPAWN, requestId), { success: true, data: { id: runId } } satisfies TReplyOk<{ id: string }>);
-
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      pi.events.emit(tReply(T_SPAWN, requestId), { success: false, error: msg } satisfies TReplyErr);
-    }
-  });
-
-  // STOP — forward to nicobailon; always reply success since pi-tasks silences stop errors.
-  pi.events.on(T_STOP, async (raw: unknown) => {
-    const req = raw as { requestId?: string; agentId?: string };
-    const { requestId, agentId } = req ?? {};
+  const handleSpawn = async (raw: unknown): Promise<void> => {
+    if (!isRecord(raw)) return;
+    const requestId = text(raw.requestId);
     if (!requestId) return;
 
-    if (agentId) {
-      try {
-        await nbRpc(pi.events, "stop", { runId: agentId }, 8_000);
-      } catch {
-        // Agent may have already finished — not an error.
-      }
-      spawned.delete(agentId);
-    }
-
-    pi.events.emit(tReply(T_STOP, requestId), { success: true } satisfies TReplyOk<undefined>);
-  });
-
-  // COMPLETION — translate nicobailon:async-complete → tintinweb completed/failed.
-  // Only processes agents spawned through this bridge (spawned.has guard).
-  pi.events.on(NB_COMPLETE, (payload: unknown) => {
-    const p = payload as NbComplete;
-    const runId = p.runId ?? p.asyncId ?? p.id;
-    if (!runId || !spawned.has(runId) || seen.has(runId)) return;
-
-    seen.add(runId);
-    spawned.delete(runId);
-
-    if (p.state === "stopped") {
-      const result = extractResult(p);
-      pi.events.emit(T_FAILED, { id: runId, status: "stopped", ...(result ? { result } : {}) });
-
-    } else if (p.success === false || p.state === "error" || p.state === "failed" || p.state === "aborted") {
-      pi.events.emit(T_FAILED, {
-        id:    runId,
-        error: typeof p.error === "string" ? p.error : "Agent failed",
-        status: p.state ?? "error",
+    const agentType = text(raw.type);
+    const prompt = text(raw.prompt);
+    if (!agentType || !prompt) {
+      emitReply(pi.events, SPAWN_CHANNEL, requestId, {
+        success: false,
+        error: "spawn requires string type and prompt",
       });
-
-    } else {
-      const result = extractResult(p);
-      pi.events.emit(T_COMPLETED, { id: runId, ...(result ? { result } : {}) });
+      return;
     }
-  });
 
-  // Announce presence. If pi-tasks loaded first and its initial ping already
-  // timed out, this triggers it to re-check version compatibility.
-  pi.events.emit("subagents:ready", {});
+    const optionsRaw = normalizeSpawnOptions(raw.options);
+    const model = text(optionsRaw?.model);
+    const maxTurns =
+      typeof optionsRaw?.maxTurns === "number" &&
+      Number.isInteger(optionsRaw.maxTurns) &&
+      optionsRaw.maxTurns > 0
+        ? optionsRaw.maxTurns
+        : undefined;
+    const spawnParams: Record<string, unknown> = {
+      agent: resolveAgentType(agentType),
+      task: prompt,
+      async: true,
+      clarify: false,
+      context: "fresh",
+      ...(model ? { model } : {}),
+      ...(maxTurns ? { turnBudget: { maxTurns } } : {}),
+    };
+
+    try {
+      // pi-subagents rpc.ts: dataFromToolResult keeps async spawn metadata under details,
+      // including details.runId/details.asyncId for the launched async run.
+      const reply = await requestNicobailonRpc<unknown>(
+        pi.events,
+        "spawn",
+        spawnParams,
+        spawnTimeoutMs,
+      );
+      const runId = extractSpawnRunId(reply);
+      if (!runId)
+        throw new Error("nicobailon spawn reply did not include a run id");
+
+      ownedRunIds.add(runId);
+      emitReply(pi.events, SPAWN_CHANNEL, requestId, {
+        success: true,
+        data: { id: runId },
+      } satisfies RpcReply<{ id: string }>);
+    } catch (error: unknown) {
+      emitReply(pi.events, SPAWN_CHANNEL, requestId, {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
+  track(
+    pi.events.on(SPAWN_CHANNEL, (raw: unknown) => {
+      void handleSpawn(raw);
+    }),
+  );
+
+  track(
+    pi.events.on(STOP_CHANNEL, (raw: unknown) => {
+      if (!isRecord(raw)) return;
+      const requestId = text(raw.requestId);
+      if (!requestId) return;
+
+      const agentId = text(raw.agentId) ?? text(raw.id) ?? text(raw.runId);
+      if (agentId && ownedRunIds.has(agentId)) {
+        try {
+          // pi-subagents rpc.ts normalizes stop targets from id/runId; use canonical id here.
+          pi.events.emit(NB_REQUEST_CHANNEL, {
+            version: 1,
+            requestId: randomUUID(),
+            method: "stop",
+            params: { id: agentId },
+          });
+        } catch {
+          // pi-tasks ignores stop failures; still acknowledge success locally.
+        }
+      }
+
+      emitReply(pi.events, STOP_CHANNEL, requestId, {
+        success: true,
+        data: undefined,
+      } satisfies RpcReply<void>);
+    }),
+  );
+
+  track(
+    pi.events.on(NB_COMPLETE_EVENT, (raw: unknown) => {
+      if (!isRecord(raw)) return;
+      const payload = raw as AsyncCompleteRaw;
+      const runId = extractRunId(payload);
+      if (!runId || !ownedRunIds.has(runId) || completedRunIds.has(runId))
+        return;
+
+      completedRunIds.add(runId);
+      ownedRunIds.delete(runId);
+
+      const kind = classifyCompleteEvent(payload);
+      if (kind === "stopped") {
+        // pi-subagents result-watcher.ts emits state="paused" for interrupted runs and still
+        // includes the partial child output in results[].output. pi-tasks treats subagents:failed
+        // with status="stopped" as a completed task with partial result.
+        const result = extractStoppedResult(payload);
+        pi.events.emit(FAILED_EVENT, {
+          id: runId,
+          ...(result ? { result } : {}),
+          status: "stopped",
+        });
+        return;
+      }
+
+      if (kind === "failed") {
+        pi.events.emit(FAILED_EVENT, {
+          id: runId,
+          error: extractFailureError(payload),
+          status: "failed",
+        });
+        return;
+      }
+
+      const result = extractCompletedResult(payload);
+      pi.events.emit(COMPLETED_EVENT, {
+        id: runId,
+        ...(result ? { result } : {}),
+      });
+    }),
+  );
+
+  pi.events.emit(READY_EVENT, {});
+
+  return {
+    dispose() {
+      while (unsubscribes.length > 0) {
+        const unsubscribe = unsubscribes.pop();
+        try {
+          unsubscribe?.();
+        } catch {
+          // Best effort cleanup.
+        }
+      }
+      ownedRunIds.clear();
+      completedRunIds.clear();
+    },
+  };
+}
+
+export default function bridgeExtension(pi: ExtensionAPI): void {
+  registerBridge(pi);
 }

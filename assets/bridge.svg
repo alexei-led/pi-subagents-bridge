@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" role="img" aria-label="pi-subagents-bridge">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#020617" />
+      <stop offset="100%" stop-color="#0f172a" />
+    </linearGradient>
+    <linearGradient id="accent" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#22c55e" />
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" rx="48" fill="url(#bg)" />
+  <rect x="64" y="64" width="1152" height="512" rx="36" fill="#0b1220" stroke="#1e293b" stroke-width="4" />
+  <rect x="96" y="104" width="328" height="96" rx="24" fill="#0f172a" stroke="#38bdf8" stroke-width="3" />
+  <rect x="856" y="104" width="328" height="96" rx="24" fill="#0f172a" stroke="#22c55e" stroke-width="3" />
+  <rect x="476" y="248" width="328" height="144" rx="28" fill="#111827" stroke="url(#accent)" stroke-width="4" />
+  <path d="M424 152h112" stroke="#38bdf8" stroke-width="10" stroke-linecap="round" />
+  <path d="M744 152h112" stroke="#22c55e" stroke-width="10" stroke-linecap="round" />
+  <path d="M480 320H316" stroke="#38bdf8" stroke-width="8" stroke-linecap="round" />
+  <path d="M800 320H964" stroke="#22c55e" stroke-width="8" stroke-linecap="round" />
+  <circle cx="488" cy="320" r="16" fill="#38bdf8" />
+  <circle cx="792" cy="320" r="16" fill="#22c55e" />
+  <text x="256" y="152" fill="#dbeafe" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="34" text-anchor="middle">pi-tasks</text>
+  <text x="1020" y="152" fill="#dcfce7" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="34" text-anchor="middle">pi-subagents</text>
+  <text x="640" y="308" fill="#e5f0ff" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="42" text-anchor="middle">bridge</text>
+  <text x="640" y="356" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="22" text-anchor="middle">v2 ping • v1 spawn/stop • async-complete translation</text>
+</svg>
