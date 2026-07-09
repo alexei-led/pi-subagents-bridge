@@ -4,6 +4,12 @@
 
 - None.
 
+## 0.1.3 - 2026-07-09
+
+- Disabled pi-subagents acceptance gating for bridge-spawned `TaskExecute` runs so pi-tasks jobs no longer pause on missing `acceptance-report` output.
+- Disabled pi-subagents live control nudges for bridge-spawned `TaskExecute` runs to keep queue-style background tasks from surfacing misleading `needs attention` prompts.
+- Added tests and docs for the bridge spawn overrides and execution-capable agent guidance.
+
 ## 0.1.2 - 2026-07-09
 
 - No code changes from `0.1.1`.
