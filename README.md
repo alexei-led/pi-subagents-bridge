@@ -25,6 +25,33 @@ Specifically, it:
 - translates `pi-subagents` completion events back into `pi-tasks` task updates
 - falls back to polling `pi-subagents` run `status` if an async completion event is missed
 
+### Request and completion flow
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Tasks as @tintinweb/pi-tasks
+  participant Bridge as pi-subagents-bridge
+  participant Subs as pi-subagents
+
+  Tasks->>Bridge: ping (v2)
+  Bridge-->>Tasks: version 2
+
+  Tasks->>Bridge: spawn(type, prompt, options)
+  Bridge->>Subs: spawn(agent, task, async: true)
+  Subs-->>Bridge: runId
+  Bridge-->>Tasks: id = runId
+
+  Subs-->>Bridge: subagent:async-complete
+  Bridge-->>Tasks: subagents:completed / subagents:failed
+
+  alt async completion event is missed
+    Bridge->>Subs: status(runId)
+    Subs-->>Bridge: state + result path
+    Bridge-->>Tasks: subagents:completed / subagents:failed
+  end
+```
+
 ## Install
 
 Install the two extensions being bridged, then install the bridge:
