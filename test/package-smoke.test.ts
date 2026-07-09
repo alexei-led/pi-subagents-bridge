@@ -58,6 +58,8 @@ test("npm pack includes only release package assets", async (t) => {
   assert.ok(files.has("LICENSE"));
   assert.ok(files.has("src/index.ts"));
   assert.ok(files.has("assets/bridge.svg"));
+  assert.ok(files.has("docs/design.md"));
+  assert.ok(files.has("docs/protocol-research.md"));
   assert.equal(files.has("tsconfig.json"), false);
   assert.equal(files.has("eslint.config.js"), false);
   assert.equal(

@@ -44,3 +44,15 @@ git push origin main --follow-tags
 
 The GitHub release workflow runs on pushed `v*` tags.
 It verifies the tag matches `package.json`, checks it is on `main`, runs the validation gate, then publishes with npm provenance.
+
+Configure npm trusted publishing after the first package publish:
+
+```bash
+npm trust github @alexeiled/pi-subagents-bridge \
+  --repo alexei-led/pi-subagents-bridge \
+  --file release.yml \
+  --allow-publish \
+  -y
+```
+
+`--file` must be just the workflow file name, not `.github/workflows/release.yml`.

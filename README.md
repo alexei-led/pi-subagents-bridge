@@ -52,6 +52,11 @@ Use exact Pi agent names for everything else.
 Do not load `@tintinweb/pi-subagents` at the same time.
 The bridge only tracks its own spawned run IDs, so unrelated `pi-subagents` runs pass through untouched.
 
+## Docs
+
+- [`docs/protocol-research.md`](./docs/protocol-research.md) — reverse-engineered upstream protocol facts and maintenance checklist.
+- [`docs/design.md`](./docs/design.md) — bridge design, mappings, non-goals, and result rules.
+
 ## Release
 
 See [`DEVELOPMENT.md`](./DEVELOPMENT.md) for the local validation gate and release steps.
