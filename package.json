@@ -1,0 +1,29 @@
+{
+  "name": "pi-subagents-bridge",
+  "version": "0.1.0",
+  "description": "Bridge nicobailon/pi-subagents to @tintinweb/pi-tasks RPC protocols",
+  "type": "module",
+  "main": "./src/index.ts",
+  "files": [
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "subagents",
+    "tasks",
+    "bridge"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
