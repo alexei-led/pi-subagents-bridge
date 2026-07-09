@@ -4,6 +4,11 @@
 
 - None.
 
+## 0.1.2 - 2026-07-09
+
+- No code changes from `0.1.1`.
+- Release retry after configuring npm trusted publishing for GitHub Actions.
+
 ## 0.1.1 - 2026-07-09
 
 - Kept the npm tarball to runtime package files only: `src/index.ts`, `package.json`, `README.md`, and `LICENSE`.
