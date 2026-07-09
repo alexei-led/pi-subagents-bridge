@@ -40,6 +40,13 @@ type RpcReply<T> =
   { success: true; data: T } | { success: false; error: string };
 type CompletionKind = "completed" | "failed" | "stopped";
 
+interface BridgeState {
+  ownedRunIds: Set<string>;
+  completedRunIds: Set<string>;
+}
+
+const bridgeStates = new WeakMap<BridgeHost["events"], BridgeState>();
+
 interface SpawnOptionsRaw {
   model?: unknown;
   maxTurns?: unknown;
@@ -159,36 +166,65 @@ function requestNicobailonRpc<T>(
   method: "spawn",
   params: Record<string, unknown>,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<T> {
   const requestId = randomUUID();
 
   return new Promise<T>((resolve, reject) => {
-    const timeout = setTimeout(() => {
+    let settled = false;
+
+    const cleanup = (): void => {
+      if (settled) return;
+      settled = true;
       unsubscribe();
-      reject(
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
+    };
+
+    const fail = (error: Error): void => {
+      if (settled) return;
+      cleanup();
+      reject(error);
+    };
+
+    const succeed = (value: T): void => {
+      if (settled) return;
+      cleanup();
+      resolve(value);
+    };
+
+    const onAbort = (): void => {
+      fail(new Error("Bridge disposed"));
+    };
+
+    const timeout = setTimeout(() => {
+      fail(
         new Error(`nicobailon "${method}" RPC timed out after ${timeoutMs}ms`),
       );
     }, timeoutMs);
 
     const unsubscribe = events.on(nbReplyChannel(requestId), (raw: unknown) => {
-      unsubscribe();
-      clearTimeout(timeout);
-
       if (!isRecord(raw) || typeof raw.success !== "boolean") {
-        reject(new Error("Malformed nicobailon RPC reply."));
+        fail(new Error("Malformed nicobailon RPC reply."));
         return;
       }
 
       if (raw.success) {
-        resolve(raw.data as T);
+        succeed(raw.data as T);
         return;
       }
 
       const message = isRecord(raw.error)
         ? text(raw.error.message)
         : text(raw.error);
-      reject(new Error(message ?? "nicobailon RPC error"));
+      fail(new Error(message ?? "nicobailon RPC error"));
     });
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
 
     events.emit(NB_REQUEST_CHANNEL, {
       version: 1,
@@ -203,6 +239,18 @@ function normalizeSpawnOptions(raw: unknown): SpawnOptionsRaw | undefined {
   return isRecord(raw) ? raw : undefined;
 }
 
+function getBridgeState(events: BridgeHost["events"]): BridgeState {
+  const existing = bridgeStates.get(events);
+  if (existing) return existing;
+
+  const created: BridgeState = {
+    ownedRunIds: new Set<string>(),
+    completedRunIds: new Set<string>(),
+  };
+  bridgeStates.set(events, created);
+  return created;
+}
+
 export function registerBridge(
   pi: BridgeHost,
   options: BridgeOptions = {},
@@ -213,9 +261,10 @@ export function registerBridge(
       ? requestedSpawnTimeoutMs
       : DEFAULT_SPAWN_TIMEOUT_MS;
 
-  const ownedRunIds = new Set<string>();
-  const completedRunIds = new Set<string>();
+  const { ownedRunIds, completedRunIds } = getBridgeState(pi.events);
+  const pendingSpawnControllers = new Set<AbortController>();
   const unsubscribes: Unsubscribe[] = [];
+  let disposed = false;
 
   const track = (unsubscribe: Unsubscribe | void): void => {
     if (typeof unsubscribe === "function") unsubscribes.push(unsubscribe);
@@ -269,6 +318,9 @@ export function registerBridge(
       ...(maxTurns ? { turnBudget: { maxTurns } } : {}),
     };
 
+    const controller = new AbortController();
+    pendingSpawnControllers.add(controller);
+
     try {
       // pi-subagents rpc.ts: dataFromToolResult keeps async spawn metadata under details,
       // including details.runId/details.asyncId for the launched async run.
@@ -277,7 +329,10 @@ export function registerBridge(
         "spawn",
         spawnParams,
         spawnTimeoutMs,
+        controller.signal,
       );
+      if (disposed) return;
+
       const runId = extractSpawnRunId(reply);
       if (!runId)
         throw new Error("nicobailon spawn reply did not include a run id");
@@ -288,10 +343,14 @@ export function registerBridge(
         data: { id: runId },
       } satisfies RpcReply<{ id: string }>);
     } catch (error: unknown) {
+      if (disposed || controller.signal.aborted) return;
+
       emitReply(pi.events, SPAWN_CHANNEL, requestId, {
         success: false,
         error: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      pendingSpawnControllers.delete(controller);
     }
   };
 
@@ -375,6 +434,13 @@ export function registerBridge(
 
   return {
     dispose() {
+      disposed = true;
+
+      for (const controller of pendingSpawnControllers) {
+        controller.abort();
+      }
+      pendingSpawnControllers.clear();
+
       while (unsubscribes.length > 0) {
         const unsubscribe = unsubscribes.pop();
         try {
@@ -383,8 +449,6 @@ export function registerBridge(
           // Best effort cleanup.
         }
       }
-      ownedRunIds.clear();
-      completedRunIds.clear();
     },
   };
 }

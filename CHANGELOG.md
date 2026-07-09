@@ -4,6 +4,12 @@
 
 - None.
 
+## 0.1.1 - 2026-07-09
+
+- Kept the npm tarball to runtime package files only: `src/index.ts`, `package.json`, `README.md`, and `LICENSE`.
+- Preserved active run ownership across bridge re-registration so in-flight tasks can still stop and complete.
+- Cancelled in-flight spawn RPC listeners on bridge disposal and ignored late replies.
+
 ## 0.1.0 - 2026-07-09
 
 ### Added

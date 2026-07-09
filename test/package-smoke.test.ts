@@ -23,11 +23,12 @@ interface PackResult {
 interface PackageManifest {
   name: string;
   version: string;
+  files?: string[];
   pi: { extensions?: string[]; image?: string };
   publishConfig?: { access?: string };
 }
 
-test("npm pack includes only release package assets", async (t) => {
+test("npm pack includes only the runtime extension package", async (t) => {
   const packDir = await mkdtemp(join(tmpdir(), "pi-subagents-bridge-pack-"));
   t.after(async () => {
     await rm(packDir, { recursive: true, force: true });
@@ -51,26 +52,14 @@ test("npm pack includes only release package assets", async (t) => {
       "",
     ),
   );
-  assert.ok(result.size < 75_000);
-  assert.ok(files.has("package.json"));
-  assert.ok(files.has("README.md"));
-  assert.ok(files.has("CHANGELOG.md"));
-  assert.ok(files.has("LICENSE"));
-  assert.ok(files.has("src/index.ts"));
-  assert.ok(files.has("assets/bridge.svg"));
-  assert.ok(files.has("docs/design.md"));
-  assert.ok(files.has("docs/protocol-research.md"));
-  assert.equal(files.has("tsconfig.json"), false);
-  assert.equal(files.has("eslint.config.js"), false);
-  assert.equal(
-    [...files].some((file) => file.startsWith("test/")),
-    false,
-  );
-  assert.equal(
-    [...files].some((file) => file.startsWith(".github/")),
-    false,
-  );
+  assert.deepEqual([...files].sort(), [
+    "LICENSE",
+    "README.md",
+    "package.json",
+    "src/index.ts",
+  ]);
 
+  assert.deepEqual(manifest.files, ["src/index.ts"]);
   assert.deepEqual(manifest.pi.extensions, ["./src/index.ts"]);
   assert.match(manifest.pi.image ?? "", /^https:\/\//);
   assert.equal(manifest.publishConfig?.access, "public");
@@ -110,6 +99,9 @@ function isPackageManifest(value: unknown): value is PackageManifest {
     typeof value.name === "string" &&
     typeof value.version === "string" &&
     isRecord(value.pi) &&
+    (value.files === undefined ||
+      (Array.isArray(value.files) &&
+        value.files.every((item) => typeof item === "string"))) &&
     (value.pi.extensions === undefined ||
       (Array.isArray(value.pi.extensions) &&
         value.pi.extensions.every((item) => typeof item === "string"))) &&
