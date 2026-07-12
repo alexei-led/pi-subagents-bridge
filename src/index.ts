@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerPlanExecRpc } from "./plan-exec-rpc.js";
 
 // Protocol evidence (installed sources verified against npm pack pi-subagents@0.34.0):
 // - @tintinweb/pi-tasks src/index.ts:103-119 reply channel/envelope,
@@ -402,6 +403,9 @@ export function registerBridge(
   const completionPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const unsubscribes: Unsubscribe[] = [];
   let disposed = false;
+  const planExecRpc = registerPlanExecRpc(pi.events, {
+    timeoutMs: spawnTimeoutMs,
+  });
 
   const track = (unsubscribe: Unsubscribe | void): void => {
     if (typeof unsubscribe === "function") unsubscribes.push(unsubscribe);
@@ -728,6 +732,7 @@ export function registerBridge(
     dispose() {
       if (disposed) return;
       disposed = true;
+      planExecRpc.dispose();
       if (state.registration === registration) {
         delete state.registration;
       }

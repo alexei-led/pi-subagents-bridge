@@ -4,6 +4,12 @@
 
 - None.
 
+## 0.1.6 - 2026-07-12
+
+- Added the generic plan-exec v1 RPC with cwd forwarding, durable spawn-operation idempotency, and normalized status/result/stop/adopt responses over the pi-subagents v1 RPC.
+- Preserved in-flight durable spawn operations across bridge re-registration and added contract validation for request and upstream reply envelopes.
+- Documented the plan-exec protocol and included its runtime module in the npm package.
+
 ## 0.1.5 - 2026-07-12
 
 - Limited bridge-owned task runs to two concurrent agents and applied a 12-turn default when TaskExecute does not provide maxTurns.

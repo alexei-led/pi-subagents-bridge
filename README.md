@@ -10,7 +10,7 @@
 - [`@tintinweb/pi-tasks`](https://www.npmjs.com/package/@tintinweb/pi-tasks)
 - [`pi-subagents`](https://www.npmjs.com/package/pi-subagents)
 
-It makes `TaskExecute` work with `pi-subagents` by translating the `pi-tasks` subagent RPC into the RPC and completion events that `pi-subagents` exposes.
+It makes `TaskExecute` work with `pi-subagents` by translating the `pi-tasks` subagent RPC into the RPC and completion events that `pi-subagents` exposes. It also exposes a separate, generic plan-exec RPC for direct execution clients.
 
 ## What it does
 
@@ -24,6 +24,7 @@ Specifically, it:
 - forwards `spawn` and `stop` requests to `pi-subagents`
 - translates `pi-subagents` completion events back into `pi-tasks` task updates
 - falls back to polling `pi-subagents` run `status` if an async completion event is missed
+- keeps the generic plan-exec RPC separate from all `pi-tasks` channels
 
 ### Request and completion flow
 
@@ -118,6 +119,19 @@ For runs the bridge spawned itself, it converts `pi-subagents` outcomes into `pi
 
 If `subagent:async-complete` does not arrive, the bridge polls `pi-subagents` `status`, reads the result file path from that status output, and emits the same completion event that `pi-tasks` expects. If a terminal status arrives before its result file is readable, the bridge retries for up to five seconds instead of silently dropping the result.
 
+## Generic plan-exec RPC
+
+This protocol is independent of `pi-tasks`. Send `{ version: 1, requestId, method, ... }` on `plan-exec:bridge:v1:request`; replies use `plan-exec:bridge:v1:reply:<requestId>`.
+
+Supported methods are `ping`, `spawn`, `status`, `result`, `stop`, and `adopt`.
+
+- `spawn` requires a durable top-level `operationId`, top-level `cwd` when needed, and `params.agent` plus `params.task`. It forwards supported execution fields (`async`, `clarify`, `context`, `model`, `turnBudget`, `control`, `acceptance`, and `timeout`) to `pi-subagents`; `timeout` maps to its `timeoutMs` field. It returns `{ runId, asyncDir? }`. A repeated operation ID reuses the original reply for this extension lifetime.
+- `status` and `result` return normalized observations from the `pi-subagents` status RPC. `result` uses status because `pi-subagents` has no separate result RPC.
+- `stop` delegates to the `pi-subagents` stop RPC.
+- `adopt` validates and observes a run but does not transfer ownership or promise cross-session stop support.
+
+Failures use `{ success: false, error: { code, message } }`.
+
 ## TaskExecute-specific safeguards
 
 `TaskExecute` is queue-style orchestration, not direct subagent supervision.
@@ -141,7 +155,7 @@ It does:
 It does not:
 
 - replace `pi-tasks` task orchestration
-- act as a generic adapter for every `pi-subagents` RPC method
+- act as a generic adapter for `pi-subagents` methods beyond the documented plan-exec protocol
 - support loading `@tintinweb/pi-subagents` alongside this bridge
 
 Do not load `@tintinweb/pi-subagents` at the same time as this package.

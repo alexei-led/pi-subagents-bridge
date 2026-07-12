@@ -1,6 +1,6 @@
 {
   "name": "@alexeiled/pi-subagents-bridge",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Protocol adapter that lets @tintinweb/pi-tasks TaskExecute spawn nicobailon/pi-subagents.",
   "type": "module",
   "main": "./src/index.ts",
@@ -22,7 +22,8 @@
     "rpc"
   ],
   "files": [
-    "src/index.ts"
+    "src/index.ts",
+    "src/plan-exec-rpc.ts"
   ],
   "scripts": {
     "lint": "eslint . --cache --cache-strategy content",

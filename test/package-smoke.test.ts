@@ -57,9 +57,10 @@ test("npm pack includes only the runtime extension package", async (t) => {
     "README.md",
     "package.json",
     "src/index.ts",
+    "src/plan-exec-rpc.ts",
   ]);
 
-  assert.deepEqual(manifest.files, ["src/index.ts"]);
+  assert.deepEqual(manifest.files, ["src/index.ts", "src/plan-exec-rpc.ts"]);
   assert.deepEqual(manifest.pi.extensions, ["./src/index.ts"]);
   assert.match(manifest.pi.image ?? "", /^https:\/\//);
   assert.equal(manifest.publishConfig?.access, "public");
