@@ -106,7 +106,7 @@ Spawned runs are always forwarded as:
 - `clarify: false`
 - `context: "fresh"`
 
-The bridge returns the spawned run ID back to `pi-tasks` and tracks that run as bridge-owned state.
+The bridge returns the spawned run ID back to `pi-tasks` and tracks that run as bridge-owned state. It runs at most **two** bridge-owned tasks at once. A task without an explicit `maxTurns` receives a **12-turn** budget.
 
 ### Completion flow
 
@@ -116,7 +116,7 @@ For runs the bridge spawned itself, it converts `pi-subagents` outcomes into `pi
 - failure → `subagents:failed`
 - stopped or paused run → `subagents:failed` with `status: "stopped"`
 
-If `subagent:async-complete` does not arrive, the bridge polls `pi-subagents` `status`, reads the result file path from that status output, and emits the same completion event that `pi-tasks` expects.
+If `subagent:async-complete` does not arrive, the bridge polls `pi-subagents` `status`, reads the result file path from that status output, and emits the same completion event that `pi-tasks` expects. If a terminal status arrives before its result file is readable, the bridge retries for up to five seconds instead of silently dropping the result.
 
 ## TaskExecute-specific safeguards
 
@@ -126,7 +126,7 @@ Because of that, the bridge also applies two execution defaults to bridge-spawne
 - disables `pi-subagents` acceptance gating
 - disables `pi-subagents` live control nudges
 
-This avoids false pauses on missing acceptance reports and avoids misleading background `needs attention` notices for normal task runs.
+This avoids false pauses on missing acceptance reports and avoids misleading background `needs attention` notices for normal task runs. Repeated copies of the same spawn request are coalesced, so retries cannot launch duplicate bridge-owned agents.
 
 ## Scope and limits
 

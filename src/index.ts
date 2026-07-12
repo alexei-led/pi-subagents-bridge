@@ -25,6 +25,11 @@ const NB_COMPLETE_EVENT = "subagent:async-complete";
 const NB_REPLY_PREFIX = "subagents:rpc:v1:reply:";
 const DEFAULT_SPAWN_TIMEOUT_MS = 24_000;
 const DEFAULT_COMPLETION_POLL_INTERVAL_MS = 2_000;
+const DEFAULT_MAX_ACTIVE_RUNS = 2;
+const DEFAULT_MAX_TURNS = 12;
+const DEFAULT_TERMINAL_RESULT_GRACE_MS = 5_000;
+const DEFAULT_SPAWN_REPLY_CACHE_TTL_MS = 60_000;
+const MAX_FAILURE_PARTIAL_OUTPUT_CHARS = 4_000;
 
 const AGENT_TYPE_ALIASES = new Map<string, string>([
   ["general-purpose", "delegate"],
@@ -45,6 +50,10 @@ const BRIDGE_CONTROL_CONFIG = {
 interface BridgeOptions {
   spawnTimeoutMs?: number;
   completionPollIntervalMs?: number;
+  maxActiveRuns?: number;
+  defaultMaxTurns?: number;
+  terminalResultGraceMs?: number;
+  spawnReplyCacheTtlMs?: number;
 }
 
 type BridgeHost = Pick<ExtensionAPI, "events">;
@@ -53,9 +62,24 @@ type RpcReply<T> =
   { success: true; data: T } | { success: false; error: string };
 type CompletionKind = "completed" | "failed" | "stopped";
 
+interface BridgeRegistration {
+  dispose(): void;
+}
+
+interface SpawnReplyCacheEntry {
+  reply: RpcReply<{ id: string }>;
+  expiresAt: number;
+}
+
 interface BridgeState {
   ownedRunIds: Set<string>;
   completedRunIds: Set<string>;
+  stoppingRunIds: Set<string>;
+  pendingSpawnCount: number;
+  inFlightSpawnReplies: Map<string, Promise<RpcReply<{ id: string }>>>;
+  spawnReplyCache: Map<string, SpawnReplyCacheEntry>;
+  terminalResultDeadlines: Map<string, number>;
+  registration?: BridgeRegistration;
 }
 
 const bridgeStates = new WeakMap<BridgeHost["events"], BridgeState>();
@@ -149,16 +173,33 @@ function extractStoppedResult(payload: AsyncCompleteRaw): string | undefined {
 }
 
 function extractFailureError(payload: AsyncCompleteRaw): string {
-  const error = text(payload.error);
-  if (error) return error;
-  if (Array.isArray(payload.results)) {
+  let error = text(payload.error);
+  if (!error && Array.isArray(payload.results)) {
     for (const result of payload.results) {
       if (!isRecord(result)) continue;
-      const error = text(result.error);
-      if (error) return error;
+      error = text(result.error);
+      if (error) break;
     }
   }
-  return "Agent failed";
+
+  const partialOutput =
+    text(payload.output) ??
+    (Array.isArray(payload.results)
+      ? payload.results
+          .filter(isRecord)
+          .map((result) => text(result.output))
+          .filter((output): output is string => output !== undefined)
+          .join("\n\n")
+      : undefined);
+  if (!partialOutput) return error ?? "Agent failed";
+
+  const truncatedOutput = partialOutput.slice(
+    0,
+    MAX_FAILURE_PARTIAL_OUTPUT_CHARS,
+  );
+  const suffix =
+    partialOutput.length > truncatedOutput.length ? "\n[truncated]" : "";
+  return `${error ?? "Agent failed"}\n\nPartial output:\n${truncatedOutput}${suffix}`;
 }
 
 function classifyCompleteEvent(payload: AsyncCompleteRaw): CompletionKind {
@@ -275,16 +316,29 @@ function classifyStatusText(statusText: string): CompletionKind | undefined {
   return undefined;
 }
 
-function readResultPayload(
-  resultPath: string | undefined,
-): AsyncCompleteRaw | undefined {
-  if (!resultPath || !fs.existsSync(resultPath)) return undefined;
+function readResultPayload(resultPath: string | undefined): {
+  payload?: AsyncCompleteRaw;
+  error?: string;
+} {
+  if (!resultPath) return {};
   try {
     const parsed: unknown = JSON.parse(fs.readFileSync(resultPath, "utf8"));
-    return isRecord(parsed) ? parsed : undefined;
+    if (!isRecord(parsed)) {
+      return { error: "result payload is not a JSON object" };
+    }
+    return { payload: parsed };
   } catch {
-    return undefined;
+    return { error: "result payload is not readable yet" };
   }
+}
+
+function positiveIntegerOrDefault(
+  value: number | undefined,
+  fallback: number,
+): number {
+  return value !== undefined && Number.isInteger(value) && value > 0
+    ? value
+    : fallback;
 }
 
 function getBridgeState(events: BridgeHost["events"]): BridgeState {
@@ -294,6 +348,11 @@ function getBridgeState(events: BridgeHost["events"]): BridgeState {
   const created: BridgeState = {
     ownedRunIds: new Set<string>(),
     completedRunIds: new Set<string>(),
+    stoppingRunIds: new Set<string>(),
+    pendingSpawnCount: 0,
+    inFlightSpawnReplies: new Map(),
+    spawnReplyCache: new Map(),
+    terminalResultDeadlines: new Map(),
   };
   bridgeStates.set(events, created);
   return created;
@@ -303,19 +362,42 @@ export function registerBridge(
   pi: BridgeHost,
   options: BridgeOptions = {},
 ): { dispose: () => void } {
-  const requestedSpawnTimeoutMs = options.spawnTimeoutMs;
-  const spawnTimeoutMs =
-    requestedSpawnTimeoutMs !== undefined && requestedSpawnTimeoutMs > 0
-      ? requestedSpawnTimeoutMs
-      : DEFAULT_SPAWN_TIMEOUT_MS;
-  const requestedCompletionPollIntervalMs = options.completionPollIntervalMs;
-  const completionPollIntervalMs =
-    requestedCompletionPollIntervalMs !== undefined &&
-    requestedCompletionPollIntervalMs > 0
-      ? requestedCompletionPollIntervalMs
-      : DEFAULT_COMPLETION_POLL_INTERVAL_MS;
+  const state = getBridgeState(pi.events);
+  if (state.registration) return state.registration;
 
-  const { ownedRunIds, completedRunIds } = getBridgeState(pi.events);
+  const spawnTimeoutMs = positiveIntegerOrDefault(
+    options.spawnTimeoutMs,
+    DEFAULT_SPAWN_TIMEOUT_MS,
+  );
+  const completionPollIntervalMs = positiveIntegerOrDefault(
+    options.completionPollIntervalMs,
+    DEFAULT_COMPLETION_POLL_INTERVAL_MS,
+  );
+  const maxActiveRuns = positiveIntegerOrDefault(
+    options.maxActiveRuns,
+    DEFAULT_MAX_ACTIVE_RUNS,
+  );
+  const defaultMaxTurns = positiveIntegerOrDefault(
+    options.defaultMaxTurns,
+    DEFAULT_MAX_TURNS,
+  );
+  const terminalResultGraceMs = positiveIntegerOrDefault(
+    options.terminalResultGraceMs,
+    DEFAULT_TERMINAL_RESULT_GRACE_MS,
+  );
+  const spawnReplyCacheTtlMs = positiveIntegerOrDefault(
+    options.spawnReplyCacheTtlMs,
+    DEFAULT_SPAWN_REPLY_CACHE_TTL_MS,
+  );
+
+  const {
+    ownedRunIds,
+    completedRunIds,
+    stoppingRunIds,
+    inFlightSpawnReplies,
+    spawnReplyCache,
+    terminalResultDeadlines,
+  } = state;
   const pendingRpcControllers = new Set<AbortController>();
   const completionPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const unsubscribes: Unsubscribe[] = [];
@@ -343,6 +425,8 @@ export function registerBridge(
 
     completedRunIds.add(runId);
     ownedRunIds.delete(runId);
+    stoppingRunIds.delete(runId);
+    terminalResultDeadlines.delete(runId);
     clearCompletionPoll(runId);
 
     if (kind === "stopped") {
@@ -397,8 +481,39 @@ export function registerBridge(
       const statusText = extractRpcText(reply);
       const kind = statusText ? classifyStatusText(statusText) : undefined;
       if (kind && statusText) {
-        const payload = readResultPayload(parseResultPath(statusText));
-        emitCompletion(runId, kind, payload);
+        const resultPath = parseResultPath(statusText);
+        const result = readResultPayload(resultPath);
+        if (result.payload) {
+          terminalResultDeadlines.delete(runId);
+          emitCompletion(runId, kind, result.payload);
+          return;
+        }
+
+        if (resultPath) {
+          const now = Date.now();
+          const deadline =
+            terminalResultDeadlines.get(runId) ?? now + terminalResultGraceMs;
+          terminalResultDeadlines.set(runId, deadline);
+          if (now < deadline) {
+            const timer = setTimeout(
+              () => {
+                void pollRunCompletion(runId);
+              },
+              Math.min(completionPollIntervalMs, deadline - now),
+            );
+            timer.unref();
+            completionPollTimers.set(runId, timer);
+            return;
+          }
+
+          emitCompletion(runId, kind, {
+            [kind === "failed" ? "error" : "summary"]:
+              `Bridge warning: ${result.error ?? "result payload was unavailable"} after ${terminalResultGraceMs}ms.`,
+          });
+          return;
+        }
+
+        emitCompletion(runId, kind);
         return;
       }
     } catch {
@@ -443,10 +558,32 @@ export function registerBridge(
     }),
   );
 
-  const handleSpawn = async (raw: unknown): Promise<void> => {
+  const pruneSpawnReplyCache = (): void => {
+    const now = Date.now();
+    for (const [requestId, entry] of spawnReplyCache) {
+      if (entry.expiresAt <= now) spawnReplyCache.delete(requestId);
+    }
+  };
+
+  const handleSpawn = (raw: unknown): void => {
     if (!isRecord(raw)) return;
     const requestId = text(raw.requestId);
     if (!requestId) return;
+
+    pruneSpawnReplyCache();
+    const cachedReply = spawnReplyCache.get(requestId)?.reply;
+    if (cachedReply) {
+      emitReply(pi.events, SPAWN_CHANNEL, requestId, cachedReply);
+      return;
+    }
+
+    const inFlightReply = inFlightSpawnReplies.get(requestId);
+    if (inFlightReply) {
+      void inFlightReply.then((reply) => {
+        if (!disposed) emitReply(pi.events, SPAWN_CHANNEL, requestId, reply);
+      });
+      return;
+    }
 
     const agentType = text(raw.type);
     const prompt = text(raw.prompt);
@@ -458,75 +595,89 @@ export function registerBridge(
       return;
     }
 
-    const optionsRaw = normalizeSpawnOptions(raw.options);
-    const model = text(optionsRaw?.model);
-    const maxTurns =
-      typeof optionsRaw?.maxTurns === "number" &&
-      Number.isInteger(optionsRaw.maxTurns) &&
-      optionsRaw.maxTurns > 0
-        ? optionsRaw.maxTurns
-        : undefined;
-    const spawnParams: Record<string, unknown> = {
-      agent: resolveAgentType(agentType),
-      task: prompt,
-      async: true,
-      clarify: false,
-      context: "fresh",
-      // pi-tasks has its own task/result contract and no channel for pi-subagents'
-      // structured acceptance gate. Without this override, async write-capable runs
-      // infer reviewed/checked acceptance and can pause on a missing
-      // `acceptance-report` even when the task itself succeeded.
-      acceptance: BRIDGE_ACCEPTANCE_CONFIG,
-      // TaskExecute is fire-and-forget orchestration, not an interactive subagent
-      // supervisor. Disable pi-subagents live control nudges so background tasks
-      // do not surface misleading 60s "needs attention" prompts through the bridge.
-      control: BRIDGE_CONTROL_CONFIG,
-      ...(model ? { model } : {}),
-      ...(maxTurns ? { turnBudget: { maxTurns } } : {}),
+    const spawn = async (): Promise<RpcReply<{ id: string }>> => {
+      if (ownedRunIds.size + state.pendingSpawnCount >= maxActiveRuns) {
+        return {
+          success: false,
+          error: `bridge capacity reached: at most ${maxActiveRuns} active runs`,
+        };
+      }
+
+      const optionsRaw = normalizeSpawnOptions(raw.options);
+      const model = text(optionsRaw?.model);
+      const maxTurns =
+        typeof optionsRaw?.maxTurns === "number" &&
+        Number.isInteger(optionsRaw.maxTurns) &&
+        optionsRaw.maxTurns > 0
+          ? optionsRaw.maxTurns
+          : defaultMaxTurns;
+      const spawnParams: Record<string, unknown> = {
+        agent: resolveAgentType(agentType),
+        task: prompt,
+        async: true,
+        clarify: false,
+        context: "fresh",
+        acceptance: BRIDGE_ACCEPTANCE_CONFIG,
+        control: BRIDGE_CONTROL_CONFIG,
+        ...(model ? { model } : {}),
+        turnBudget: { maxTurns },
+      };
+
+      const controller = new AbortController();
+      state.pendingSpawnCount += 1;
+      pendingRpcControllers.add(controller);
+
+      try {
+        const reply = await requestNicobailonRpc<unknown>(
+          pi.events,
+          "spawn",
+          spawnParams,
+          spawnTimeoutMs,
+          controller.signal,
+        );
+        if (disposed || controller.signal.aborted) {
+          return { success: false, error: "Bridge disposed" };
+        }
+
+        const runId = extractSpawnRunId(reply);
+        if (!runId) {
+          throw new Error("nicobailon spawn reply did not include a run id");
+        }
+
+        ownedRunIds.add(runId);
+        ensureCompletionPoll(runId);
+        return { success: true, data: { id: runId } };
+      } catch (error: unknown) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      } finally {
+        state.pendingSpawnCount -= 1;
+        pendingRpcControllers.delete(controller);
+      }
     };
 
-    const controller = new AbortController();
-    pendingRpcControllers.add(controller);
-
-    try {
-      // pi-subagents rpc.ts: dataFromToolResult keeps async spawn metadata under details,
-      // including details.runId/details.asyncId for the launched async run.
-      const reply = await requestNicobailonRpc<unknown>(
-        pi.events,
-        "spawn",
-        spawnParams,
-        spawnTimeoutMs,
-        controller.signal,
-      );
-      if (disposed) return;
-
-      const runId = extractSpawnRunId(reply);
-      if (!runId)
-        throw new Error("nicobailon spawn reply did not include a run id");
-
-      ownedRunIds.add(runId);
-      ensureCompletionPoll(runId);
-      emitReply(pi.events, SPAWN_CHANNEL, requestId, {
-        success: true,
-        data: { id: runId },
-      } satisfies RpcReply<{ id: string }>);
-    } catch (error: unknown) {
-      if (disposed || controller.signal.aborted) return;
-
-      emitReply(pi.events, SPAWN_CHANNEL, requestId, {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    } finally {
-      pendingRpcControllers.delete(controller);
-    }
+    const spawnReply = spawn();
+    inFlightSpawnReplies.set(requestId, spawnReply);
+    void spawnReply.then((reply) => {
+      if (inFlightSpawnReplies.get(requestId) === spawnReply) {
+        inFlightSpawnReplies.delete(requestId);
+      }
+      if (
+        reply.success ||
+        !reply.error.startsWith("bridge capacity reached:")
+      ) {
+        spawnReplyCache.set(requestId, {
+          reply,
+          expiresAt: Date.now() + spawnReplyCacheTtlMs,
+        });
+      }
+      if (!disposed) emitReply(pi.events, SPAWN_CHANNEL, requestId, reply);
+    });
   };
 
-  track(
-    pi.events.on(SPAWN_CHANNEL, (raw: unknown) => {
-      void handleSpawn(raw);
-    }),
-  );
+  track(pi.events.on(SPAWN_CHANNEL, handleSpawn));
 
   track(
     pi.events.on(STOP_CHANNEL, (raw: unknown) => {
@@ -535,7 +686,8 @@ export function registerBridge(
       if (!requestId) return;
 
       const agentId = text(raw.agentId) ?? text(raw.id) ?? text(raw.runId);
-      if (agentId && ownedRunIds.has(agentId)) {
+      if (agentId && ownedRunIds.has(agentId) && !stoppingRunIds.has(agentId)) {
+        stoppingRunIds.add(agentId);
         try {
           // pi-subagents rpc.ts normalizes stop targets from id/runId; use canonical id here.
           pi.events.emit(NB_REQUEST_CHANNEL, {
@@ -572,9 +724,13 @@ export function registerBridge(
 
   pi.events.emit(READY_EVENT, {});
 
-  return {
+  const registration: BridgeRegistration = {
     dispose() {
+      if (disposed) return;
       disposed = true;
+      if (state.registration === registration) {
+        delete state.registration;
+      }
 
       for (const controller of pendingRpcControllers) {
         controller.abort();
@@ -596,6 +752,8 @@ export function registerBridge(
       }
     },
   };
+  state.registration = registration;
+  return registration;
 }
 
 export default function bridgeExtension(pi: ExtensionAPI): void {

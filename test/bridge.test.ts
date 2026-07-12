@@ -71,6 +71,34 @@ test("spawn forwards the normalized pi-tasks request and returns the launched ru
   assert.deepEqual(await reply, { success: true, data: { id: "run-1" } });
 });
 
+test("spawn defaults to a twelve-turn budget", async () => {
+  const bus = new FakeEventBus();
+  registerBridge({ events: bus });
+
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-default-turns"));
+  bus.emit(SPAWN_CHANNEL, {
+    requestId: "spawn-default-turns",
+    type: "general-purpose",
+    prompt: "Do the task",
+  });
+
+  const request = bus.lastPayload(NB_REQUEST_CHANNEL);
+  assert.ok(isRecord(request));
+  assert.ok(isRecord(request.params));
+  assert.deepEqual(request.params.turnBudget, { maxTurns: 12 });
+
+  bus.emit(nbReplyChannel(String(request.requestId)), {
+    version: 1,
+    requestId: request.requestId,
+    success: true,
+    data: { details: { runId: "default-turns" } },
+  });
+  assert.deepEqual(await reply, {
+    success: true,
+    data: { id: "default-turns" },
+  });
+});
+
 test("spawn supports documented aliases, keeps custom agent names unchanged, and disables pi-subagents acceptance/control gates", async () => {
   const cases = [
     { type: "general-purpose", expectedAgent: "delegate" },
@@ -236,6 +264,107 @@ test("spawn accepts fallback run ids and surfaces reply-shape errors", async () 
   }
 });
 
+test("duplicate spawn requests start one run and replay its response", async () => {
+  const bus = new FakeEventBus();
+  registerBridge({ events: bus });
+
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-duplicate"));
+  const request = {
+    requestId: "spawn-duplicate",
+    type: "general-purpose",
+    prompt: "Do the task",
+  };
+  bus.emit(SPAWN_CHANNEL, request);
+  bus.emit(SPAWN_CHANNEL, request);
+
+  assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
+  const spawned = bus.lastPayload(NB_REQUEST_CHANNEL);
+  assert.ok(isRecord(spawned));
+  bus.emit(nbReplyChannel(String(spawned.requestId)), {
+    version: 1,
+    requestId: spawned.requestId,
+    success: true,
+    data: { details: { runId: "deduped-run" } },
+  });
+
+  assert.deepEqual(await reply, { success: true, data: { id: "deduped-run" } });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(bus.count(replyChannel(SPAWN_CHANNEL, "spawn-duplicate")), 2);
+});
+
+test("bridge registration is idempotent and cannot duplicate spawn handlers", async () => {
+  const bus = new FakeEventBus();
+  const firstBridge = registerBridge({ events: bus });
+  const secondBridge = registerBridge({ events: bus });
+  assert.equal(secondBridge, firstBridge);
+
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-single-handler"));
+  bus.emit(SPAWN_CHANNEL, {
+    requestId: "spawn-single-handler",
+    type: "general-purpose",
+    prompt: "Do the task",
+  });
+
+  assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
+  const request = bus.lastPayload(NB_REQUEST_CHANNEL);
+  assert.ok(isRecord(request));
+  bus.emit(nbReplyChannel(String(request.requestId)), {
+    version: 1,
+    requestId: request.requestId,
+    success: true,
+    data: { details: { runId: "single-handler-run" } },
+  });
+  assert.deepEqual(await reply, {
+    success: true,
+    data: { id: "single-handler-run" },
+  });
+});
+
+test("bridge limits active runs to two and permits retry after capacity frees", async () => {
+  const bus = new FakeEventBus();
+  registerBridge({ events: bus });
+  await spawnOwnedRun(bus, "capacity-one");
+  await spawnOwnedRun(bus, "capacity-two");
+
+  const requestsBefore = bus.count(NB_REQUEST_CHANNEL);
+  const spawnRequest = {
+    requestId: "capacity-three",
+    type: "general-purpose",
+    prompt: "Do the task",
+  };
+  const rejected = once(bus, replyChannel(SPAWN_CHANNEL, "capacity-three"));
+  bus.emit(SPAWN_CHANNEL, spawnRequest);
+
+  assert.deepEqual(await rejected, {
+    success: false,
+    error: "bridge capacity reached: at most 2 active runs",
+  });
+  assert.equal(bus.count(NB_REQUEST_CHANNEL), requestsBefore);
+
+  bus.emit(NB_COMPLETE_EVENT, {
+    runId: "capacity-one",
+    success: true,
+    state: "complete",
+    summary: "done",
+  });
+
+  const retried = once(bus, replyChannel(SPAWN_CHANNEL, "capacity-three"));
+  bus.emit(SPAWN_CHANNEL, spawnRequest);
+  assert.equal(bus.count(NB_REQUEST_CHANNEL), requestsBefore + 1);
+  const request = bus.lastPayload(NB_REQUEST_CHANNEL);
+  assert.ok(isRecord(request));
+  bus.emit(nbReplyChannel(String(request.requestId)), {
+    version: 1,
+    requestId: request.requestId,
+    success: true,
+    data: { details: { runId: "capacity-three" } },
+  });
+  assert.deepEqual(await retried, {
+    success: true,
+    data: { id: "capacity-three" },
+  });
+});
+
 test("spawn timeout uses the configured timeout and cleans up the listener", async () => {
   const bus = new FakeEventBus();
   registerBridge({ events: bus }, { spawnTimeoutMs: 1 });
@@ -258,30 +387,30 @@ test("spawn timeout uses the configured timeout and cleans up the listener", asy
   assert.equal(bus.listenerCount(nbReplyChannel(String(request.requestId))), 0);
 });
 
-test("stop always replies success, forwards owned runs, and ignores unknown runs", async () => {
+test("stop replies success, dedupes owned runs, and ignores unknown runs", async () => {
   const bus = new FakeEventBus();
   registerBridge({ events: bus });
   await spawnOwnedRun(bus, "run-stop");
 
+  const requestsBeforeStop = bus.count(NB_REQUEST_CHANNEL);
   for (const requestShape of [
     { requestId: "stop-agentId", agentId: "run-stop" },
     { requestId: "stop-id", id: "run-stop" },
     { requestId: "stop-runId", runId: "run-stop" },
   ]) {
-    const before = bus.count(NB_REQUEST_CHANNEL);
     const reply = once(
       bus,
       replyChannel(STOP_CHANNEL, String(requestShape.requestId)),
     );
     bus.emit(STOP_CHANNEL, requestShape);
-
     assert.deepEqual(await reply, { success: true, data: undefined });
-    assert.equal(bus.count(NB_REQUEST_CHANNEL), before + 1);
-    const request = bus.lastPayload(NB_REQUEST_CHANNEL);
-    assert.ok(isRecord(request));
-    assert.equal(request.method, "stop");
-    assert.deepEqual(request.params, { id: "run-stop" });
   }
+
+  assert.equal(bus.count(NB_REQUEST_CHANNEL), requestsBeforeStop + 1);
+  const stopRequest = bus.lastPayload(NB_REQUEST_CHANNEL);
+  assert.ok(isRecord(stopRequest));
+  assert.equal(stopRequest.method, "stop");
+  assert.deepEqual(stopRequest.params, { id: "run-stop" });
 
   const before = bus.count(NB_REQUEST_CHANNEL);
   const reply = once(bus, replyChannel(STOP_CHANNEL, "stop-unknown"));
@@ -367,6 +496,21 @@ test("completion events use the documented result and error fallbacks", async ()
         results: [{ error: "child failure" }],
       },
       expected: { id: "run-aborted", error: "child failure", status: "failed" },
+    },
+    {
+      label: "partial output is retained with failure",
+      payload: {
+        runId: "run-partial-failure",
+        success: false,
+        state: "failed",
+        error: "validation failed",
+        results: [{ output: "useful partial result" }],
+      },
+      expected: {
+        id: "run-partial-failure",
+        error: "validation failed\n\nPartial output:\nuseful partial result",
+        status: "failed",
+      },
     },
     {
       label: "generic failure fallback",
@@ -512,6 +656,121 @@ test("status polling emits completion when async-complete never arrives", async 
   assert.deepEqual(await completed, {
     id: "run-polled",
     result: "polled output",
+  });
+});
+
+test("status polling waits for a terminal result file before completing", async (t) => {
+  const bus = new FakeEventBus();
+  const bridge = registerBridge(
+    { events: bus },
+    { completionPollIntervalMs: 1, terminalResultGraceMs: 100 },
+  );
+  t.after(() => bridge.dispose());
+
+  const tempDir = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-retry-"));
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+  const resultPath = join(tempDir, "late-result.json");
+  let statusChecks = 0;
+  bus.on(NB_REQUEST_CHANNEL, (payload) => {
+    if (!isRecord(payload) || payload.method !== "status") return;
+    statusChecks += 1;
+    if (statusChecks === 2) {
+      writeFileSync(
+        resultPath,
+        JSON.stringify({
+          runId: "run-late-result",
+          success: true,
+          state: "complete",
+          summary: "late output",
+        }),
+        "utf8",
+      );
+    }
+    bus.emit(nbReplyChannel(String(payload.requestId)), {
+      version: 1,
+      requestId: payload.requestId,
+      method: "status",
+      success: true,
+      data: {
+        text: `Run: run-late-result\nState: complete\nResult: ${resultPath}`,
+      },
+    });
+  });
+
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-late-result"));
+  const completed = once(bus, COMPLETED_EVENT, 250);
+  bus.emit(SPAWN_CHANNEL, {
+    requestId: "spawn-late-result",
+    type: "general-purpose",
+    prompt: "Do the task",
+  });
+  const request = bus.lastPayload(NB_REQUEST_CHANNEL);
+  assert.ok(isRecord(request));
+  bus.emit(nbReplyChannel(String(request.requestId)), {
+    version: 1,
+    requestId: request.requestId,
+    success: true,
+    data: { details: { runId: "run-late-result" } },
+  });
+
+  assert.deepEqual(await reply, {
+    success: true,
+    data: { id: "run-late-result" },
+  });
+  assert.deepEqual(await completed, {
+    id: "run-late-result",
+    result: "late output",
+  });
+  assert.equal(statusChecks, 2);
+});
+
+test("status polling reports a missing terminal result after its grace period", async (t) => {
+  const bus = new FakeEventBus();
+  const bridge = registerBridge(
+    { events: bus },
+    { completionPollIntervalMs: 1, terminalResultGraceMs: 1 },
+  );
+  t.after(() => bridge.dispose());
+
+  const resultPath = join(tmpdir(), "pi-subagents-bridge-missing-result.json");
+  rmSync(resultPath, { force: true });
+  t.after(() => rmSync(resultPath, { force: true }));
+  bus.on(NB_REQUEST_CHANNEL, (payload) => {
+    if (!isRecord(payload) || payload.method !== "status") return;
+    bus.emit(nbReplyChannel(String(payload.requestId)), {
+      version: 1,
+      requestId: payload.requestId,
+      method: "status",
+      success: true,
+      data: {
+        text: `Run: run-missing-result\nState: complete\nResult: ${resultPath}`,
+      },
+    });
+  });
+
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-missing-result"));
+  const completed = once(bus, COMPLETED_EVENT, 250);
+  bus.emit(SPAWN_CHANNEL, {
+    requestId: "spawn-missing-result",
+    type: "general-purpose",
+    prompt: "Do the task",
+  });
+  const request = bus.lastPayload(NB_REQUEST_CHANNEL);
+  assert.ok(isRecord(request));
+  bus.emit(nbReplyChannel(String(request.requestId)), {
+    version: 1,
+    requestId: request.requestId,
+    success: true,
+    data: { details: { runId: "run-missing-result" } },
+  });
+
+  assert.deepEqual(await reply, {
+    success: true,
+    data: { id: "run-missing-result" },
+  });
+  assert.deepEqual(await completed, {
+    id: "run-missing-result",
+    result: "Bridge warning: result payload is not readable yet after 1ms.",
   });
 });
 

@@ -26,6 +26,8 @@ State:
 
 - `ownedRunIds`: run IDs spawned through this bridge only.
 - `completedRunIds`: dedupe set for async completion events.
+- in-flight and short-lived spawn reply maps: coalesce repeated request IDs.
+- terminal-result deadlines: bound retries when a terminal result file is not readable yet.
 
 Inputs:
 
@@ -62,7 +64,8 @@ Reason:
    - `general-purpose` → `delegate`
    - `Explore` / `explore` → `scout`
    - everything else passes through unchanged
-3. Bridge forwards a v1 RPC request to pi-subagents with:
+3. Bridge rejects the request if two bridge-owned runs are already active.
+4. Bridge forwards a v1 RPC request to pi-subagents with:
    - `agent`
    - `task`
    - `async: true`
@@ -71,9 +74,11 @@ Reason:
    - `acceptance: { level: "none", reason: ... }`
    - `control: { enabled: false }`
    - optional `model`
-   - optional `turnBudget.maxTurns`
-4. Bridge reads the returned run ID from `data.details.runId`, with `details.asyncId` and top-level fallbacks as backup.
-5. Bridge stores the run ID in `ownedRunIds` and replies to pi-tasks with `{ id: runId }`.
+   - `turnBudget.maxTurns`, defaulting to `12`
+5. Bridge reads the returned run ID from `data.details.runId`, with `details.asyncId` and top-level fallbacks as backup.
+6. Bridge stores the run ID in `ownedRunIds` and replies to pi-tasks with `{ id: runId }`.
+
+Repeated copies of the same request ID share one spawn promise and replay one cached reply. Capacity errors are not cached, so pi-tasks can retry after a run finishes.
 
 Reason:
 
@@ -84,7 +89,7 @@ Reason:
 ### Stop
 
 1. pi-tasks emits `subagents:rpc:stop` with `{ agentId }`.
-2. If the run ID is one this bridge owns, the bridge emits a pi-subagents v1 `stop` request with `{ id: agentId }`.
+2. If the run ID is one this bridge owns and is not already stopping, the bridge emits one pi-subagents v1 `stop` request with `{ id: agentId }`.
 3. Bridge always replies success to pi-tasks.
 
 Reason:
@@ -102,6 +107,7 @@ Reason:
    - `state=failed` or `state=aborted` or `success=false` → `subagents:failed`
    - `state=paused` or `state=stopped` → `subagents:failed` with `status: "stopped"`
 5. On stopped runs, bridge includes the partial result text so pi-tasks can mark the task completed with preserved output.
+6. If status polling sees a terminal result path before its file is readable, bridge retries for at most five seconds before emitting a warning result.
 
 ## Result text rules
 
@@ -122,6 +128,7 @@ Failure error preference:
 1. top-level `error`
 2. first child `results[].error`
 3. `Agent failed`
+4. append up to 4,000 characters of top-level or child partial output when present
 
 Reason:
 

@@ -4,6 +4,13 @@
 
 - None.
 
+## 0.1.5 - 2026-07-12
+
+- Limited bridge-owned task runs to two concurrent agents and applied a 12-turn default when TaskExecute does not provide maxTurns.
+- Coalesced duplicate spawn and stop requests to avoid duplicate work and token spend.
+- Retried terminal result-file reads for up to five seconds, retained bounded partial failure output, and made bridge registration idempotent.
+- Added live Pi/HERDR validation and regression coverage for capacity, deduplication, result hydration, reload survival, and npm pack JSON compatibility.
+
 ## 0.1.4 - 2026-07-09
 
 - Added a fallback completion poll so bridge-owned `TaskExecute` runs still update pi-tasks when the `subagent:async-complete` event is missed.
