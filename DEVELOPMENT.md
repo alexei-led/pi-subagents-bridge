@@ -34,13 +34,18 @@ Target package:
 @alexeiled/pi-subagents-bridge
 ```
 
-Cut v0.1.0:
+For each release, decide patch versus minor, update `package.json`,
+`package-lock.json`, and `CHANGELOG.md`, then commit and tag the chosen version:
 
 ```bash
 npm run test:all
-npm version 0.1.0
+git commit -am "chore: release <version>"
+git tag v<version>
 git push origin main --follow-tags
 ```
+
+Use `npm version patch` or `npm version minor` only when it makes the intended
+version change; do not bump an already versioned release a second time.
 
 The GitHub release workflow runs on pushed `v*` tags.
 It verifies the tag matches `package.json`, checks it is on `main`, runs the validation gate, then publishes with npm provenance.

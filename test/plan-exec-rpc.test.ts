@@ -175,6 +175,206 @@ test("plan-exec retains an in-flight operation across re-registration", async (t
   });
 });
 
+test("plan-exec reports operation lookup states without launching duplicates", async (t) => {
+  const bus = new FakeEventBus();
+  const rpc = registerPlanExecRpc(bus, { timeoutMs: 100 });
+  t.after(() => rpc.dispose());
+
+  const absent = once(bus, replyEvent("operation-absent"));
+  bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "operation-absent",
+    method: "operation",
+    operationId: "missing",
+  });
+  assert.deepEqual(await absent, { success: true, data: { state: "absent" } });
+
+  const spawned = once(bus, replyEvent("spawn-pending"));
+  bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "spawn-pending",
+    method: "spawn",
+    operationId: "operation-1",
+    params: { agent: "worker", task: "Do work." },
+  });
+  const upstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(upstream));
+
+  const pending = once(bus, replyEvent("operation-pending"));
+  bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "operation-pending",
+    method: "operation",
+    operationId: "operation-1",
+  });
+  assert.deepEqual(await pending, { success: true, data: { state: "pending" } });
+  assert.equal(bus.count(SUBAGENTS_REQUEST_EVENT), 1);
+
+  replyUpstream(bus, upstream, "spawn", { details: { runId: "run-1" } });
+  await spawned;
+  const found = once(bus, replyEvent("operation-found"));
+  bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "operation-found",
+    method: "operation",
+    operationId: "operation-1",
+  });
+  assert.deepEqual(await found, {
+    success: true,
+    data: { state: "found", runId: "run-1" },
+  });
+});
+
+test("plan-exec retains failed operation lookup across re-registration", async (t) => {
+  const bus = new FakeEventBus();
+  const first = registerPlanExecRpc(bus, { timeoutMs: 100 });
+  t.after(() => first.dispose());
+
+  const spawned = once(bus, replyEvent("spawn-failed"));
+  bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "spawn-failed",
+    method: "spawn",
+    operationId: "failed-operation",
+    params: { agent: "worker", task: "Fail once." },
+  });
+  const upstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(upstream));
+  bus.emit(upstreamReplyEvent(String(upstream.requestId)), {
+    version: 1,
+    requestId: upstream.requestId,
+    method: "spawn",
+    success: false,
+    error: { message: "provider unavailable" },
+  });
+  assert.deepEqual(await spawned, {
+    success: false,
+    error: { code: "upstream_error", message: "provider unavailable" },
+  });
+
+  first.dispose();
+  const second = registerPlanExecRpc(bus, { timeoutMs: 100 });
+  t.after(() => second.dispose());
+  const lookup = once(bus, replyEvent("failed-operation-lookup"));
+  bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "failed-operation-lookup",
+    method: "operation",
+    operationId: "failed-operation",
+  });
+  assert.deepEqual(await lookup, {
+    success: true,
+    data: { state: "unknown", error: "provider unavailable" },
+  });
+  assert.equal(bus.count(SUBAGENTS_REQUEST_EVENT), 1);
+});
+
+test("plan-exec validates operation lookup requests", async (t) => {
+  const bus = new FakeEventBus();
+  const rpc = registerPlanExecRpc(bus, { timeoutMs: 100 });
+  t.after(() => rpc.dispose());
+
+  for (const [requestId, operationId] of [
+    ["missing-operation-id", undefined],
+    ["empty-operation-id", ""],
+  ] as const) {
+    const reply = once(bus, replyEvent(requestId));
+    bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+      version: 1,
+      requestId,
+      method: "operation",
+      ...(operationId === undefined ? {} : { operationId }),
+    });
+    assert.deepEqual(await reply, {
+      success: false,
+      error: {
+        code: "invalid_request",
+        message: "operation requires a non-empty operationId",
+      },
+    });
+  }
+  assert.equal(bus.count(SUBAGENTS_REQUEST_EVENT), 0);
+});
+
+test("plan-exec bounds completed operation history without evicting the newest outcome", async (t) => {
+  const bus = new FakeEventBus();
+  const rpc = registerPlanExecRpc(bus, { timeoutMs: 100 });
+  t.after(() => rpc.dispose());
+
+  for (let index = 0; index < 129; index += 1) {
+    const requestId = `history-spawn-${index}`;
+    const reply = once(bus, replyEvent(requestId));
+    bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+      version: 1,
+      requestId,
+      method: "spawn",
+      operationId: `history-operation-${index}`,
+      params: { agent: "worker", task: `Work ${index}.` },
+    });
+    const upstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+    assert.ok(isRecord(upstream));
+    replyUpstream(bus, upstream, "spawn", {
+      details: { runId: `history-run-${index}` },
+    });
+    await reply;
+  }
+
+  const oldest = once(bus, replyEvent("history-oldest"));
+  bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "history-oldest",
+    method: "operation",
+    operationId: "history-operation-0",
+  });
+  assert.deepEqual(await oldest, { success: true, data: { state: "absent" } });
+
+  const newest = once(bus, replyEvent("history-newest"));
+  bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "history-newest",
+    method: "operation",
+    operationId: "history-operation-128",
+  });
+  assert.deepEqual(await newest, {
+    success: true,
+    data: { state: "found", runId: "history-run-128" },
+  });
+});
+
+test("plan-exec refuses a new spawn when operation history is all active", async (t) => {
+  const bus = new FakeEventBus();
+  const rpc = registerPlanExecRpc(bus, { timeoutMs: 100 });
+  t.after(() => rpc.dispose());
+
+  for (let index = 0; index < 128; index += 1) {
+    bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+      version: 1,
+      requestId: `active-spawn-${index}`,
+      method: "spawn",
+      operationId: `active-operation-${index}`,
+      params: { agent: "worker", task: `Work ${index}.` },
+    });
+  }
+  assert.equal(bus.count(SUBAGENTS_REQUEST_EVENT), 128);
+
+  const reply = once(bus, replyEvent("capacity"));
+  bus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "capacity",
+    method: "spawn",
+    operationId: "active-operation-128",
+    params: { agent: "worker", task: "One too many." },
+  });
+  assert.deepEqual(await reply, {
+    success: false,
+    error: {
+      code: "operation_capacity",
+      message: "plan-exec operation history is full of active operations",
+    },
+  });
+  assert.equal(bus.count(SUBAGENTS_REQUEST_EVENT), 128);
+});
+
 test("plan-exec normalizes status, result, and observational adoption", async (t) => {
   const bus = new FakeEventBus();
   const rpc = registerPlanExecRpc(bus, { timeoutMs: 100 });
@@ -377,7 +577,15 @@ test("plan-exec ping advertises the supported generic methods", async (t) => {
     success: true,
     data: {
       version: 1,
-      methods: ["ping", "spawn", "status", "result", "stop", "adopt"],
+      methods: [
+        "ping",
+        "spawn",
+        "operation",
+        "status",
+        "result",
+        "stop",
+        "adopt",
+      ],
     },
   });
 });

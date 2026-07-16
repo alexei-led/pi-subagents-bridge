@@ -6,7 +6,16 @@ export const PLAN_EXEC_REPLY_PREFIX = "plan-exec:bridge:v1:reply:";
 const SUBAGENTS_REQUEST_EVENT = "subagents:rpc:v1:request";
 const SUBAGENTS_REPLY_PREFIX = "subagents:rpc:v1:reply:";
 const PROTOCOL_VERSION = 1;
-const METHODS = ["ping", "spawn", "status", "result", "stop", "adopt"] as const;
+const MAX_COMPLETED_OPERATION_HISTORY = 128;
+const METHODS = [
+  "ping",
+  "spawn",
+  "operation",
+  "status",
+  "result",
+  "stop",
+  "adopt",
+] as const;
 
 type Method = (typeof METHODS)[number];
 type UpstreamMethod = "spawn" | "status" | "stop";
@@ -19,7 +28,10 @@ type EventBus = {
 
 type Failure = {
   success: false;
-  error: { code: "invalid_request" | "upstream_error"; message: string };
+  error: {
+    code: "invalid_request" | "upstream_error" | "operation_capacity";
+    message: string;
+  };
 };
 type Reply<T> = { success: true; data: T } | Failure;
 
@@ -61,6 +73,7 @@ interface PlanExecOptions {
 interface Operation {
   fingerprint: string;
   reply: Promise<Reply<SpawnResult>>;
+  outcome?: Reply<SpawnResult>;
 }
 
 interface PlanExecState {
@@ -90,7 +103,7 @@ function upstreamReplyEvent(requestId: string): string {
 }
 
 function failure(
-  code: "invalid_request" | "upstream_error",
+  code: "invalid_request" | "upstream_error" | "operation_capacity",
   message: string,
 ): Failure {
   return { success: false, error: { code, message } };
@@ -252,6 +265,15 @@ function validateSpawn(raw: Record<string, unknown>): SpawnRequest | Failure {
   };
 }
 
+function validateOperationRequest(
+  raw: Record<string, unknown>,
+): string | Failure {
+  const operationId = nonEmptyString(raw.operationId);
+  return operationId
+    ? operationId
+    : failure("invalid_request", "operation requires a non-empty operationId");
+}
+
 function validateRunRequest(
   method: "status" | "result" | "stop" | "adopt",
   raw: Record<string, unknown>,
@@ -382,6 +404,13 @@ function requestSubagents(
   });
 }
 
+function pruneCompletedOperations(state: PlanExecState): void {
+  for (const [operationId, operation] of state.operations) {
+    if (state.operations.size < MAX_COMPLETED_OPERATION_HISTORY) return;
+    if (operation.outcome) state.operations.delete(operationId);
+  }
+}
+
 function getPlanExecState(events: EventBus): PlanExecState {
   const existing = planExecStates.get(events);
   if (existing) return existing;
@@ -427,40 +456,54 @@ export function registerPlanExecRpc(
           );
     }
 
+    pruneCompletedOperations(state);
+    if (state.operations.size >= MAX_COMPLETED_OPERATION_HISTORY)
+      return Promise.resolve(
+        failure(
+          "operation_capacity",
+          "plan-exec operation history is full of active operations",
+        ),
+      );
+
     const controller = new AbortController();
     state.spawnControllers.add(controller);
-    const operation = requestSubagents(
-      events,
-      "spawn",
-      request.params,
-      options.timeoutMs,
-      controller.signal,
-    )
-      .then((reply): Reply<SpawnResult> => {
-        const runId = extractSpawnRunId(reply);
-        const asyncDir = extractSpawnAsyncDir(reply);
-        return runId
-          ? {
-              success: true,
-              data: { runId, ...(asyncDir ? { asyncDir } : {}) },
-            }
-          : failure(
-              "upstream_error",
-              "pi-subagents spawn reply did not include a runId",
-            );
-      })
-      .catch((error: unknown): Reply<SpawnResult> =>
-        failure(
-          "upstream_error",
-          error instanceof Error ? error.message : String(error),
-        ),
-      )
-      .finally(() => state.spawnControllers.delete(controller));
-    state.operations.set(request.operationId, {
+    const operation: Operation = {
       fingerprint: request.fingerprint,
-      reply: operation,
-    });
-    return operation;
+      reply: requestSubagents(
+        events,
+        "spawn",
+        request.params,
+        options.timeoutMs,
+        controller.signal,
+      )
+        .then((reply): Reply<SpawnResult> => {
+          const runId = extractSpawnRunId(reply);
+          const asyncDir = extractSpawnAsyncDir(reply);
+          return runId
+            ? {
+                success: true,
+                data: { runId, ...(asyncDir ? { asyncDir } : {}) },
+              }
+            : failure(
+                "upstream_error",
+                "pi-subagents spawn reply did not include a runId",
+              );
+        })
+        .catch((error: unknown): Reply<SpawnResult> =>
+          failure(
+            "upstream_error",
+            error instanceof Error ? error.message : String(error),
+          ),
+        )
+        .then((outcome) => {
+          operation.outcome = outcome;
+          pruneCompletedOperations(state);
+          return outcome;
+        })
+        .finally(() => state.spawnControllers.delete(controller)),
+    };
+    state.operations.set(request.operationId, operation);
+    return operation.reply;
   };
 
   const invoke = async (
@@ -478,6 +521,24 @@ export function registerPlanExecRpc(
       const request = validateSpawn(raw);
       if (isFailure(request)) return request;
       return startOperation(request);
+    }
+
+    if (method === "operation") {
+      const operationId = validateOperationRequest(raw);
+      if (isFailure(operationId)) return operationId;
+      const operation = state.operations.get(operationId);
+      if (!operation) return { success: true, data: { state: "absent" } };
+      if (!operation.outcome)
+        return { success: true, data: { state: "pending" } };
+      return operation.outcome.success
+        ? { success: true, data: { state: "found", ...operation.outcome.data } }
+        : {
+            success: true,
+            data: {
+              state: "unknown",
+              error: operation.outcome.error.message,
+            },
+          };
     }
 
     const request = validateRunRequest(method, raw);

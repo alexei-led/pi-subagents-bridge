@@ -4,6 +4,16 @@
 
 - None.
 
+## 0.2.0 - 2026-07-16
+
+- Added the plan-exec `operation` RPC for safe reconciliation of durable spawn
+  operation IDs after an unknown launch result. It reports `absent`, `pending`,
+  `found`, or `unknown` without starting another child.
+- Preserved successful and failed operation lookup outcomes across bridge
+  re-registration during one Pi process lifetime.
+- Documented operation-lifetime limits and the accepted `timeout` / `timeoutMs`
+  spawn aliases.
+
 ## 0.1.6 - 2026-07-12
 
 - Added the generic plan-exec v1 RPC with cwd forwarding, durable spawn-operation idempotency, and normalized status/result/stop/adopt responses over the pi-subagents v1 RPC.
