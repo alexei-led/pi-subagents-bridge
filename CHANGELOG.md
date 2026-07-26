@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 - 2026-07-26
 
-- None.
+- Bumped `@earendil-works/pi-coding-agent` dev dependency from `^0.80.3` to `^0.82.1`
+  to match the installed version and pick up updated type definitions.
 
 ## 0.2.0 - 2026-07-16
 

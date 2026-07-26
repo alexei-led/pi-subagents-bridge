@@ -1,6 +1,6 @@
 {
   "name": "@alexeiled/pi-subagents-bridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Protocol adapter that lets @tintinweb/pi-tasks TaskExecute spawn nicobailon/pi-subagents.",
   "type": "module",
   "main": "./src/index.ts",
@@ -43,7 +43,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "@earendil-works/pi-coding-agent": "^0.82.1",
     "@eslint/js": "^10.0.1",
     "@types/node": "^24.10.0",
     "eslint": "^10.6.0",
