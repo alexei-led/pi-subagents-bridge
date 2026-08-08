@@ -2,14 +2,14 @@ import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerPlanExecRpc } from "./plan-exec-rpc.js";
+import { singleChildWorkflowScript } from "./workflow-spawn.js";
 
-// Protocol evidence (installed sources verified against npm pack pi-subagents@0.34.0):
+// Protocol evidence (installed sources verified against pi-subagents@0.43.0):
 // - @tintinweb/pi-tasks src/index.ts:103-119 reply channel/envelope,
 //   126-133 spawn/stop params, 137-157 strict PROTOCOL_VERSION=2,
 //   207-260 completed/failed/stopped fields.
-// - pi-subagents src/extension/rpc.ts:13-18 v1 channel/methods,
-//   32-45 reply envelope, 128-132 spawn details, 141-147 id/runId stop target,
-//   193-204 async-only spawn/no clarify.
+// - pi-subagents src/extension/rpc.ts exposes the v1 channel and async-only spawn;
+//   public-execution.ts requires workflowScript and rejects clarify entirely.
 // - pi-subagents src/runs/background/result-watcher.ts:49-57 result file fields,
 //   141-164 child output/status normalization, 193-204 async-complete payload;
 //   subagent-runner.ts:3066-3073 complete/failed/paused state values.
@@ -92,6 +92,7 @@ interface SpawnOptionsRaw {
 
 interface AsyncCompleteRaw {
   runId?: unknown;
+  mode?: unknown;
   asyncId?: unknown;
   id?: unknown;
   success?: unknown;
@@ -158,11 +159,9 @@ function extractChildOutputs(payload: AsyncCompleteRaw): string[] {
 }
 
 function extractCompletedResult(payload: AsyncCompleteRaw): string | undefined {
-  return (
-    text(payload.summary) ??
-    text(payload.output) ??
-    (extractChildOutputs(payload).join("\n\n") || undefined)
-  );
+  const childOutput = extractChildOutputs(payload).join("\n\n") || undefined;
+  if (text(payload.mode) === "workflow" && childOutput) return childOutput;
+  return text(payload.summary) ?? text(payload.output) ?? childOutput;
 }
 
 function extractStoppedResult(payload: AsyncCompleteRaw): string | undefined {
@@ -616,10 +615,11 @@ export function registerBridge(
           ? optionsRaw.maxTurns
           : defaultMaxTurns;
       const spawnParams: Record<string, unknown> = {
-        agent: resolveAgentType(agentType),
-        task: prompt,
+        workflowScript: singleChildWorkflowScript(
+          resolveAgentType(agentType),
+          prompt,
+        ),
         async: true,
-        clarify: false,
         context: "fresh",
         acceptance: BRIDGE_ACCEPTANCE_CONFIG,
         control: BRIDGE_CONTROL_CONFIG,

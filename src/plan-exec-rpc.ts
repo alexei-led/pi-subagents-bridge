@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { singleChildWorkflowScript } from "./workflow-spawn.js";
 
 export const PLAN_EXEC_REQUEST_EVENT = "plan-exec:bridge:v1:request";
 export const PLAN_EXEC_REPLY_PREFIX = "plan-exec:bridge:v1:reply:";
@@ -243,14 +244,33 @@ function validateSpawn(raw: Record<string, unknown>): SpawnRequest | Failure {
   if (params.clarify === true) {
     return failure("invalid_request", "spawn cannot set clarify to true");
   }
+  if (
+    "completionGuard" in params &&
+    typeof params.completionGuard !== "boolean"
+  ) {
+    return failure(
+      "invalid_request",
+      "spawn completionGuard must be a boolean",
+    );
+  }
 
   const cwd = topLevelCwd ?? paramsCwd;
+  const {
+    agent: _agent,
+    task: _task,
+    async: _async,
+    clarify: _clarify,
+    completionGuard,
+    ...workflowDefaults
+  } = params;
   const forwarded: Record<string, unknown> = {
-    ...params,
-    agent,
-    task,
+    ...workflowDefaults,
+    workflowScript: singleChildWorkflowScript(
+      agent,
+      task,
+      completionGuard === undefined ? {} : { completionGuard },
+    ),
     async: true,
-    clarify: false,
   };
   delete forwarded.timeout;
   if (cwd !== undefined) forwarded.cwd = cwd;
@@ -513,7 +533,11 @@ export function registerPlanExecRpc(
     if (method === "ping") {
       return {
         success: true,
-        data: { version: PROTOCOL_VERSION, methods: [...METHODS] },
+        data: {
+          version: PROTOCOL_VERSION,
+          capabilities: { workflowScriptSpawn: true },
+          methods: [...METHODS],
+        },
       };
     }
 

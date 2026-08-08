@@ -30,6 +30,7 @@ test("plan-exec spawn forwards actual pi-subagents parameters and coalesces a du
       toolBudget: { hard: 10 },
       control: { enabled: false },
       acceptance: { level: "verified" },
+      completionGuard: false,
       timeout: 30_000,
     },
   } as const;
@@ -44,10 +45,9 @@ test("plan-exec spawn forwards actual pi-subagents parameters and coalesces a du
   assert.equal(upstream.version, 1);
   assert.equal(upstream.method, "spawn");
   assert.deepEqual(upstream.params, {
-    agent: "worker",
-    task: "Implement the task.",
+    workflowScript:
+      'return runs.run("main", {"agent":"worker","task":"Implement the task.","completionGuard":false})',
     async: true,
-    clarify: false,
     context: "fresh",
     model: "test/model",
     turnBudget: { maxTurns: 40 },
@@ -111,7 +111,13 @@ test("plan-exec accepts cwd from params and rejects conflicting cwd values", asy
   assert.ok(isRecord(upstream.params));
   assert.equal(upstream.params.cwd, "/tmp/params-worktree");
   assert.equal(upstream.params.async, true);
-  assert.equal(upstream.params.clarify, false);
+  assert.equal(
+    upstream.params.workflowScript,
+    'return runs.run("main", {"agent":"worker","task":"Use the requested worktree."})',
+  );
+  assert.equal(Object.hasOwn(upstream.params, "agent"), false);
+  assert.equal(Object.hasOwn(upstream.params, "task"), false);
+  assert.equal(Object.hasOwn(upstream.params, "clarify"), false);
   replyUpstream(bus, upstream, "spawn", {
     details: { runId: "params-cwd-run" },
   });
@@ -490,6 +496,20 @@ test("plan-exec validates its request contract before emitting upstream RPC", as
       expected: "spawn cannot set clarify to true",
     },
     {
+      requestId: "invalid-completion-guard",
+      payload: {
+        version: 1,
+        method: "spawn",
+        operationId: "invalid-completion-guard-operation",
+        params: {
+          agent: "worker",
+          task: "Not allowed.",
+          completionGuard: "disabled",
+        },
+      },
+      expected: "spawn completionGuard must be a boolean",
+    },
+    {
       requestId: "bad-adopt",
       payload: {
         version: 1,
@@ -577,6 +597,7 @@ test("plan-exec ping advertises the supported generic methods", async (t) => {
     success: true,
     data: {
       version: 1,
+      capabilities: { workflowScriptSpawn: true },
       methods: [
         "ping",
         "spawn",

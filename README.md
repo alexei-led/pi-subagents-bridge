@@ -39,7 +39,7 @@ sequenceDiagram
   Bridge-->>Tasks: version 2
 
   Tasks->>Bridge: spawn(type, prompt, options)
-  Bridge->>Subs: spawn(agent, task, async: true)
+  Bridge->>Subs: spawn(workflowScript, async: true)
   Subs-->>Bridge: runId
   Bridge-->>Tasks: id = runId
 
@@ -103,9 +103,11 @@ A read-only agent can still be useful for read-only tasks such as review or meta
 
 Spawned runs are always forwarded as:
 
+- one-child `workflowScript` execution
 - `async: true`
-- `clarify: false`
 - `context: "fresh"`
+
+The bridge does not send the removed public `clarify` field.
 
 The bridge returns the spawned run ID back to `pi-tasks` and tracks that run as bridge-owned state. It runs at most **two** bridge-owned tasks at once. A task without an explicit `maxTurns` receives a **12-turn** budget.
 
@@ -123,9 +125,9 @@ If `subagent:async-complete` does not arrive, the bridge polls `pi-subagents` `s
 
 This protocol is independent of `pi-tasks`. Send `{ version: 1, requestId, method, ... }` on `plan-exec:bridge:v1:request`; replies use `plan-exec:bridge:v1:reply:<requestId>`.
 
-Supported methods are `ping`, `spawn`, `operation`, `status`, `result`, `stop`, and `adopt`.
+Supported methods are `ping`, `spawn`, `operation`, `status`, `result`, `stop`, and `adopt`. `ping` advertises `capabilities.workflowScriptSpawn: true` for compatibility probes.
 
-- `spawn` requires a durable top-level `operationId`, top-level `cwd` when needed, and `params.agent` plus `params.task`. It forwards supported execution fields (`async`, `clarify`, `context`, `model`, `turnBudget`, `control`, `acceptance`, and `timeout`) to `pi-subagents`. It accepts `timeout` or `timeoutMs` and rejects mismatched values; either maps to pi-subagents `timeoutMs`. It returns `{ runId, asyncDir? }`. A repeated operation ID reuses the original reply for this Pi process lifetime.
+- `spawn` requires a durable top-level `operationId`, top-level `cwd` when needed, and `params.agent` plus `params.task`. It translates the child into a one-child `workflowScript` and forwards supported workflow defaults (`context`, `model`, `turnBudget`, `control`, `acceptance`, and `timeout`) to `pi-subagents`. It accepts legacy `clarify: false` by omitting the field and rejects `clarify: true`. It accepts `timeout` or `timeoutMs` and rejects mismatched values; either maps to pi-subagents `timeoutMs`. It returns `{ runId, asyncDir? }`. A repeated operation ID reuses the original reply for this Pi process lifetime.
 - `operation` requires `operationId` and never starts a child. It returns `{ state: "absent" }`, `{ state: "pending" }`, `{ state: "found", runId, asyncDir? }`, or `{ state: "unknown", error }`. Its lookup map survives bridge re-registration in one Pi process but is not durable across a full Pi restart. It retains at most 127 completed outcomes and never evicts active operations. Clients must use it after an unknown spawn outcome and must not blindly launch a second child.
 - `status` and `result` return normalized observations from the `pi-subagents` status RPC. `result` uses status because `pi-subagents` has no separate result RPC.
 - `stop` delegates to the `pi-subagents` stop RPC.

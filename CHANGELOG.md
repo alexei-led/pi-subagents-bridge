@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2 - 2026-08-08
+
+- Translate `TaskExecute` and plan-exec child launches into the one-child
+  `workflowScript` public API required by `pi-subagents` 0.43.0.
+- Stop sending the removed public `clarify` field while retaining compatibility
+  with plan-exec callers that still pass `clarify: false`.
+- Advertise the `workflowScriptSpawn` plan-exec capability so clients reject
+  older incompatible bridge releases before launching work.
+- Return the child output rather than the outer workflow summary through the
+  pi-tasks completion API.
+
 ## 0.2.1 - 2026-07-26
 
 - Bumped `@earendil-works/pi-coding-agent` dev dependency from `^0.80.3` to `^0.82.1`

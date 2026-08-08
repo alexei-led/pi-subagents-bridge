@@ -45,10 +45,9 @@ test("spawn forwards the normalized pi-tasks request and returns the launched ru
   assert.equal(request.version, 1);
   assert.equal(request.method, "spawn");
   assert.deepEqual(request.params, {
-    agent: "delegate",
-    task: "Do the task",
+    workflowScript:
+      'return runs.run("main", {"agent":"delegate","task":"Do the task"})',
     async: true,
-    clarify: false,
     context: "fresh",
     acceptance: {
       level: "none",
@@ -121,7 +120,13 @@ test("spawn supports documented aliases, keeps custom agent names unchanged, and
     const request = bus.lastPayload(NB_REQUEST_CHANNEL);
     assert.ok(isRecord(request));
     assert.ok(isRecord(request.params));
-    assert.equal(request.params.agent, expectedAgent);
+    assert.equal(
+      request.params.workflowScript,
+      `return runs.run("main", {"agent":"${expectedAgent}","task":"Do the task"})`,
+    );
+    assert.equal(Object.hasOwn(request.params, "agent"), false);
+    assert.equal(Object.hasOwn(request.params, "task"), false);
+    assert.equal(Object.hasOwn(request.params, "clarify"), false);
     assert.deepEqual(request.params.acceptance, {
       level: "none",
       reason:
@@ -433,6 +438,19 @@ test("completion events use the documented result and error fallbacks", async ()
         results: [{ output: "child output" }],
       },
       expected: { id: "run-summary", result: "summary text" },
+    },
+    {
+      label: "workflow child output",
+      payload: {
+        runId: "run-workflow",
+        mode: "workflow",
+        success: true,
+        state: "complete",
+        summary: "Workflow completed successfully (1 child).",
+        output: "Workflow completed successfully (1 child).",
+        results: [{ output: "child output" }],
+      },
+      expected: { id: "run-workflow", result: "child output" },
     },
     {
       label: "top-level output",
