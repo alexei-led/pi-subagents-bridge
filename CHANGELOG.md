@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+## 0.2.3 - 2026-08-08
+
+- Disable pi-subagents control notices for bridge-owned child runs. This avoids
+  stale control-event crashes after a Pi reload while plan-exec polls run status.
+
 ## 0.2.2 - 2026-08-08
 
 - Translate `TaskExecute` and plan-exec child launches into the one-child

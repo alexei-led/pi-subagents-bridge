@@ -618,6 +618,7 @@ export function registerBridge(
         workflowScript: singleChildWorkflowScript(
           resolveAgentType(agentType),
           prompt,
+          { control: BRIDGE_CONTROL_CONFIG },
         ),
         async: true,
         context: "fresh",

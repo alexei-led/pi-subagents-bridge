@@ -106,6 +106,7 @@ Spawned runs are always forwarded as:
 - one-child `workflowScript` execution
 - `async: true`
 - `context: "fresh"`
+- `control: { enabled: false }` on the outer workflow and its child
 
 The bridge does not send the removed public `clarify` field.
 
