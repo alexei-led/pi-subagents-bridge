@@ -89,6 +89,25 @@ interface BridgeState {
 }
 
 const bridgeStates = new WeakMap<BridgeHost["events"], BridgeState>();
+const PROCESS_OWNER_KEY = Symbol.for(
+  "pi-subagents-bridge.accepted-run-owner.v1",
+);
+
+interface ProcessOwnerStore {
+  pid: number;
+  instanceId: string;
+}
+
+function acceptedRunOwner(): ProcessOwnerStore {
+  const target = globalThis as typeof globalThis & {
+    [PROCESS_OWNER_KEY]?: ProcessOwnerStore;
+  };
+  const existing = target[PROCESS_OWNER_KEY];
+  if (existing?.pid === process.pid) return existing;
+  const created = { pid: process.pid, instanceId: randomUUID() };
+  target[PROCESS_OWNER_KEY] = created;
+  return created;
+}
 
 interface SpawnOptionsRaw {
   model?: unknown;
@@ -369,6 +388,7 @@ export function registerBridge(
 ): { dispose: () => void } {
   const state = getBridgeState(pi.events);
   if (state.registration) return state.registration;
+  const processOwner = acceptedRunOwner();
 
   const spawnTimeoutMs = positiveIntegerOrDefault(
     options.spawnTimeoutMs,
@@ -465,7 +485,7 @@ export function registerBridge(
     }
 
     try {
-      bridgeJournal?.completeRun(runId);
+      bridgeJournal?.completeRun(runId, processOwner.instanceId);
     } catch (error: unknown) {
       console.error(
         `Failed to record delivered bridge completion for '${runId}':`,
@@ -563,7 +583,8 @@ export function registerBridge(
   };
 
   try {
-    for (const accepted of bridgeJournal?.listAcceptedRuns() ?? []) {
+    for (const accepted of
+      bridgeJournal?.claimAcceptedRuns(processOwner) ?? []) {
       ownedRunIds.add(accepted.runId);
       ensureCompletionPoll(accepted.runId);
     }
@@ -675,7 +696,7 @@ export function registerBridge(
         }
 
         try {
-          bridgeJournal?.acceptRun(runId);
+          bridgeJournal?.acceptRun(runId, processOwner);
         } catch (error: unknown) {
           // The native run already exists. Returning a failed spawn would invite
           // TaskExecute to launch a duplicate, so keep ownership in memory and

@@ -146,7 +146,7 @@ This avoids false positives for:
 - direct `subagent(...)` calls
 - any other extension using pi-subagents RPC
 
-This is why accepted legacy run IDs are journaled and restored into `ownedRunIds`. Completion delivery is at least once: the bridge emits the pi-tasks event before removing the accepted run from the journal, so a crash can replay a harmless duplicate but cannot silently lose ownership.
+This is why accepted legacy run IDs are journaled and restored into `ownedRunIds`. Each record has a process owner. A live foreign process cannot claim or delete it; after that owner exits, one new process claims it transactionally. Completion delivery is at least once: the bridge emits the pi-tasks event before removing its owned record, so a crash can replay a harmless duplicate but cannot silently lose ownership.
 
 ## Durable plan-exec launches
 

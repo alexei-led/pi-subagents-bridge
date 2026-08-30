@@ -697,6 +697,27 @@ export function registerPlanExecRpc(
                 ),
               );
         }
+      } catch (error: unknown) {
+        return Promise.resolve(
+          failure(
+            "upstream_error",
+            error instanceof Error ? error.message : String(error),
+          ),
+        );
+      }
+    }
+
+    pruneCompletedOperations(state);
+    if (state.operations.size >= MAX_COMPLETED_OPERATION_HISTORY)
+      return Promise.resolve(
+        failure(
+          "operation_capacity",
+          "plan-exec operation history is full of active operations",
+        ),
+      );
+
+    if (state.journal) {
+      try {
         const begun = state.journal.begin(
           request.operationId,
           request.fingerprint,
@@ -722,15 +743,6 @@ export function registerPlanExecRpc(
         );
       }
     }
-
-    pruneCompletedOperations(state);
-    if (state.operations.size >= MAX_COMPLETED_OPERATION_HISTORY)
-      return Promise.resolve(
-        failure(
-          "operation_capacity",
-          "plan-exec operation history is full of active operations",
-        ),
-      );
 
     const controller = new AbortController();
     state.spawnControllers.add(controller);

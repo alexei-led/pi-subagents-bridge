@@ -7,10 +7,17 @@ const BUSY_TIMEOUT_MS = 2_000;
 
 export type OperationBinding = "dispatching" | "bound" | "unknown";
 
+export interface AcceptedRunOwner {
+  pid: number;
+  instanceId: string;
+}
+
 export interface AcceptedRunJournalRecord {
   runId: string;
   asyncDir?: string;
   acceptedAt: number;
+  ownerPid: number;
+  ownerInstanceId: string;
 }
 
 export interface OperationJournalRecord {
@@ -41,6 +48,8 @@ interface AcceptedRunRow {
   run_id: string;
   async_dir: string | null;
   accepted_at: number;
+  owner_pid: number;
+  owner_instance_id: string;
 }
 
 function operationRecord(row: OperationRow): OperationJournalRecord {
@@ -57,11 +66,28 @@ function operationRecord(row: OperationRow): OperationJournalRecord {
   };
 }
 
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: unknown) {
+    return !(
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "ESRCH"
+    );
+  }
+}
+
 function acceptedRunRecord(row: AcceptedRunRow): AcceptedRunJournalRecord {
   return {
     runId: row.run_id,
     ...(row.async_dir ? { asyncDir: row.async_dir } : {}),
     acceptedAt: row.accepted_at,
+    ownerPid: row.owner_pid,
+    ownerInstanceId: row.owner_instance_id,
   };
 }
 
@@ -98,7 +124,9 @@ export class OperationJournal {
       CREATE TABLE IF NOT EXISTS accepted_runs (
         run_id TEXT PRIMARY KEY,
         async_dir TEXT,
-        accepted_at INTEGER NOT NULL
+        accepted_at INTEGER NOT NULL,
+        owner_pid INTEGER NOT NULL,
+        owner_instance_id TEXT NOT NULL
       ) STRICT;
     `);
     const version = this.#db.prepare("PRAGMA user_version").get() as
@@ -115,25 +143,75 @@ export class OperationJournal {
     fs.chmodSync(this.filePath, 0o600);
   }
 
-  listAcceptedRuns(): AcceptedRunJournalRecord[] {
-    const rows = this.#db
-      .prepare(
-        "SELECT run_id, async_dir, accepted_at FROM accepted_runs ORDER BY accepted_at, run_id",
-      )
-      .all() as unknown as AcceptedRunRow[];
-    return rows.map(acceptedRunRecord);
+  claimAcceptedRuns(owner: AcceptedRunOwner): AcceptedRunJournalRecord[] {
+    return this.#transaction(() => {
+      const rows = this.#db
+        .prepare(
+          `SELECT run_id, async_dir, accepted_at, owner_pid, owner_instance_id
+             FROM accepted_runs
+            ORDER BY accepted_at, run_id`,
+        )
+        .all() as unknown as AcceptedRunRow[];
+      const claimed: AcceptedRunJournalRecord[] = [];
+      for (const row of rows) {
+        if (row.owner_instance_id === owner.instanceId) {
+          claimed.push(acceptedRunRecord(row));
+          continue;
+        }
+        if (isProcessAlive(row.owner_pid)) continue;
+        const result = this.#db
+          .prepare(
+            `UPDATE accepted_runs
+                SET owner_pid = ?, owner_instance_id = ?
+              WHERE run_id = ? AND owner_pid = ? AND owner_instance_id = ?`,
+          )
+          .run(
+            owner.pid,
+            owner.instanceId,
+            row.run_id,
+            row.owner_pid,
+            row.owner_instance_id,
+          );
+        if (result.changes === 1) {
+          claimed.push(
+            acceptedRunRecord({
+              ...row,
+              owner_pid: owner.pid,
+              owner_instance_id: owner.instanceId,
+            }),
+          );
+        }
+      }
+      return claimed;
+    });
   }
 
-  acceptRun(runId: string, asyncDir?: string): void {
+  acceptRun(
+    runId: string,
+    owner: AcceptedRunOwner,
+    asyncDir?: string,
+  ): void {
     this.#db
       .prepare(
-        "INSERT OR IGNORE INTO accepted_runs (run_id, async_dir, accepted_at) VALUES (?, ?, ?)",
+        `INSERT OR IGNORE INTO accepted_runs
+           (run_id, async_dir, accepted_at, owner_pid, owner_instance_id)
+         VALUES (?, ?, ?, ?, ?)`,
       )
-      .run(runId, asyncDir ?? null, this.#now());
+      .run(
+        runId,
+        asyncDir ?? null,
+        this.#now(),
+        owner.pid,
+        owner.instanceId,
+      );
   }
 
-  completeRun(runId: string): void {
-    this.#db.prepare("DELETE FROM accepted_runs WHERE run_id = ?").run(runId);
+  completeRun(runId: string, ownerInstanceId: string): void {
+    this.#db
+      .prepare(
+        "DELETE FROM accepted_runs WHERE run_id = ? AND owner_instance_id = ?",
+      )
+      .run(runId, ownerInstanceId);
   }
 
   get(operationId: string): OperationJournalRecord | undefined {

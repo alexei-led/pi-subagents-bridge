@@ -825,8 +825,11 @@ test("plan-exec bounds completed operation history without evicting the newest o
 });
 
 test("plan-exec refuses a new spawn when operation history is all active", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-bridge-capacity-"));
+  const journalPath = path.join(root, "operations.sqlite");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const bus = new FakeEventBus();
-  const rpc = registerPlanExecRpc(bus, { timeoutMs: 100 });
+  const rpc = registerPlanExecRpc(bus, { timeoutMs: 100, journalPath });
   t.after(() => rpc.dispose());
 
   for (let index = 0; index < 128; index += 1) {
@@ -856,6 +859,31 @@ test("plan-exec refuses a new spawn when operation history is all active", async
     },
   });
   assert.equal(bus.count(SUBAGENTS_REQUEST_EVENT), 128);
+
+  const recoveredBus = new FakeEventBus();
+  const recoveredRpc = registerPlanExecRpc(recoveredBus, {
+    timeoutMs: 100,
+    journalPath,
+  });
+  t.after(() => recoveredRpc.dispose());
+  const recoveredReply = once(recoveredBus, replyEvent("capacity-retry"));
+  recoveredBus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "capacity-retry",
+    method: "spawn",
+    operationId: "active-operation-128",
+    params: { agent: "worker", task: "Retry after restart." },
+  });
+  assert.equal(recoveredBus.count(SUBAGENTS_REQUEST_EVENT), 1);
+  const recoveredUpstream = recoveredBus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(recoveredUpstream));
+  replyUpstream(recoveredBus, recoveredUpstream, "spawn", {
+    details: { runId: "capacity-retry-run" },
+  });
+  assert.deepEqual(await recoveredReply, {
+    success: true,
+    data: { runId: "capacity-retry-run" },
+  });
 });
 
 test("plan-exec normalizes status, result, and observational adoption", async (t) => {

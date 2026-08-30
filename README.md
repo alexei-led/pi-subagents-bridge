@@ -148,7 +148,7 @@ Because of that, the bridge also applies two execution defaults to bridge-spawne
 - disables `pi-subagents` acceptance gating
 - disables `pi-subagents` live control nudges
 
-This avoids false pauses on missing acceptance reports and avoids misleading background `needs attention` notices for normal task runs. Repeated copies of one live request are coalesced. Accepted run IDs are journaled so completion delivery can recover after a full Pi restart.
+This avoids false pauses on missing acceptance reports and avoids misleading background `needs attention` notices for normal task runs. Repeated copies of one live request are coalesced. Accepted run IDs are journaled with a process owner so only one live Pi process polls or completes them; a new process takes ownership only after the prior owner exits.
 
 The legacy `pi-tasks` spawn request does not contain task ID, list ID, or attempt generation. Therefore the bridge cannot guarantee exactly-once launch after a crash that occurs after native dispatch but before the run ID is received. It reports that outcome as unknown and does not use prompt matching or automatic retry.
 
