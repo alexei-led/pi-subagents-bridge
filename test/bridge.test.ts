@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable } from "node:stream";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { registerBridge } from "../src/index.js";
+import { OperationJournal } from "../src/operation-journal.js";
 
 const PING_CHANNEL = "subagents:rpc:ping";
 const SPAWN_CHANNEL = "subagents:rpc:spawn";
@@ -26,6 +29,54 @@ test("registerBridge announces readiness and answers v2 ping", async () => {
   bus.emit(PING_CHANNEL, { requestId: "ping-1" });
 
   assert.deepEqual(await reply, { success: true, data: { version: 2 } });
+});
+
+test("spawn waits for an authoritative Pi session identity", async () => {
+  const bus = new FakeEventBus();
+  const session = { id: undefined as string | undefined };
+  const bridge = registerBridge(
+    { events: bus },
+    { getSessionId: () => session.id },
+  );
+
+  const unavailable = once(
+    bus,
+    replyChannel(SPAWN_CHANNEL, "spawn-before-session"),
+  );
+  bus.emit(SPAWN_CHANNEL, {
+    requestId: "spawn-before-session",
+    type: "general-purpose",
+    prompt: "Do the task",
+  });
+  assert.deepEqual(await unavailable, {
+    success: false,
+    error: "Pi session identity is not initialized",
+  });
+  assert.equal(bus.count(NB_REQUEST_CHANNEL), 0);
+
+  session.id = "session-a";
+  const available = once(
+    bus,
+    replyChannel(SPAWN_CHANNEL, "spawn-after-session"),
+  );
+  bus.emit(SPAWN_CHANNEL, {
+    requestId: "spawn-after-session",
+    type: "general-purpose",
+    prompt: "Do the task",
+  });
+  const request = bus.lastPayload(NB_REQUEST_CHANNEL);
+  assert.ok(isRecord(request));
+  bus.emit(nbReplyChannel(String(request.requestId)), {
+    version: 1,
+    requestId: request.requestId,
+    success: true,
+    data: { details: { runId: "session-ready-run" } },
+  });
+  assert.deepEqual(await available, {
+    success: true,
+    data: { id: "session-ready-run" },
+  });
+  bridge.dispose();
 });
 
 test("spawn forwards the normalized pi-tasks request and returns the launched run id", async () => {
@@ -295,6 +346,60 @@ test("duplicate spawn requests start one run and replay its response", async () 
   assert.deepEqual(await reply, { success: true, data: { id: "deduped-run" } });
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(bus.count(replyChannel(SPAWN_CHANNEL, "spawn-duplicate")), 2);
+});
+
+test("durable legacy request identity prevents redispatch after reply-cache expiry", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-legacy-"));
+  const journalPath = join(root, "operations.sqlite");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const bus = new FakeEventBus();
+  const bridge = registerBridge(
+    { events: bus },
+    {
+      planExecJournalPath: journalPath,
+      spawnReplyCacheTtlMs: 1,
+      getSessionId: () => "session-a",
+    },
+  );
+  t.after(() => bridge.dispose());
+
+  const request = {
+    requestId: "durable-legacy-request",
+    type: "general-purpose",
+    prompt: "Do the task",
+  };
+  const firstReply = once(bus, replyChannel(SPAWN_CHANNEL, request.requestId));
+  bus.emit(SPAWN_CHANNEL, request);
+  const spawned = bus.lastPayload(NB_REQUEST_CHANNEL);
+  assert.ok(isRecord(spawned));
+  bus.emit(nbReplyChannel(String(spawned.requestId)), {
+    version: 1,
+    requestId: spawned.requestId,
+    success: true,
+    data: { details: { runId: "durable-legacy-run" } },
+  });
+  assert.deepEqual(await firstReply, {
+    success: true,
+    data: { id: "durable-legacy-run" },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const replay = once(bus, replyChannel(SPAWN_CHANNEL, request.requestId));
+  bus.emit(SPAWN_CHANNEL, request);
+  assert.deepEqual(await replay, {
+    success: true,
+    data: { id: "durable-legacy-run" },
+  });
+  assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const conflict = once(bus, replyChannel(SPAWN_CHANNEL, request.requestId));
+  bus.emit(SPAWN_CHANNEL, { ...request, prompt: "Different task" });
+  assert.deepEqual(await conflict, {
+    success: false,
+    error: "spawn requestId was already used by another request",
+  });
+  assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
 });
 
 test("bridge registration is idempotent and cannot duplicate spawn handlers", async () => {
@@ -942,6 +1047,158 @@ test("accepted legacy runs survive a full bridge restart until completion delive
   third.dispose();
 });
 
+test("a foreign Pi session cannot consume another session's accepted completion", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-session-"));
+  const journalPath = join(root, "operations.sqlite");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const originBus = new FakeEventBus();
+  const origin = registerBridge(
+    { events: originBus },
+    { planExecJournalPath: journalPath, getSessionId: () => "session-a" },
+  );
+  await spawnOwnedRun(originBus, "session-owned-run");
+  origin.dispose();
+
+  const foreignBus = new FakeEventBus();
+  const foreign = registerBridge(
+    { events: foreignBus },
+    { planExecJournalPath: journalPath, getSessionId: () => "session-b" },
+  );
+  foreignBus.emit(NB_COMPLETE_EVENT, {
+    runId: "session-owned-run",
+    success: true,
+    state: "complete",
+    summary: "wrong session",
+  });
+  assert.equal(foreignBus.count(COMPLETED_EVENT), 0);
+  foreign.dispose();
+
+  const resumedBus = new FakeEventBus();
+  const resumed = registerBridge(
+    { events: resumedBus },
+    { planExecJournalPath: journalPath, getSessionId: () => "session-a" },
+  );
+  const completed = once(resumedBus, COMPLETED_EVENT);
+  resumedBus.emit(NB_COMPLETE_EVENT, {
+    runId: "session-owned-run",
+    success: true,
+    state: "complete",
+    summary: "right session",
+  });
+  assert.deepEqual(await completed, {
+    id: "session-owned-run",
+    result: "right session",
+  });
+  resumed.dispose();
+});
+
+test("accepted-run reconciliation claims a run after its owner exits", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-takeover-"));
+  const journalPath = join(root, "operations.sqlite");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const moduleUrl = new URL("../src/operation-journal.ts", import.meta.url).href;
+  const owner = spawn(
+    process.execPath,
+    [
+      "--import",
+      "jiti/register",
+      "--input-type=module",
+      "--eval",
+      `
+        import journalModule from ${JSON.stringify(moduleUrl)};
+        const journal = new journalModule.OperationJournal(${JSON.stringify(journalPath)});
+        journal.acceptRun(
+          "takeover-after-exit",
+          { pid: process.pid, instanceId: "exiting-owner" },
+          "session-a",
+        );
+        process.stdout.write("ready\\n");
+        setInterval(() => {}, 1_000);
+      `,
+    ],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
+  t.after(() => owner.kill());
+  await waitForChildReady(owner);
+
+  const bus = new FakeEventBus();
+  const bridge = registerBridge(
+    { events: bus },
+    {
+      planExecJournalPath: journalPath,
+      getSessionId: () => "session-a",
+      acceptedRunReconcileIntervalMs: 5,
+      completionPollIntervalMs: 1_000,
+    },
+  );
+  t.after(() => bridge.dispose());
+  const completed = once(bus, COMPLETED_EVENT, 1_000);
+  owner.kill();
+  await waitForChildExit(owner);
+
+  const completionTimer = setInterval(() => {
+    bus.emit(NB_COMPLETE_EVENT, {
+      runId: "takeover-after-exit",
+      success: true,
+      state: "complete",
+      summary: "taken over",
+    });
+  }, 5);
+  try {
+    assert.deepEqual(await completed, {
+      id: "takeover-after-exit",
+      result: "taken over",
+    });
+  } finally {
+    clearInterval(completionTimer);
+  }
+});
+
+test("accepted-run reconciliation retries after a transient journal failure", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-retry-"));
+  const journal = new OperationJournal(join(root, "operations.sqlite"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  journal.acceptRun(
+    "retry-claimed-run",
+    { pid: 2_147_483_647, instanceId: "exited-owner" },
+    "session-a",
+  );
+  const claim = journal.claimAcceptedRuns.bind(journal);
+  let attempts = 0;
+  journal.claimAcceptedRuns = (...args) => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("transient claim failure");
+    return claim(...args);
+  };
+
+  const bus = new FakeEventBus();
+  const bridge = registerBridge(
+    { events: bus },
+    {
+      operationJournal: journal,
+      getSessionId: () => "session-a",
+      acceptedRunReconcileIntervalMs: 5,
+      completionPollIntervalMs: 1_000,
+    },
+  );
+  t.after(() => bridge.dispose());
+  await waitFor(() => attempts >= 2);
+
+  const completed = once(bus, COMPLETED_EVENT);
+  bus.emit(NB_COMPLETE_EVENT, {
+    runId: "retry-claimed-run",
+    success: true,
+    state: "complete",
+    summary: "claimed after retry",
+  });
+  assert.deepEqual(await completed, {
+    id: "retry-claimed-run",
+    result: "claimed after retry",
+  });
+});
+
 test("dispose unsubscribes handlers and ignores later events until re-registered", async () => {
   const bus = new FakeEventBus();
   const bridge = registerBridge({ events: bus });
@@ -1055,6 +1312,90 @@ class FakeEventBus {
     const entry = this.emitted.findLast((item) => item.event === event);
     assert.ok(entry, `expected emitted event ${event}`);
     return entry.payload;
+  }
+}
+
+async function waitForChildReady(
+  child: ChildProcessByStdio<null, Readable, null>,
+  timeoutMs = 1_000,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      finish(new Error(`child did not become ready within ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref();
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      child.stdout.off("data", onData);
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) {
+        child.kill();
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    const onData = (chunk: Buffer | string): void => {
+      if (String(chunk).includes("ready")) finish();
+    };
+    const onError = (error: Error): void => finish(error);
+    const onExit = (code: number | null, signal: string | null): void =>
+      finish(
+        new Error(
+          `child exited before ready (code=${String(code)}, signal=${String(signal)})`,
+        ),
+      );
+    child.stdout.on("data", onData);
+    child.once("error", onError);
+    child.once("exit", onExit);
+    if (child.exitCode !== null || child.signalCode !== null) onExit(child.exitCode, child.signalCode);
+  });
+}
+
+async function waitForChildExit(
+  child: ChildProcessByStdio<null, Readable, null>,
+  timeoutMs = 1_000,
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`child did not exit within ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref();
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      child.off("error", onError);
+      child.off("exit", onExit);
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const onExit = (): void => {
+      cleanup();
+      resolve();
+    };
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
+}
+
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs = 200,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("condition was not met in time");
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
 

@@ -39,6 +39,8 @@ Bridge decisions:
 - Reply to pi-tasks on `<channel>:reply:<requestId>`.
 - Return spawn success as `{ success: true, data: { id: runId } }`.
 - Translate stopped/paused pi-subagents runs to `subagents:failed` with `status: "stopped"`.
+- Use the RPC `requestId` as a durable replay key, but bind it to a semantic request digest and the current Pi session ID because the request has no task/list/attempt identity.
+- Bind accepted completion delivery to `ctx.sessionManager.getSessionId()`. A same-session process can recover it; a foreign session cannot consume it.
 
 ## plan-exec bridge v2 contract
 

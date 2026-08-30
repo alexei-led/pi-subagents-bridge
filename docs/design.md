@@ -146,7 +146,7 @@ This avoids false positives for:
 - direct `subagent(...)` calls
 - any other extension using pi-subagents RPC
 
-This is why accepted legacy run IDs are journaled and restored into `ownedRunIds`. Each record has a process owner. A live foreign process cannot claim or delete it; after that owner exits, one new process claims it transactionally. Completion delivery is at least once: the bridge emits the pi-tasks event before removing its owned record, so a crash can replay a harmless duplicate but cannot silently lose ownership.
+This is why accepted legacy run IDs are journaled and restored into `ownedRunIds`. Each record has an originating Pi session ID plus a leased process owner. Only a process running that same Pi session can claim it. The current owner refreshes a heartbeat, and another same-session process can take over transactionally after process exit or lease expiry. Lease expiry covers PID reuse. Completion renews the ownership fence before emission, then deletes with the same session and owner tokens. Completion delivery is at least once: a crash can replay a harmless duplicate, but a foreign session cannot consume the event and a stale owner cannot delete the current owner's record. Reconciliation repeats periodically after transient SQLite failures.
 
 ## Durable plan-exec launches
 
@@ -159,9 +159,9 @@ The plan-exec v2 contract separates durable launch binding from native lifecycle
 - A recovered `dispatching` binding is also unknown. It is never dispatched again.
 - Native lifecycle and process-terminal proof come from `pi-subagents` status. They are not inferred from bridge memory, async directory presence, PID, prompt, or elapsed time.
 
-The journal uses SQLite transactions with full synchronous durability. SQLite releases process locks after a crash and serializes cross-process writers. Invalid or unreadable data fails closed; it is never silently replaced with an empty journal.
+The journal uses SQLite transactions with full synchronous durability. SQLite releases process locks after a crash and serializes cross-process writers. Invalid or unreadable data fails closed; it is never silently replaced with an empty journal. Journal connections live for the extension process. Operation identity rows are intentionally retained because pruning one could allow that operation ID to dispatch again; deleting the database is an explicit retirement action, not routine cleanup. Existing v1 accepted-run rows migrate with an empty session identity and are not auto-claimed; this preserves safety at the cost of requiring manual recovery for those pre-upgrade runs.
 
-The legacy TaskExecute contract has no task identity or attempt generation. Its post-dispatch/pre-reply crash window therefore remains ambiguous. The bridge records accepted run IDs, but it does not claim exactly-once launch for that unidentifiable window.
+The legacy TaskExecute request ID is journaled with its session and semantic request digest before dispatch. Replays return the bound run; recovered `dispatching` records fail closed as unknown. The contract still has no task identity or attempt generation, so its post-dispatch/pre-reply crash window cannot be rebound to a task and the bridge does not claim recoverable exactly-once execution for that window.
 
 ## Maintenance rules
 
