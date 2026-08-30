@@ -1,13 +1,226 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   PLAN_EXEC_REPLY_PREFIX,
   PLAN_EXEC_REQUEST_EVENT,
+  PLAN_EXEC_V2_REPLY_PREFIX,
+  PLAN_EXEC_V2_REQUEST_EVENT,
   registerPlanExecRpc,
 } from "../src/plan-exec-rpc.js";
 
 const SUBAGENTS_REQUEST_EVENT = "subagents:rpc:v1:request";
 const SUBAGENTS_REPLY_PREFIX = "subagents:rpc:v1:reply:";
+
+test("plan-exec v2 exposes durable lookup and native terminal proof", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-bridge-"));
+  const journalPath = path.join(root, "operations.json");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const bus = new FakeEventBus();
+  const rpc = registerPlanExecRpc(bus, { timeoutMs: 100, journalPath });
+  t.after(() => rpc.dispose());
+
+  const ping = once(bus, v2ReplyEvent("v2-ping"));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "v2-ping",
+    method: "ping",
+  });
+  const pingUpstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(pingUpstream));
+  replyUpstream(bus, pingUpstream, "ping", {
+    version: 1,
+    capabilities: {
+      asyncSpawn: true,
+      processTerminalProof: { version: 1, lifecycleArtifactVersion: 3 },
+    },
+  });
+  assert.deepEqual(await ping, {
+    success: true,
+    data: {
+      version: 2,
+      protocol: "plan-exec-bridge",
+      capabilities: {
+        workflowScriptSpawn: true,
+        durableOperationLookup: { version: 1 },
+        processTerminalProof: { version: 1 },
+      },
+      methods: ["ping", "spawn", "operation", "status", "result", "stop", "adopt"],
+    },
+  });
+
+  const operationId = "v2-operation";
+  const params = { agent: "worker", task: "Use the v2 contract.", mission: false };
+  const requestDigest = digest({ cwd: "/tmp/v2-worktree", params });
+  const owner = {
+    kind: "pi-plan-exec",
+    runId: "plan-run-1",
+    key: operationId,
+    requestDigest,
+  } as const;
+  const spawned = once(bus, v2ReplyEvent("v2-spawn"));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "v2-spawn",
+    method: "spawn",
+    operationId,
+    owner,
+    cwd: "/tmp/v2-worktree",
+    params,
+  });
+  const spawnUpstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(spawnUpstream));
+  replyUpstream(bus, spawnUpstream, "spawn", {
+    details: { runId: "v2-run", asyncDir: "/tmp/v2-run" },
+  });
+  assert.deepEqual(await spawned, {
+    success: true,
+    data: { runId: "v2-run", asyncDir: "/tmp/v2-run", requestDigest },
+  });
+
+  const noCwdOperationId = "v2-no-cwd-operation";
+  const noCwdParams = { agent: "worker", task: "Use the default worktree.", mission: false };
+  const noCwdDigest = digest({ params: noCwdParams });
+  const noCwdSpawn = once(bus, v2ReplyEvent("v2-no-cwd"));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "v2-no-cwd",
+    method: "spawn",
+    operationId: noCwdOperationId,
+    owner: {
+      kind: "pi-plan-exec",
+      runId: "plan-run-no-cwd",
+      key: noCwdOperationId,
+      requestDigest: noCwdDigest,
+    },
+    params: noCwdParams,
+  });
+  const noCwdUpstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(noCwdUpstream));
+  replyUpstream(bus, noCwdUpstream, "spawn", {
+    details: { runId: "v2-no-cwd-run", asyncDir: "/tmp/v2-no-cwd-run" },
+  });
+  assert.deepEqual(await noCwdSpawn, {
+    success: true,
+    data: {
+      runId: "v2-no-cwd-run",
+      asyncDir: "/tmp/v2-no-cwd-run",
+      requestDigest: noCwdDigest,
+    },
+  });
+
+  const lookup = once(bus, v2ReplyEvent("v2-operation"));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "v2-operation",
+    method: "operation",
+    operationId,
+    owner,
+  });
+  assert.deepEqual(await lookup, {
+    success: true,
+    data: {
+      state: "found",
+      operationId,
+      requestDigest,
+      runId: "v2-run",
+      asyncDir: "/tmp/v2-run",
+    },
+  });
+
+  const status = once(bus, v2ReplyEvent("v2-status"));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "v2-status",
+    method: "status",
+    params: { runId: "v2-run", asyncDir: "/tmp/v2-run" },
+  });
+  const statusUpstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(statusUpstream));
+  const processTerminal = {
+    version: 1,
+    state: "observed",
+    runId: "v2-run",
+    runnerProcessInstanceId: "runner-1",
+    observedAt: 1234,
+    instances: [],
+  };
+  replyUpstream(bus, statusUpstream, "status", {
+    text: "Run: v2-run\nState: complete\nDir: /tmp/v2-run",
+    details: { lifecycleStatus: { processTerminal } },
+  });
+  assert.deepEqual(await status, {
+    success: true,
+    data: {
+      runId: "v2-run",
+      state: "complete",
+      asyncDir: "/tmp/v2-run",
+      text: "Run: v2-run\nState: complete\nDir: /tmp/v2-run",
+      processTerminal,
+    },
+  });
+  rpc.dispose();
+
+  const recoveredBus = new FakeEventBus();
+  const recovered = registerPlanExecRpc(recoveredBus, {
+    timeoutMs: 100,
+    journalPath,
+  });
+  t.after(() => recovered.dispose());
+  const recoveredLookup = once(recoveredBus, v2ReplyEvent("v2-recovered"));
+  recoveredBus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "v2-recovered",
+    method: "operation",
+    operationId,
+    owner,
+  });
+  assert.deepEqual(await recoveredLookup, {
+    success: true,
+    data: {
+      state: "found",
+      operationId,
+      requestDigest,
+      runId: "v2-run",
+      asyncDir: "/tmp/v2-run",
+    },
+  });
+});
+
+test("plan-exec v2 rejects a mismatched request digest before dispatch", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-bridge-"));
+  const journalPath = path.join(root, "operations.json");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const bus = new FakeEventBus();
+  const rpc = registerPlanExecRpc(bus, { timeoutMs: 100, journalPath });
+  t.after(() => rpc.dispose());
+
+  const reply = once(bus, v2ReplyEvent("bad-digest"));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "bad-digest",
+    method: "spawn",
+    operationId: "bad-digest-operation",
+    owner: {
+      kind: "pi-plan-exec",
+      runId: "plan-run-1",
+      key: "bad-digest-operation",
+      requestDigest: `sha256:${"0".repeat(64)}`,
+    },
+    params: { agent: "worker", task: "Reject this." },
+  });
+  assert.deepEqual(await reply, {
+    success: false,
+    error: {
+      code: "invalid_request",
+      message: "spawn owner requestDigest does not match cwd and params",
+    },
+  });
+  assert.equal(bus.count(SUBAGENTS_REQUEST_EVENT), 0);
+});
 
 test("plan-exec spawn forwards actual pi-subagents parameters and coalesces a durable operation", async (t) => {
   const bus = new FakeEventBus();
@@ -273,6 +486,195 @@ test("plan-exec retains failed operation lookup across re-registration", async (
     data: { state: "unknown", error: "provider unavailable" },
   });
   assert.equal(bus.count(SUBAGENTS_REQUEST_EVENT), 1);
+});
+
+test("plan-exec recovers bound operations from a durable journal", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-bridge-"));
+  const journalPath = path.join(root, "operations.json");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const firstBus = new FakeEventBus();
+  const first = registerPlanExecRpc(firstBus, { timeoutMs: 100, journalPath });
+  const request = {
+    version: 1,
+    method: "spawn",
+    operationId: "durable-operation",
+    params: { agent: "worker", task: "Survive a full restart." },
+  } as const;
+  const spawned = once(firstBus, replyEvent("durable-spawn"));
+  firstBus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    ...request,
+    requestId: "durable-spawn",
+  });
+  const upstream = firstBus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(upstream));
+  replyUpstream(firstBus, upstream, "spawn", {
+    details: { runId: "durable-run", asyncDir: "/tmp/durable-run" },
+  });
+  assert.deepEqual(await spawned, {
+    success: true,
+    data: { runId: "durable-run", asyncDir: "/tmp/durable-run" },
+  });
+  first.dispose();
+
+  const secondBus = new FakeEventBus();
+  const second = registerPlanExecRpc(secondBus, { timeoutMs: 100, journalPath });
+  t.after(() => second.dispose());
+  const lookup = once(secondBus, replyEvent("durable-lookup"));
+  secondBus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "durable-lookup",
+    method: "operation",
+    operationId: "durable-operation",
+  });
+  assert.deepEqual(await lookup, {
+    success: true,
+    data: {
+      state: "found",
+      runId: "durable-run",
+      asyncDir: "/tmp/durable-run",
+    },
+  });
+
+  const replay = once(secondBus, replyEvent("durable-replay"));
+  secondBus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    ...request,
+    requestId: "durable-replay",
+  });
+  assert.deepEqual(await replay, {
+    success: true,
+    data: { runId: "durable-run", asyncDir: "/tmp/durable-run" },
+  });
+  assert.equal(secondBus.count(SUBAGENTS_REQUEST_EVENT), 0);
+});
+
+test("plan-exec durable journal prevents a second process from redispatching", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-bridge-"));
+  const journalPath = path.join(root, "operations.json");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const request = {
+    version: 1,
+    method: "spawn",
+    operationId: "cross-process-operation",
+    params: { agent: "worker", task: "Dispatch only once." },
+  } as const;
+
+  const firstBus = new FakeEventBus();
+  const first = registerPlanExecRpc(firstBus, { timeoutMs: 1_000, journalPath });
+  firstBus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    ...request,
+    requestId: "first-process",
+  });
+  assert.equal(firstBus.count(SUBAGENTS_REQUEST_EVENT), 1);
+
+  const secondBus = new FakeEventBus();
+  const second = registerPlanExecRpc(secondBus, { timeoutMs: 100, journalPath });
+  const replay = once(secondBus, replyEvent("second-process"));
+  secondBus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    ...request,
+    requestId: "second-process",
+  });
+  assert.deepEqual(await replay, {
+    success: false,
+    error: {
+      code: "upstream_error",
+      message: "pi-subagents spawn outcome is unknown after bridge restart",
+    },
+  });
+  assert.equal(secondBus.count(SUBAGENTS_REQUEST_EVENT), 0);
+
+  first.dispose();
+  second.dispose();
+});
+
+test("plan-exec returns a known native run when binding persistence fails", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-bridge-"));
+  const journalPath = path.join(root, "operations.json");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const bus = new FakeEventBus();
+  const rpc = registerPlanExecRpc(bus, { timeoutMs: 100, journalPath });
+  t.after(() => rpc.dispose());
+
+  const params = { agent: "worker", task: "Keep the known run." };
+  const requestDigest = digest({ params });
+  const reply = once(bus, v2ReplyEvent("known-run"));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "known-run",
+    method: "spawn",
+    operationId: "known-run-operation",
+    owner: {
+      kind: "pi-plan-exec",
+      runId: "plan-run-known",
+      key: "known-run-operation",
+      requestDigest,
+    },
+    params,
+  });
+  const upstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(upstream));
+  fs.writeFileSync(journalPath, "{", "utf8");
+  const originalConsoleError = console.error;
+  console.error = () => undefined;
+  t.after(() => {
+    console.error = originalConsoleError;
+  });
+  replyUpstream(bus, upstream, "spawn", {
+    details: { runId: "native-known-run", asyncDir: "/tmp/native-known-run" },
+  });
+
+  assert.deepEqual(await reply, {
+    success: true,
+    data: {
+      runId: "native-known-run",
+      asyncDir: "/tmp/native-known-run",
+      requestDigest,
+    },
+  });
+});
+
+test("plan-exec recovers an unknown launch instead of reporting it absent", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-bridge-"));
+  const journalPath = path.join(root, "operations.json");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const firstBus = new FakeEventBus();
+  const first = registerPlanExecRpc(firstBus, { timeoutMs: 5, journalPath });
+  const reply = once(firstBus, replyEvent("unknown-spawn"));
+  firstBus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "unknown-spawn",
+    method: "spawn",
+    operationId: "unknown-operation",
+    params: { agent: "worker", task: "Lose the native reply." },
+  });
+  assert.equal(firstBus.count(SUBAGENTS_REQUEST_EVENT), 1);
+  assert.deepEqual(await reply, {
+    success: false,
+    error: {
+      code: "upstream_error",
+      message: "pi-subagents spawn RPC timed out after 5ms",
+    },
+  });
+  first.dispose();
+
+  const secondBus = new FakeEventBus();
+  const second = registerPlanExecRpc(secondBus, { timeoutMs: 100, journalPath });
+  t.after(() => second.dispose());
+  const lookup = once(secondBus, replyEvent("unknown-lookup"));
+  secondBus.emit(PLAN_EXEC_REQUEST_EVENT, {
+    version: 1,
+    requestId: "unknown-lookup",
+    method: "operation",
+    operationId: "unknown-operation",
+  });
+  assert.deepEqual(await lookup, {
+    success: true,
+    data: {
+      state: "unknown",
+      error: "pi-subagents spawn RPC timed out after 5ms",
+    },
+  });
 });
 
 test("plan-exec validates operation lookup requests", async (t) => {
@@ -615,6 +1017,28 @@ function replyEvent(requestId: string): string {
   return `${PLAN_EXEC_REPLY_PREFIX}${requestId}`;
 }
 
+function v2ReplyEvent(requestId: string): string {
+  return `${PLAN_EXEC_V2_REPLY_PREFIX}${requestId}`;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function digest(value: unknown): string {
+  return `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
+}
+
 function upstreamReplyEvent(requestId: string): string {
   return `${SUBAGENTS_REPLY_PREFIX}${requestId}`;
 }
@@ -622,7 +1046,7 @@ function upstreamReplyEvent(requestId: string): string {
 function replyUpstream(
   bus: FakeEventBus,
   request: Record<string, unknown>,
-  method: "spawn" | "status" | "stop",
+  method: "ping" | "spawn" | "status" | "stop",
   data: unknown,
 ): void {
   bus.emit(upstreamReplyEvent(String(request.requestId)), {

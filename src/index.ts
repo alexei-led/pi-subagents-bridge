@@ -1,10 +1,14 @@
-import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { OperationJournal } from "./operation-journal.js";
 import { registerPlanExecRpc } from "./plan-exec-rpc.js";
 import { singleChildWorkflowScript } from "./workflow-spawn.js";
 
-// Protocol evidence (installed sources verified against pi-subagents@0.43.0):
+// Protocol evidence (installed sources verified against pi-subagents@0.60.0
+// and @tintinweb/pi-tasks@0.9.0):
 // - @tintinweb/pi-tasks src/index.ts:103-119 reply channel/envelope,
 //   126-133 spawn/stop params, 137-157 strict PROTOCOL_VERSION=2,
 //   207-260 completed/failed/stopped fields.
@@ -50,6 +54,7 @@ const BRIDGE_CONTROL_CONFIG = {
 
 interface BridgeOptions {
   spawnTimeoutMs?: number;
+  planExecJournalPath?: string;
   completionPollIntervalMs?: number;
   maxActiveRuns?: number;
   defaultMaxTurns?: number;
@@ -402,8 +407,14 @@ export function registerBridge(
   const completionPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const unsubscribes: Unsubscribe[] = [];
   let disposed = false;
+  const bridgeJournal = options.planExecJournalPath
+    ? new OperationJournal(options.planExecJournalPath)
+    : undefined;
   const planExecRpc = registerPlanExecRpc(pi.events, {
     timeoutMs: spawnTimeoutMs,
+    ...(options.planExecJournalPath
+      ? { journalPath: options.planExecJournalPath }
+      : {}),
   });
 
   const track = (unsubscribe: Unsubscribe | void): void => {
@@ -439,23 +450,28 @@ export function registerBridge(
         ...(result ? { result } : {}),
         status: "stopped",
       });
-      return;
-    }
-
-    if (kind === "failed") {
+    } else if (kind === "failed") {
       pi.events.emit(FAILED_EVENT, {
         id: runId,
         error: payload ? extractFailureError(payload) : "Agent failed",
         status: "failed",
       });
-      return;
+    } else {
+      const result = payload ? extractCompletedResult(payload) : undefined;
+      pi.events.emit(COMPLETED_EVENT, {
+        id: runId,
+        ...(result ? { result } : {}),
+      });
     }
 
-    const result = payload ? extractCompletedResult(payload) : undefined;
-    pi.events.emit(COMPLETED_EVENT, {
-      id: runId,
-      ...(result ? { result } : {}),
-    });
+    try {
+      bridgeJournal?.completeRun(runId);
+    } catch (error: unknown) {
+      console.error(
+        `Failed to record delivered bridge completion for '${runId}':`,
+        error,
+      );
+    }
   };
 
   const pollRunCompletion = async (runId: string): Promise<void> => {
@@ -545,6 +561,15 @@ export function registerBridge(
     timer.unref();
     completionPollTimers.set(runId, timer);
   };
+
+  try {
+    for (const accepted of bridgeJournal?.listAcceptedRuns() ?? []) {
+      ownedRunIds.add(accepted.runId);
+      ensureCompletionPoll(accepted.runId);
+    }
+  } catch (error: unknown) {
+    console.error("Failed to restore accepted bridge runs:", error);
+  }
 
   // pi-subagents/src/agents/agents.ts exposes exact runtime names and has no
   // general-purpose/Explore builtins. Keep only these pi-tasks compatibility aliases.
@@ -649,6 +674,11 @@ export function registerBridge(
           throw new Error("nicobailon spawn reply did not include a run id");
         }
 
+        try {
+          bridgeJournal?.acceptRun(runId);
+        } catch (error: unknown) {
+          console.error(`Failed to persist accepted bridge run '${runId}':`, error);
+        }
         ownedRunIds.add(runId);
         ensureCompletionPoll(runId);
         return { success: true, data: { id: runId } };
@@ -763,5 +793,12 @@ export function registerBridge(
 }
 
 export default function bridgeExtension(pi: ExtensionAPI): void {
-  registerBridge(pi);
+  registerBridge(pi, {
+    planExecJournalPath: path.join(
+      os.homedir(),
+      ".pi",
+      "pi-subagents-bridge",
+      "plan-exec-operations.json",
+    ),
+  });
 }

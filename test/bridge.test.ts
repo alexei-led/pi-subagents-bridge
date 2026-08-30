@@ -896,6 +896,52 @@ test("dispose cancels in-flight spawn work and ignores late replies", async () =
   assert.equal(bus.count(replyChannel(SPAWN_CHANNEL, "spawn-disposed")), 0);
 });
 
+test("accepted legacy runs survive a full bridge restart until completion delivery", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-runs-"));
+  const journalPath = join(root, "bridge-journal.json");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const firstBus = new FakeEventBus();
+  const first = registerBridge(
+    { events: firstBus },
+    { planExecJournalPath: journalPath, completionPollIntervalMs: 1_000 },
+  );
+  await spawnOwnedRun(firstBus, "run-after-restart");
+  first.dispose();
+
+  const secondBus = new FakeEventBus();
+  const second = registerBridge(
+    { events: secondBus },
+    { planExecJournalPath: journalPath, completionPollIntervalMs: 1_000 },
+  );
+  const completed = once(secondBus, COMPLETED_EVENT);
+  secondBus.emit(NB_COMPLETE_EVENT, {
+    runId: "run-after-restart",
+    success: true,
+    state: "complete",
+    summary: "recovered",
+  });
+  assert.deepEqual(await completed, {
+    id: "run-after-restart",
+    result: "recovered",
+  });
+  second.dispose();
+
+  const thirdBus = new FakeEventBus();
+  const third = registerBridge(
+    { events: thirdBus },
+    { planExecJournalPath: journalPath, completionPollIntervalMs: 1_000 },
+  );
+  thirdBus.emit(NB_COMPLETE_EVENT, {
+    runId: "run-after-restart",
+    success: true,
+    state: "complete",
+    summary: "duplicate",
+  });
+  assert.equal(thirdBus.count(COMPLETED_EVENT), 0);
+  third.dispose();
+});
+
 test("dispose unsubscribes handlers and ignores later events until re-registered", async () => {
   const bus = new FakeEventBus();
   const bridge = registerBridge({ events: bus });

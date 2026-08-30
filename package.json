@@ -23,6 +23,7 @@
   ],
   "files": [
     "src/index.ts",
+    "src/operation-journal.ts",
     "src/plan-exec-rpc.ts",
     "src/workflow-spawn.ts"
   ],
@@ -41,15 +42,17 @@
     "image": "https://raw.githubusercontent.com/alexei-led/pi-subagents-bridge/main/assets/bridge.svg"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": ">=0.84.4"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.82.1",
+    "@earendil-works/pi-coding-agent": "0.84.4",
     "@eslint/js": "^10.0.1",
+    "@tintinweb/pi-tasks": "0.9.0",
     "@types/node": "^24.10.0",
     "eslint": "^10.6.0",
     "globals": "^17.7.0",
     "jiti": "^2.7.0",
+    "pi-subagents": "0.60.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.1"
   },

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add the version 2 plan-exec RPC with durable operation lookup, request-digest validation, and validated native process-terminal proof while retaining the version 1 contract.
+- Persist launch bindings before native dispatch so bridge restarts recover bound runs and fail closed on unknown launch outcomes instead of spawning duplicates.
+- Persist accepted legacy TaskExecute run IDs so completion translation resumes after a full Pi restart.
+- Verify live pi-subagents capabilities before advertising version 2 workflow and terminal-proof support.
+
 ## 0.2.3 - 2026-08-08
 
 - Disable pi-subagents control notices for bridge-owned child runs. This avoids
