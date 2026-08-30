@@ -85,6 +85,7 @@ interface BridgeState {
   inFlightSpawnReplies: Map<string, Promise<RpcReply<{ id: string }>>>;
   spawnReplyCache: Map<string, SpawnReplyCacheEntry>;
   terminalResultDeadlines: Map<string, number>;
+  journal?: OperationJournal;
   registration?: BridgeRegistration;
 }
 
@@ -427,9 +428,16 @@ export function registerBridge(
   const completionPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const unsubscribes: Unsubscribe[] = [];
   let disposed = false;
-  const bridgeJournal = options.planExecJournalPath
-    ? new OperationJournal(options.planExecJournalPath)
-    : undefined;
+  if (options.planExecJournalPath) {
+    const journalPath = path.resolve(options.planExecJournalPath);
+    if (state.journal && state.journal.filePath !== journalPath) {
+      throw new Error(
+        "bridge was already registered with a different operation journal",
+      );
+    }
+    state.journal ??= new OperationJournal(journalPath);
+  }
+  const bridgeJournal = state.journal;
   const planExecRpc = registerPlanExecRpc(pi.events, {
     timeoutMs: spawnTimeoutMs,
     ...(options.planExecJournalPath
