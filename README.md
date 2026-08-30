@@ -124,19 +124,21 @@ If `subagent:async-complete` does not arrive, the bridge polls `pi-subagents` `s
 
 ## Generic plan-exec RPC
 
-This protocol is independent of `pi-tasks`. Send `{ version: 1, requestId, method, ... }` on `plan-exec:bridge:v1:request`; replies use `plan-exec:bridge:v1:reply:<requestId>`.
+This protocol is independent of `pi-tasks`. Version 1 remains available on `plan-exec:bridge:v1:request` with replies on `plan-exec:bridge:v1:reply:<requestId>`.
 
-Supported methods are `ping`, `spawn`, `operation`, `status`, `result`, `stop`, and `adopt`. `ping` advertises `capabilities.workflowScriptSpawn: true` for compatibility probes.
+Version 2 uses `plan-exec:bridge:v2:request` and `plan-exec:bridge:v2:reply:<requestId>`. It keeps the same `ping`, `spawn`, `operation`, `status`, `result`, `stop`, and `adopt` methods while adding durable launch identity and native process-terminal proof.
 
-- `spawn` requires a durable top-level `operationId`, top-level `cwd` when needed, and `params.agent` plus `params.task`. It translates the child into a one-child `workflowScript` and forwards supported workflow defaults (`context`, `model`, `turnBudget`, `control`, `acceptance`, and `timeout`) to `pi-subagents`. It accepts legacy `clarify: false` by omitting the field and rejects `clarify: true`. It accepts `timeout` or `timeoutMs` and rejects mismatched values; either maps to pi-subagents `timeoutMs`. It returns `{ runId, asyncDir? }`. A repeated operation ID reuses the original reply for this Pi process lifetime.
-- `operation` requires `operationId` and never starts a child. It returns `{ state: "absent" }`, `{ state: "pending" }`, `{ state: "found", runId, asyncDir? }`, or `{ state: "unknown", error }`. Its lookup map survives bridge re-registration in one Pi process but is not durable across a full Pi restart. It retains at most 127 completed outcomes and never evicts active operations. Clients must use it after an unknown spawn outcome and must not blindly launch a second child.
-- `status` and `result` return normalized observations from the `pi-subagents` status RPC. `result` uses status because `pi-subagents` has no separate result RPC.
-- `stop` delegates to the `pi-subagents` stop RPC.
-- `adopt` validates and observes a run but does not transfer ownership or promise cross-session stop support.
+- `ping` verifies the live `pi-subagents` RPC before advertising `workflowScriptSpawn`, `durableOperationLookup`, and `processTerminalProof` capabilities.
+- `spawn` requires `operationId`, `cwd` when needed, `params.agent`, `params.task`, and an owner `{ kind: "pi-plan-exec", runId, key, requestDigest }`. The digest is SHA-256 over canonical `{ cwd, params }`. The bridge rejects mismatches before dispatch.
+- The durable journal is written before the native spawn is emitted. A bound operation survives a full Pi restart. A dispatch with no durable native reply becomes `unknown`; the bridge never launches it again automatically.
+- `operation` never starts work. Version 2 returns `operationId`, `requestDigest`, and `absent`, `pending`, `found`, or `unknown` binding state.
+- `status` and `adopt` include a validated native `processTerminal` value when `pi-subagents` returns one. Only an `observed` proof with the matching run ID proves process termination.
+- `result` uses the native status RPC because `pi-subagents` has no separate result RPC. `stop` delegates to the native stop RPC.
+- `adopt` is observational. It does not silently transfer session ownership.
 
-Failures use `{ success: false, error: { code, message } }`. `operation_capacity`
-means the bridge has 128 unresolved active operation IDs and will not evict any
-to accept another spawn.
+The journal defaults to `~/.pi/pi-subagents-bridge/plan-exec-operations.sqlite`. SQLite transactions provide crash recovery and cross-process serialization without a stale application lock. Version 1 clients retain their existing response shape and also benefit from durable bound-operation lookup. Operation identity rows are retained as idempotency records; automatic pruning could make an old operation ID dispatch again. Remove the database only after all referenced plan runs are permanently retired and duplicate-launch protection is no longer needed. Existing v1 accepted-run rows migrate fail-closed with no session identity; they require explicit manual recovery rather than unsafe cross-session delivery.
+
+Failures use `{ success: false, error: { code, message } }`. `operation_capacity` means the in-process bridge has 128 unresolved active operation IDs and will not evict one to accept another spawn.
 
 ## TaskExecute-specific safeguards
 
@@ -146,7 +148,13 @@ Because of that, the bridge also applies two execution defaults to bridge-spawne
 - disables `pi-subagents` acceptance gating
 - disables `pi-subagents` live control nudges
 
-This avoids false pauses on missing acceptance reports and avoids misleading background `needs attention` notices for normal task runs. Repeated copies of the same spawn request are coalesced, so retries cannot launch duplicate bridge-owned agents.
+This avoids false pauses on missing acceptance reports and avoids misleading background `needs attention` notices for normal task runs. Repeated copies of one live request are coalesced only after their session and request digest match. The request ID is also journaled before native dispatch, so replay after the in-memory reply cache expires returns the existing run or fails closed as unknown instead of dispatching again. Transient persistence failures for known accepted runs and launch bindings are retried while the bridge process remains active.
+
+Accepted run IDs are tied to the originating Pi session ID and a leased process owner. A foreign Pi session cannot claim or delete them. The same resumed session can reclaim them after the owner exits or its heartbeat lease expires; the lease covers PID reuse. The owner renews its fence before emitting completion, and failed reconciliation is retried periodically. If another session wins ownership, the bridge stops polling and emits `subagents:warning` with code `accepted_run_ownership_lost` instead of silently dropping the run.
+
+The legacy `pi-tasks` spawn request does not contain task ID, list ID, or attempt generation. Therefore the bridge cannot recover a task binding after a crash that occurs after native dispatch but before the run ID is received. The durable request becomes unknown and is not launched again automatically. The bridge does not use prompt matching.
+
+If the native run ID is known but local accepted-run persistence fails, the bridge acknowledges that known run instead of returning an error that could trigger a duplicate launch. It keeps completion ownership for the current process and logs the durability loss; a subsequent process restart then requires manual completion recovery.
 
 ## Scope and limits
 

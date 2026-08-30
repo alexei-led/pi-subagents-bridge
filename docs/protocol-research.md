@@ -5,14 +5,15 @@ Update it incrementally when either upstream package changes.
 
 ## Scope and versions checked
 
-- `pi-subagents` installed package: `0.34.0`.
-- `npm pack pi-subagents` package: `0.34.0`.
+- Pi extension API contract tested with `@earendil-works/pi-coding-agent 0.84.4`.
+- `pi-subagents` supported runtime contract: `0.60.0`.
+- The bridge v2 capability probe is required because package versions alone do not prove the loaded extension contract.
 - Packed files matched installed files for:
   - `src/extension/rpc.ts`
   - `src/runs/background/result-watcher.ts`
   - `src/shared/types.ts`
   - `src/agents/agent-selection.ts`
-- `@tintinweb/pi-tasks` installed package: `0.7.1`.
+- `@tintinweb/pi-tasks` supported runtime contract: `0.9.0`.
 
 ## pi-tasks v2 RPC contract
 
@@ -38,6 +39,19 @@ Bridge decisions:
 - Reply to pi-tasks on `<channel>:reply:<requestId>`.
 - Return spawn success as `{ success: true, data: { id: runId } }`.
 - Translate stopped/paused pi-subagents runs to `subagents:failed` with `status: "stopped"`.
+- Use the RPC `requestId` as a durable replay key, but bind it to a semantic request digest and the current Pi session ID because the request has no task/list/attempt identity.
+- Bind accepted completion delivery to `ctx.sessionManager.getSessionId()`. A same-session process can recover it; a foreign session cannot consume it.
+
+## plan-exec bridge v2 contract
+
+- Request channel is `plan-exec:bridge:v2:request`; reply prefix is `plan-exec:bridge:v2:reply:`.
+- Version 1 remains supported without changing its request or reply shapes.
+- Spawn identity is `{ operationId, owner: { kind: "pi-plan-exec", runId, key, requestDigest }, cwd, params }`.
+- `requestDigest` is `sha256:` plus SHA-256 of canonical JSON `{ cwd: effectiveTopLevelCwd, params: originalParams }`.
+- A journal record is persisted before native dispatch. `dispatching` records that cannot be proven bound are `unknown` and never retried automatically.
+- Version 2 ping negotiates native `pi-subagents` capabilities. `processTerminalProof: { version: 1 }` is advertised only when upstream advertises version 1.
+- Status and adopt pass through only validated native `details.lifecycleStatus.processTerminal`; proof state `observed` is the only terminal proof.
+- Owner and digest mismatches fail before native dispatch. Operation lookup is durable and never starts a child.
 
 ## pi-subagents v1 RPC contract
 

@@ -1,10 +1,14 @@
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import { randomUUID } from "node:crypto";
+import os from "node:os";
+import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { OperationJournal } from "./operation-journal.js";
 import { registerPlanExecRpc } from "./plan-exec-rpc.js";
 import { singleChildWorkflowScript } from "./workflow-spawn.js";
 
-// Protocol evidence (installed sources verified against pi-subagents@0.43.0):
+// Protocol evidence (installed sources verified against pi-subagents@0.60.0
+// and @tintinweb/pi-tasks@0.9.0):
 // - @tintinweb/pi-tasks src/index.ts:103-119 reply channel/envelope,
 //   126-133 spawn/stop params, 137-157 strict PROTOCOL_VERSION=2,
 //   207-260 completed/failed/stopped fields.
@@ -21,6 +25,7 @@ const STOP_CHANNEL = "subagents:rpc:stop";
 const COMPLETED_EVENT = "subagents:completed";
 const FAILED_EVENT = "subagents:failed";
 const READY_EVENT = "subagents:ready";
+const WARNING_EVENT = "subagents:warning";
 const NB_REQUEST_CHANNEL = "subagents:rpc:v1:request";
 const NB_COMPLETE_EVENT = "subagent:async-complete";
 const NB_REPLY_PREFIX = "subagents:rpc:v1:reply:";
@@ -30,6 +35,7 @@ const DEFAULT_MAX_ACTIVE_RUNS = 2;
 const DEFAULT_MAX_TURNS = 12;
 const DEFAULT_TERMINAL_RESULT_GRACE_MS = 5_000;
 const DEFAULT_SPAWN_REPLY_CACHE_TTL_MS = 60_000;
+const DEFAULT_ACCEPTED_RUN_LEASE_MS = 30_000;
 const MAX_FAILURE_PARTIAL_OUTPUT_CHARS = 4_000;
 
 const AGENT_TYPE_ALIASES = new Map<string, string>([
@@ -50,11 +56,16 @@ const BRIDGE_CONTROL_CONFIG = {
 
 interface BridgeOptions {
   spawnTimeoutMs?: number;
+  planExecJournalPath?: string;
   completionPollIntervalMs?: number;
   maxActiveRuns?: number;
   defaultMaxTurns?: number;
   terminalResultGraceMs?: number;
   spawnReplyCacheTtlMs?: number;
+  acceptedRunLeaseMs?: number;
+  acceptedRunReconcileIntervalMs?: number;
+  getSessionId?: () => string | undefined;
+  operationJournal?: OperationJournal;
 }
 
 type BridgeHost = Pick<ExtensionAPI, "events">;
@@ -68,8 +79,21 @@ interface BridgeRegistration {
 }
 
 interface SpawnReplyCacheEntry {
+  identity: string;
   reply: RpcReply<{ id: string }>;
   expiresAt: number;
+}
+
+interface InFlightSpawnReply {
+  identity: string;
+  reply: Promise<RpcReply<{ id: string }>>;
+}
+
+interface PendingLegacyBinding {
+  requestId: string;
+  requestDigest: string;
+  sessionId: string;
+  runId: string;
 }
 
 interface BridgeState {
@@ -77,13 +101,34 @@ interface BridgeState {
   completedRunIds: Set<string>;
   stoppingRunIds: Set<string>;
   pendingSpawnCount: number;
-  inFlightSpawnReplies: Map<string, Promise<RpcReply<{ id: string }>>>;
+  inFlightSpawnReplies: Map<string, InFlightSpawnReply>;
   spawnReplyCache: Map<string, SpawnReplyCacheEntry>;
   terminalResultDeadlines: Map<string, number>;
+  pendingLegacyBindings: Map<string, PendingLegacyBinding>;
+  journal?: OperationJournal;
   registration?: BridgeRegistration;
 }
 
 const bridgeStates = new WeakMap<BridgeHost["events"], BridgeState>();
+const PROCESS_OWNER_KEY = Symbol.for(
+  "pi-subagents-bridge.accepted-run-owner.v1",
+);
+
+interface ProcessOwnerStore {
+  pid: number;
+  instanceId: string;
+}
+
+function acceptedRunOwner(): ProcessOwnerStore {
+  const target = globalThis as typeof globalThis & {
+    [PROCESS_OWNER_KEY]?: ProcessOwnerStore;
+  };
+  const existing = target[PROCESS_OWNER_KEY];
+  if (existing?.pid === process.pid) return existing;
+  const created = { pid: process.pid, instanceId: randomUUID() };
+  target[PROCESS_OWNER_KEY] = created;
+  return created;
+}
 
 interface SpawnOptionsRaw {
   model?: unknown;
@@ -353,6 +398,7 @@ function getBridgeState(events: BridgeHost["events"]): BridgeState {
     inFlightSpawnReplies: new Map(),
     spawnReplyCache: new Map(),
     terminalResultDeadlines: new Map(),
+    pendingLegacyBindings: new Map(),
   };
   bridgeStates.set(events, created);
   return created;
@@ -364,6 +410,7 @@ export function registerBridge(
 ): { dispose: () => void } {
   const state = getBridgeState(pi.events);
   if (state.registration) return state.registration;
+  const processOwner = acceptedRunOwner();
 
   const spawnTimeoutMs = positiveIntegerOrDefault(
     options.spawnTimeoutMs,
@@ -389,6 +436,16 @@ export function registerBridge(
     options.spawnReplyCacheTtlMs,
     DEFAULT_SPAWN_REPLY_CACHE_TTL_MS,
   );
+  const acceptedRunLeaseMs = positiveIntegerOrDefault(
+    options.acceptedRunLeaseMs,
+    DEFAULT_ACCEPTED_RUN_LEASE_MS,
+  );
+  const fallbackSessionId = `process:${processOwner.instanceId}`;
+  const currentSessionId = (): string | undefined => {
+    const sessionId = options.getSessionId?.()?.trim();
+    if (sessionId) return sessionId;
+    return options.getSessionId ? undefined : fallbackSessionId;
+  };
 
   const {
     ownedRunIds,
@@ -397,13 +454,35 @@ export function registerBridge(
     inFlightSpawnReplies,
     spawnReplyCache,
     terminalResultDeadlines,
+    pendingLegacyBindings,
   } = state;
   const pendingRpcControllers = new Set<AbortController>();
   const completionPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const volatileOwnedRuns = new Map<string, string>();
   const unsubscribes: Unsubscribe[] = [];
   let disposed = false;
+  if (options.operationJournal) {
+    if (state.journal && state.journal !== options.operationJournal) {
+      throw new Error(
+        "bridge was already registered with a different operation journal",
+      );
+    }
+    state.journal = options.operationJournal;
+  } else if (options.planExecJournalPath) {
+    const journalPath = path.resolve(options.planExecJournalPath);
+    if (state.journal && state.journal.filePath !== journalPath) {
+      throw new Error(
+        "bridge was already registered with a different operation journal",
+      );
+    }
+    state.journal ??= new OperationJournal(journalPath);
+  }
+  const bridgeJournal = state.journal;
   const planExecRpc = registerPlanExecRpc(pi.events, {
     timeoutMs: spawnTimeoutMs,
+    ...(options.planExecJournalPath
+      ? { journalPath: options.planExecJournalPath }
+      : {}),
   });
 
   const track = (unsubscribe: Unsubscribe | void): void => {
@@ -425,6 +504,26 @@ export function registerBridge(
     payload?: AsyncCompleteRaw,
   ): void => {
     if (!ownedRunIds.has(runId) || completedRunIds.has(runId)) return;
+    const sessionId = currentSessionId();
+    if (!sessionId) return;
+    if (bridgeJournal && volatileOwnedRuns.get(runId) !== sessionId) {
+      let renewed: boolean;
+      try {
+        renewed = bridgeJournal.renewAcceptedRun(
+          runId,
+          processOwner.instanceId,
+          sessionId,
+        );
+      } catch (error: unknown) {
+        console.error(`Failed to renew accepted bridge run '${runId}':`, error);
+        return;
+      }
+      if (!renewed) {
+        ownedRunIds.delete(runId);
+        clearCompletionPoll(runId);
+        return;
+      }
+    }
 
     completedRunIds.add(runId);
     ownedRunIds.delete(runId);
@@ -439,23 +538,33 @@ export function registerBridge(
         ...(result ? { result } : {}),
         status: "stopped",
       });
-      return;
-    }
-
-    if (kind === "failed") {
+    } else if (kind === "failed") {
       pi.events.emit(FAILED_EVENT, {
         id: runId,
         error: payload ? extractFailureError(payload) : "Agent failed",
         status: "failed",
       });
-      return;
+    } else {
+      const result = payload ? extractCompletedResult(payload) : undefined;
+      pi.events.emit(COMPLETED_EVENT, {
+        id: runId,
+        ...(result ? { result } : {}),
+      });
     }
 
-    const result = payload ? extractCompletedResult(payload) : undefined;
-    pi.events.emit(COMPLETED_EVENT, {
-      id: runId,
-      ...(result ? { result } : {}),
-    });
+    try {
+      bridgeJournal?.completeRun(
+        runId,
+        processOwner.instanceId,
+        sessionId,
+      );
+      volatileOwnedRuns.delete(runId);
+    } catch (error: unknown) {
+      console.error(
+        `Failed to record delivered bridge completion for '${runId}':`,
+        error,
+      );
+    }
   };
 
   const pollRunCompletion = async (runId: string): Promise<void> => {
@@ -546,6 +655,117 @@ export function registerBridge(
     completionPollTimers.set(runId, timer);
   };
 
+  const rearmAcceptedRun = (runId: string): string | undefined => {
+    const sessionId = currentSessionId();
+    if (!sessionId) return "Pi session identity is not initialized";
+    if (bridgeJournal && volatileOwnedRuns.get(runId) !== sessionId) {
+      try {
+        if (!bridgeJournal.acceptRun(runId, processOwner, sessionId)) {
+          const claimed = bridgeJournal.claimAcceptedRuns(
+            processOwner,
+            sessionId,
+            acceptedRunLeaseMs,
+          );
+          if (!claimed.some((run) => run.runId === runId)) {
+            return `native run '${runId}' is already owned by another bridge session`;
+          }
+        }
+      } catch (error: unknown) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    }
+    completedRunIds.delete(runId);
+    ownedRunIds.add(runId);
+    ensureCompletionPoll(runId);
+    return undefined;
+  };
+
+  const reconcileAcceptedRuns = (): void => {
+    if (!bridgeJournal || disposed) return;
+    const sessionId = currentSessionId();
+    if (!sessionId) return;
+    for (const [runId, pending] of pendingLegacyBindings) {
+      if (pending.sessionId !== sessionId) continue;
+      try {
+        bridgeJournal.bindLegacySpawn(
+          pending.requestId,
+          pending.requestDigest,
+          pending.sessionId,
+          pending.runId,
+        );
+        pendingLegacyBindings.delete(runId);
+      } catch (error: unknown) {
+        console.error(
+          `Failed to retry legacy bridge run '${runId}' binding:`,
+          error,
+        );
+      }
+    }
+    try {
+      const claimed = bridgeJournal.claimAcceptedRuns(
+        processOwner,
+        sessionId,
+        acceptedRunLeaseMs,
+      );
+      const claimedIds = new Set(claimed.map((run) => run.runId));
+      for (const runId of [...ownedRunIds]) {
+        const volatileSessionId = volatileOwnedRuns.get(runId);
+        if (volatileSessionId === sessionId) {
+          try {
+            if (bridgeJournal.acceptRun(runId, processOwner, sessionId)) {
+              volatileOwnedRuns.delete(runId);
+              claimedIds.add(runId);
+              continue;
+            }
+            volatileOwnedRuns.delete(runId);
+          } catch (error: unknown) {
+            console.error(
+              `Failed to persist volatile bridge run '${runId}':`,
+              error,
+            );
+            continue;
+          }
+        } else if (volatileSessionId) {
+          volatileOwnedRuns.delete(runId);
+        } else if (claimedIds.has(runId)) {
+          continue;
+        }
+        ownedRunIds.delete(runId);
+        clearCompletionPoll(runId);
+        pi.events.emit(WARNING_EVENT, {
+          code: "accepted_run_ownership_lost",
+          id: runId,
+          message:
+            "Bridge stopped delivering this run because another session owns its completion record.",
+        });
+      }
+      for (const accepted of claimed) {
+        ownedRunIds.add(accepted.runId);
+        ensureCompletionPoll(accepted.runId);
+      }
+    } catch (error: unknown) {
+      console.error("Failed to reconcile accepted bridge runs:", error);
+    }
+  };
+
+  reconcileAcceptedRuns();
+  const acceptedRunReconcileInterval = bridgeJournal
+    ? setInterval(
+        reconcileAcceptedRuns,
+        positiveIntegerOrDefault(
+          options.acceptedRunReconcileIntervalMs,
+          Math.max(
+            1_000,
+            Math.min(
+              completionPollIntervalMs,
+              Math.floor(acceptedRunLeaseMs / 3),
+            ),
+          ),
+        ),
+      )
+    : undefined;
+  acceptedRunReconcileInterval?.unref();
+
   // pi-subagents/src/agents/agents.ts exposes exact runtime names and has no
   // general-purpose/Explore builtins. Keep only these pi-tasks compatibility aliases.
   track(
@@ -573,21 +793,6 @@ export function registerBridge(
     const requestId = text(raw.requestId);
     if (!requestId) return;
 
-    pruneSpawnReplyCache();
-    const cachedReply = spawnReplyCache.get(requestId)?.reply;
-    if (cachedReply) {
-      emitReply(pi.events, SPAWN_CHANNEL, requestId, cachedReply);
-      return;
-    }
-
-    const inFlightReply = inFlightSpawnReplies.get(requestId);
-    if (inFlightReply) {
-      void inFlightReply.then((reply) => {
-        if (!disposed) emitReply(pi.events, SPAWN_CHANNEL, requestId, reply);
-      });
-      return;
-    }
-
     const agentType = text(raw.type);
     const prompt = text(raw.prompt);
     if (!agentType || !prompt) {
@@ -597,8 +802,114 @@ export function registerBridge(
       });
       return;
     }
+    const sessionId = currentSessionId();
+    if (!sessionId) {
+      emitReply(pi.events, SPAWN_CHANNEL, requestId, {
+        success: false,
+        error: "Pi session identity is not initialized",
+      });
+      return;
+    }
+    const optionsRaw = normalizeSpawnOptions(raw.options);
+    const model = text(optionsRaw?.model);
+    const maxTurns =
+      typeof optionsRaw?.maxTurns === "number" &&
+      Number.isInteger(optionsRaw.maxTurns) &&
+      optionsRaw.maxTurns > 0
+        ? optionsRaw.maxTurns
+        : defaultMaxTurns;
+    const spawnParams: Record<string, unknown> = {
+      workflowScript: singleChildWorkflowScript(
+        resolveAgentType(agentType),
+        prompt,
+        { control: BRIDGE_CONTROL_CONFIG },
+      ),
+      async: true,
+      context: "fresh",
+      acceptance: BRIDGE_ACCEPTANCE_CONFIG,
+      control: BRIDGE_CONTROL_CONFIG,
+      ...(model ? { model } : {}),
+      turnBudget: { maxTurns },
+    };
+    const legacyRequestDigest = `sha256:${createHash("sha256")
+      .update(JSON.stringify({ agentType, prompt, spawnParams }))
+      .digest("hex")}`;
+    const requestIdentity = `${sessionId}:${legacyRequestDigest}`;
+
+    pruneSpawnReplyCache();
+    const cached = spawnReplyCache.get(requestId);
+    if (cached) {
+      if (cached.identity !== requestIdentity) {
+        emitReply(pi.events, SPAWN_CHANNEL, requestId, {
+          success: false,
+          error: "spawn requestId was already used by another request",
+        });
+        return;
+      }
+      if (cached.reply.success) {
+        const error = rearmAcceptedRun(cached.reply.data.id);
+        if (error) {
+          emitReply(pi.events, SPAWN_CHANNEL, requestId, {
+            success: false,
+            error,
+          });
+          return;
+        }
+      }
+      emitReply(pi.events, SPAWN_CHANNEL, requestId, cached.reply);
+      return;
+    }
+
+    const inFlight = inFlightSpawnReplies.get(requestId);
+    if (inFlight) {
+      if (inFlight.identity !== requestIdentity) {
+        emitReply(pi.events, SPAWN_CHANNEL, requestId, {
+          success: false,
+          error: "spawn requestId was already used by another request",
+        });
+        return;
+      }
+      void inFlight.reply.then((reply) => {
+        if (!disposed) emitReply(pi.events, SPAWN_CHANNEL, requestId, reply);
+      });
+      return;
+    }
 
     const spawn = async (): Promise<RpcReply<{ id: string }>> => {
+      if (bridgeJournal) {
+        try {
+          const durable = bridgeJournal.getLegacySpawn(requestId);
+          if (durable) {
+            if (
+              durable.requestDigest !== legacyRequestDigest ||
+              durable.sessionId !== sessionId
+            ) {
+              return {
+                success: false,
+                error: "spawn requestId was already used by another request",
+              };
+            }
+            if (durable.binding === "bound" && durable.runId) {
+              const error = rearmAcceptedRun(durable.runId);
+              return error
+                ? { success: false, error }
+                : { success: true, data: { id: durable.runId } };
+            }
+            return {
+              success: false,
+              error:
+                durable.error ??
+                "legacy spawn outcome is unknown; manual recovery is required",
+            };
+          }
+        } catch (error: unknown) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
+
       if (ownedRunIds.size + state.pendingSpawnCount >= maxActiveRuns) {
         return {
           success: false,
@@ -606,27 +917,28 @@ export function registerBridge(
         };
       }
 
-      const optionsRaw = normalizeSpawnOptions(raw.options);
-      const model = text(optionsRaw?.model);
-      const maxTurns =
-        typeof optionsRaw?.maxTurns === "number" &&
-        Number.isInteger(optionsRaw.maxTurns) &&
-        optionsRaw.maxTurns > 0
-          ? optionsRaw.maxTurns
-          : defaultMaxTurns;
-      const spawnParams: Record<string, unknown> = {
-        workflowScript: singleChildWorkflowScript(
-          resolveAgentType(agentType),
-          prompt,
-          { control: BRIDGE_CONTROL_CONFIG },
-        ),
-        async: true,
-        context: "fresh",
-        acceptance: BRIDGE_ACCEPTANCE_CONFIG,
-        control: BRIDGE_CONTROL_CONFIG,
-        ...(model ? { model } : {}),
-        turnBudget: { maxTurns },
-      };
+      let durableOperationStarted = false;
+      if (bridgeJournal) {
+        try {
+          const begun = bridgeJournal.beginLegacySpawn(
+            requestId,
+            legacyRequestDigest,
+            sessionId,
+          );
+          if (!begun.created) {
+            return {
+              success: false,
+              error: "spawn requestId was concurrently claimed",
+            };
+          }
+          durableOperationStarted = true;
+        } catch (error: unknown) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }
 
       const controller = new AbortController();
       state.pendingSpawnCount += 1;
@@ -641,7 +953,7 @@ export function registerBridge(
           controller.signal,
         );
         if (disposed || controller.signal.aborted) {
-          return { success: false, error: "Bridge disposed" };
+          throw new Error("Bridge disposed after native dispatch");
         }
 
         const runId = extractSpawnRunId(reply);
@@ -649,10 +961,66 @@ export function registerBridge(
           throw new Error("nicobailon spawn reply did not include a run id");
         }
 
+        try {
+          bridgeJournal?.bindLegacySpawn(
+            requestId,
+            legacyRequestDigest,
+            sessionId,
+            runId,
+          );
+          pendingLegacyBindings.delete(runId);
+          durableOperationStarted = false;
+        } catch (error: unknown) {
+          pendingLegacyBindings.set(runId, {
+            requestId,
+            requestDigest: legacyRequestDigest,
+            sessionId,
+            runId,
+          });
+          console.error(
+            `Failed to persist legacy bridge run '${runId}' binding:`,
+            error,
+          );
+        }
+
+        try {
+          const accepted = bridgeJournal?.acceptRun(
+            runId,
+            processOwner,
+            sessionId,
+          );
+          if (accepted === false) {
+            return {
+              success: false,
+              error: `native run '${runId}' is already owned by another bridge session`,
+            };
+          }
+        } catch (error: unknown) {
+          // The native run already exists. Returning a failed spawn would invite
+          // TaskExecute to launch a duplicate, so keep session-scoped ownership
+          // in memory and report the durability loss explicitly.
+          volatileOwnedRuns.set(runId, sessionId);
+          console.error(`Failed to persist accepted bridge run '${runId}':`, error);
+        }
         ownedRunIds.add(runId);
         ensureCompletionPoll(runId);
         return { success: true, data: { id: runId } };
       } catch (error: unknown) {
+        if (durableOperationStarted) {
+          try {
+            bridgeJournal?.markLegacySpawnUnknown(
+              requestId,
+              legacyRequestDigest,
+              sessionId,
+              error instanceof Error ? error.message : String(error),
+            );
+          } catch (journalError: unknown) {
+            console.error(
+              `Failed to persist unknown legacy spawn '${requestId}':`,
+              journalError,
+            );
+          }
+        }
         return {
           success: false,
           error: error instanceof Error ? error.message : String(error),
@@ -664,9 +1032,13 @@ export function registerBridge(
     };
 
     const spawnReply = spawn();
-    inFlightSpawnReplies.set(requestId, spawnReply);
+    const inFlightEntry: InFlightSpawnReply = {
+      identity: requestIdentity,
+      reply: spawnReply,
+    };
+    inFlightSpawnReplies.set(requestId, inFlightEntry);
     void spawnReply.then((reply) => {
-      if (inFlightSpawnReplies.get(requestId) === spawnReply) {
+      if (inFlightSpawnReplies.get(requestId) === inFlightEntry) {
         inFlightSpawnReplies.delete(requestId);
       }
       if (
@@ -674,6 +1046,7 @@ export function registerBridge(
         !reply.error.startsWith("bridge capacity reached:")
       ) {
         spawnReplyCache.set(requestId, {
+          identity: requestIdentity,
           reply,
           expiresAt: Date.now() + spawnReplyCacheTtlMs,
         });
@@ -747,6 +1120,9 @@ export function registerBridge(
         clearTimeout(timer);
       }
       completionPollTimers.clear();
+      if (acceptedRunReconcileInterval) {
+        clearInterval(acceptedRunReconcileInterval);
+      }
 
       while (unsubscribes.length > 0) {
         const unsubscribe = unsubscribes.pop();
@@ -763,5 +1139,28 @@ export function registerBridge(
 }
 
 export default function bridgeExtension(pi: ExtensionAPI): void {
-  registerBridge(pi);
+  let sessionId: string | undefined;
+  let registration: BridgeRegistration | undefined;
+  const register = (): void => {
+    registration ??= registerBridge(pi, {
+      planExecJournalPath: path.join(
+        os.homedir(),
+        ".pi",
+        "pi-subagents-bridge",
+        "plan-exec-operations.sqlite",
+      ),
+      getSessionId: () => sessionId,
+    });
+  };
+
+  pi.on("session_start", (_event, ctx) => {
+    sessionId = ctx.sessionManager.getSessionId();
+    register();
+  });
+  pi.on("session_shutdown", () => {
+    registration?.dispose();
+    registration = undefined;
+    sessionId = undefined;
+  });
+  register();
 }

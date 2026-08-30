@@ -57,12 +57,14 @@ test("npm pack includes only the runtime extension package", async (t) => {
     "README.md",
     "package.json",
     "src/index.ts",
+    "src/operation-journal.ts",
     "src/plan-exec-rpc.ts",
     "src/workflow-spawn.ts",
   ]);
 
   assert.deepEqual(manifest.files, [
     "src/index.ts",
+    "src/operation-journal.ts",
     "src/plan-exec-rpc.ts",
     "src/workflow-spawn.ts",
   ]);
