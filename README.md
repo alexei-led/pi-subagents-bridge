@@ -136,7 +136,7 @@ Version 2 uses `plan-exec:bridge:v2:request` and `plan-exec:bridge:v2:reply:<req
 - `result` uses the native status RPC because `pi-subagents` has no separate result RPC. `stop` delegates to the native stop RPC.
 - `adopt` is observational. It does not silently transfer session ownership.
 
-The journal defaults to `~/.pi/pi-subagents-bridge/plan-exec-operations.json` and is written atomically under a cross-process lock. Version 1 clients retain their existing response shape and also benefit from durable bound-operation lookup.
+The journal defaults to `~/.pi/pi-subagents-bridge/plan-exec-operations.sqlite`. SQLite transactions provide crash recovery and cross-process serialization without a stale application lock. Version 1 clients retain their existing response shape and also benefit from durable bound-operation lookup.
 
 Failures use `{ success: false, error: { code, message } }`. `operation_capacity` means the in-process bridge has 128 unresolved active operation IDs and will not evict one to accept another spawn.
 
@@ -151,6 +151,8 @@ Because of that, the bridge also applies two execution defaults to bridge-spawne
 This avoids false pauses on missing acceptance reports and avoids misleading background `needs attention` notices for normal task runs. Repeated copies of one live request are coalesced. Accepted run IDs are journaled so completion delivery can recover after a full Pi restart.
 
 The legacy `pi-tasks` spawn request does not contain task ID, list ID, or attempt generation. Therefore the bridge cannot guarantee exactly-once launch after a crash that occurs after native dispatch but before the run ID is received. It reports that outcome as unknown and does not use prompt matching or automatic retry.
+
+If the native run ID is known but local accepted-run persistence fails, the bridge acknowledges that known run instead of returning an error that could trigger a duplicate launch. It keeps completion ownership for the current process and logs the durability loss; a subsequent process restart then requires manual completion recovery.
 
 ## Scope and limits
 

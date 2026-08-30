@@ -159,7 +159,7 @@ The plan-exec v2 contract separates durable launch binding from native lifecycle
 - A recovered `dispatching` binding is also unknown. It is never dispatched again.
 - Native lifecycle and process-terminal proof come from `pi-subagents` status. They are not inferred from bridge memory, async directory presence, PID, prompt, or elapsed time.
 
-The journal uses an atomic rename under a short cross-process lock. Invalid or unreadable data fails closed; it is never silently replaced with an empty journal.
+The journal uses SQLite transactions with full synchronous durability. SQLite releases process locks after a crash and serializes cross-process writers. Invalid or unreadable data fails closed; it is never silently replaced with an empty journal.
 
 The legacy TaskExecute contract has no task identity or attempt generation. Its post-dispatch/pre-reply crash window therefore remains ambiguous. The bridge records accepted run IDs, but it does not claim exactly-once launch for that unidentifiable window.
 

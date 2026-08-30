@@ -1,11 +1,9 @@
 import fs from "node:fs";
-import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 const JOURNAL_VERSION = 1;
-const LOCK_WAIT_MS = 2_000;
-const RETRY_DELAY_MS = 10;
-const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
+const BUSY_TIMEOUT_MS = 2_000;
 
 export type OperationBinding = "dispatching" | "bound" | "unknown";
 
@@ -27,151 +25,151 @@ export interface OperationJournalRecord {
   updatedAt: number;
 }
 
-interface JournalDocument {
-  version: typeof JOURNAL_VERSION;
-  operations: OperationJournalRecord[];
-  acceptedRuns: AcceptedRunJournalRecord[];
+interface OperationRow {
+  operation_id: string;
+  request_digest: string;
+  owner_run_id: string | null;
+  binding: OperationBinding;
+  run_id: string | null;
+  async_dir: string | null;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+interface AcceptedRunRow {
+  run_id: string;
+  async_dir: string | null;
+  accepted_at: number;
 }
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-function isOperationBinding(value: unknown): value is OperationBinding {
-  return value === "dispatching" || value === "bound" || value === "unknown";
-}
-
-function parseOperation(value: unknown): OperationJournalRecord | undefined {
-  if (!isRecord(value)) return undefined;
-  if (
-    !isNonEmptyString(value.operationId) ||
-    !isNonEmptyString(value.requestDigest) ||
-    !isOperationBinding(value.binding) ||
-    typeof value.createdAt !== "number" ||
-    !Number.isFinite(value.createdAt) ||
-    typeof value.updatedAt !== "number" ||
-    !Number.isFinite(value.updatedAt)
-  ) {
-    return undefined;
-  }
-  if (value.ownerRunId !== undefined && !isNonEmptyString(value.ownerRunId)) return undefined;
-  if (value.runId !== undefined && !isNonEmptyString(value.runId)) return undefined;
-  if (value.asyncDir !== undefined && !isNonEmptyString(value.asyncDir)) return undefined;
-  if (value.error !== undefined && !isNonEmptyString(value.error)) return undefined;
-  if (value.binding === "bound" && !isNonEmptyString(value.runId)) return undefined;
-  if (value.binding === "unknown" && !isNonEmptyString(value.error)) return undefined;
-
-  const ownerRunId = isNonEmptyString(value.ownerRunId)
-    ? value.ownerRunId
-    : undefined;
-  const runId = isNonEmptyString(value.runId) ? value.runId : undefined;
-  const asyncDir = isNonEmptyString(value.asyncDir) ? value.asyncDir : undefined;
-  const error = isNonEmptyString(value.error) ? value.error : undefined;
+function operationRecord(row: OperationRow): OperationJournalRecord {
   return {
-    operationId: value.operationId,
-    requestDigest: value.requestDigest,
-    ...(ownerRunId ? { ownerRunId } : {}),
-    binding: value.binding,
-    ...(runId ? { runId } : {}),
-    ...(asyncDir ? { asyncDir } : {}),
-    ...(error ? { error } : {}),
-    createdAt: value.createdAt,
-    updatedAt: value.updatedAt,
+    operationId: row.operation_id,
+    requestDigest: row.request_digest,
+    ...(row.owner_run_id ? { ownerRunId: row.owner_run_id } : {}),
+    binding: row.binding,
+    ...(row.run_id ? { runId: row.run_id } : {}),
+    ...(row.async_dir ? { asyncDir: row.async_dir } : {}),
+    ...(row.error ? { error: row.error } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
-function clone(record: OperationJournalRecord): OperationJournalRecord {
-  return { ...record };
-}
-
-function parseAcceptedRun(value: unknown): AcceptedRunJournalRecord | undefined {
-  if (
-    !isRecord(value) ||
-    !isNonEmptyString(value.runId) ||
-    typeof value.acceptedAt !== "number" ||
-    !Number.isFinite(value.acceptedAt) ||
-    (value.asyncDir !== undefined && !isNonEmptyString(value.asyncDir))
-  ) {
-    return undefined;
-  }
-  const asyncDir = isNonEmptyString(value.asyncDir) ? value.asyncDir : undefined;
+function acceptedRunRecord(row: AcceptedRunRow): AcceptedRunJournalRecord {
   return {
-    runId: value.runId,
-    ...(asyncDir ? { asyncDir } : {}),
-    acceptedAt: value.acceptedAt,
+    runId: row.run_id,
+    ...(row.async_dir ? { asyncDir: row.async_dir } : {}),
+    acceptedAt: row.accepted_at,
   };
 }
 
 export class OperationJournal {
   readonly filePath: string;
-  readonly #lockPath: string;
+  readonly #db: DatabaseSync;
   readonly #now: () => number;
 
   constructor(filePath: string, now: () => number = Date.now) {
-    if (!filePath.trim()) throw new Error("Operation journal path cannot be empty");
+    if (!filePath.trim()) {
+      throw new Error("Operation journal path cannot be empty");
+    }
     this.filePath = path.resolve(filePath);
-    this.#lockPath = `${this.filePath}.lock`;
     this.#now = now;
+    fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
+    this.#db = new DatabaseSync(this.filePath);
+    this.#db.exec(`
+      PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS};
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = FULL;
+      CREATE TABLE IF NOT EXISTS operations (
+        operation_id TEXT PRIMARY KEY,
+        request_digest TEXT NOT NULL,
+        owner_run_id TEXT,
+        binding TEXT NOT NULL CHECK (binding IN ('dispatching', 'bound', 'unknown')),
+        run_id TEXT,
+        async_dir TEXT,
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK (binding != 'bound' OR run_id IS NOT NULL),
+        CHECK (binding != 'unknown' OR error IS NOT NULL)
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS accepted_runs (
+        run_id TEXT PRIMARY KEY,
+        async_dir TEXT,
+        accepted_at INTEGER NOT NULL
+      ) STRICT;
+    `);
+    const version = this.#db.prepare("PRAGMA user_version").get() as
+      | { user_version?: unknown }
+      | undefined;
+    if (version?.user_version === 0) {
+      this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
+    } else if (version?.user_version !== JOURNAL_VERSION) {
+      this.#db.close();
+      throw new Error(
+        `Unsupported operation journal version '${String(version?.user_version)}'`,
+      );
+    }
+    fs.chmodSync(this.filePath, 0o600);
   }
 
   listAcceptedRuns(): AcceptedRunJournalRecord[] {
-    return this.#withLock((document) =>
-      document.acceptedRuns.map((record) => ({ ...record })),
-    );
+    const rows = this.#db
+      .prepare(
+        "SELECT run_id, async_dir, accepted_at FROM accepted_runs ORDER BY accepted_at, run_id",
+      )
+      .all() as unknown as AcceptedRunRow[];
+    return rows.map(acceptedRunRecord);
   }
 
   acceptRun(runId: string, asyncDir?: string): void {
-    this.#withLock((document, persist) => {
-      if (document.acceptedRuns.some((record) => record.runId === runId)) return;
-      document.acceptedRuns.push({
-        runId,
-        ...(asyncDir ? { asyncDir } : {}),
-        acceptedAt: this.#now(),
-      });
-      persist();
-    });
+    this.#db
+      .prepare(
+        "INSERT OR IGNORE INTO accepted_runs (run_id, async_dir, accepted_at) VALUES (?, ?, ?)",
+      )
+      .run(runId, asyncDir ?? null, this.#now());
   }
 
   completeRun(runId: string): void {
-    this.#withLock((document, persist) => {
-      const next = document.acceptedRuns.filter((record) => record.runId !== runId);
-      if (next.length === document.acceptedRuns.length) return;
-      document.acceptedRuns = next;
-      persist();
-    });
+    this.#db.prepare("DELETE FROM accepted_runs WHERE run_id = ?").run(runId);
   }
 
   get(operationId: string): OperationJournalRecord | undefined {
-    return this.#withLock((document) => {
-      const record = document.operations.find((item) => item.operationId === operationId);
-      return record ? clone(record) : undefined;
-    });
+    const row = this.#db
+      .prepare(
+        `SELECT operation_id, request_digest, owner_run_id, binding, run_id,
+                async_dir, error, created_at, updated_at
+           FROM operations
+          WHERE operation_id = ?`,
+      )
+      .get(operationId) as OperationRow | undefined;
+    return row ? operationRecord(row) : undefined;
   }
 
-  begin(operationId: string, requestDigest: string, ownerRunId?: string): {
-    created: boolean;
-    record: OperationJournalRecord;
-  } {
-    return this.#withLock((document, persist) => {
-      const existing = document.operations.find((item) => item.operationId === operationId);
-      if (existing) return { created: false, record: clone(existing) };
+  begin(
+    operationId: string,
+    requestDigest: string,
+    ownerRunId?: string,
+  ): { created: boolean; record: OperationJournalRecord } {
+    return this.#transaction(() => {
+      const existing = this.get(operationId);
+      if (existing) return { created: false, record: existing };
 
       const now = this.#now();
-      const record: OperationJournalRecord = {
-        operationId,
-        requestDigest,
-        ...(ownerRunId ? { ownerRunId } : {}),
-        binding: "dispatching",
-        createdAt: now,
-        updatedAt: now,
-      };
-      document.operations.push(record);
-      persist();
-      return { created: true, record: clone(record) };
+      this.#db
+        .prepare(
+          `INSERT INTO operations
+             (operation_id, request_digest, owner_run_id, binding, created_at, updated_at)
+           VALUES (?, ?, ?, 'dispatching', ?, ?)`,
+        )
+        .run(operationId, requestDigest, ownerRunId ?? null, now, now);
+      const record = this.get(operationId);
+      if (!record) {
+        throw new Error(`Operation journal failed to create '${operationId}'`);
+      }
+      return { created: true, record };
     });
   }
 
@@ -181,15 +179,10 @@ export class OperationJournal {
     runId: string,
     asyncDir?: string,
   ): OperationJournalRecord {
-    return this.#update(operationId, requestDigest, (record) => {
-      const { error: _error, ...rest } = record;
-      return {
-        ...rest,
-        binding: "bound",
-        runId,
-        ...(asyncDir ? { asyncDir } : {}),
-        updatedAt: this.#now(),
-      };
+    return this.#update(operationId, requestDigest, {
+      binding: "bound",
+      runId,
+      ...(asyncDir ? { asyncDir } : {}),
     });
   }
 
@@ -198,27 +191,21 @@ export class OperationJournal {
     requestDigest: string,
     error: string,
   ): OperationJournalRecord {
-    return this.#update(operationId, requestDigest, (record) => ({
-      ...record,
+    return this.#update(operationId, requestDigest, {
       binding: "unknown",
       error,
-      updatedAt: this.#now(),
-    }));
+    });
   }
 
   #update(
     operationId: string,
     requestDigest: string,
-    update: (record: OperationJournalRecord) => OperationJournalRecord,
+    update:
+      | { binding: "bound"; runId: string; asyncDir?: string }
+      | { binding: "unknown"; error: string },
   ): OperationJournalRecord {
-    return this.#withLock((document, persist) => {
-      const index = document.operations.findIndex(
-        (item) => item.operationId === operationId,
-      );
-      if (index < 0) {
-        throw new Error(`Operation journal has no record for '${operationId}'`);
-      }
-      const current = document.operations[index];
+    return this.#transaction(() => {
+      const current = this.get(operationId);
       if (!current) {
         throw new Error(`Operation journal has no record for '${operationId}'`);
       }
@@ -227,130 +214,45 @@ export class OperationJournal {
           `Operation '${operationId}' was already used with a different request digest`,
         );
       }
-      const next = update(current);
-      document.operations[index] = next;
-      persist();
-      return clone(next);
+      const updatedAt = this.#now();
+      if (update.binding === "bound") {
+        this.#db
+          .prepare(
+            `UPDATE operations
+                SET binding = 'bound', run_id = ?, async_dir = ?, error = NULL, updated_at = ?
+              WHERE operation_id = ?`,
+          )
+          .run(update.runId, update.asyncDir ?? null, updatedAt, operationId);
+      } else {
+        this.#db
+          .prepare(
+            `UPDATE operations
+                SET binding = 'unknown', error = ?, updated_at = ?
+              WHERE operation_id = ?`,
+          )
+          .run(update.error, updatedAt, operationId);
+      }
+      const record = this.get(operationId);
+      if (!record) {
+        throw new Error(`Operation journal lost record for '${operationId}'`);
+      }
+      return record;
     });
   }
 
-  #withLock<T>(
-    action: (document: JournalDocument, persist: () => void) => T,
-  ): T {
-    fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
-    const deadline = this.#now() + LOCK_WAIT_MS;
-    let locked = false;
-    const lockToken = randomUUID();
-    while (!locked) {
-      try {
-        fs.mkdirSync(this.#lockPath, { mode: 0o700 });
-        try {
-          fs.writeFileSync(
-            path.join(this.#lockPath, "owner"),
-            lockToken,
-            { encoding: "utf8", flag: "wx", mode: 0o600 },
-          );
-        } catch (error: unknown) {
-          fs.rmSync(this.#lockPath, { recursive: true, force: true });
-          throw error;
-        }
-        locked = true;
-      } catch (error: unknown) {
-        if (!isRecord(error) || error.code !== "EEXIST") {
-          throw new Error("Cannot acquire operation journal lock", {
-            cause: error,
-          });
-        }
-        if (this.#now() >= deadline) {
-          throw new Error(
-            `Timed out waiting for operation journal lock '${this.#lockPath}'`,
-            { cause: error },
-          );
-        }
-        Atomics.wait(waitBuffer, 0, 0, RETRY_DELAY_MS);
-      }
-    }
-
+  #transaction<T>(action: () => T): T {
+    this.#db.exec("BEGIN IMMEDIATE");
     try {
-      const document = this.#read();
-      let dirty: boolean | undefined;
-      const result = action(document, () => {
-        dirty = true;
-      });
-      if (dirty === true) this.#write(document);
+      const result = action();
+      this.#db.exec("COMMIT");
       return result;
-    } finally {
-      try {
-        const owner = fs.readFileSync(
-          path.join(this.#lockPath, "owner"),
-          "utf8",
-        );
-        if (owner === lockToken) {
-          fs.rmSync(this.#lockPath, { recursive: true, force: true });
-        }
-      } catch {
-        // Keep an unreadable lock in place. Another process must not race it.
-      }
-    }
-  }
-
-  #read(): JournalDocument {
-    if (!fs.existsSync(this.filePath)) {
-      return { version: JOURNAL_VERSION, operations: [], acceptedRuns: [] };
-    }
-
-    let raw: unknown;
-    try {
-      raw = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
     } catch (error: unknown) {
-      throw new Error(
-        `Cannot read operation journal '${this.filePath}': ${error instanceof Error ? error.message : String(error)}`,
-        { cause: error },
-      );
-    }
-    if (
-      !isRecord(raw) ||
-      raw.version !== JOURNAL_VERSION ||
-      !Array.isArray(raw.operations) ||
-      (raw.acceptedRuns !== undefined && !Array.isArray(raw.acceptedRuns))
-    ) {
-      throw new Error(`Invalid operation journal '${this.filePath}'`);
-    }
-
-    const operations: OperationJournalRecord[] = [];
-    const ids = new Set<string>();
-    for (const value of raw.operations) {
-      const operation = parseOperation(value);
-      if (!operation || ids.has(operation.operationId)) {
-        throw new Error(`Invalid operation journal '${this.filePath}'`);
+      try {
+        this.#db.exec("ROLLBACK");
+      } catch {
+        // Preserve the operation error. SQLite will release locks on process exit.
       }
-      ids.add(operation.operationId);
-      operations.push(operation);
-    }
-    const acceptedRuns: AcceptedRunJournalRecord[] = [];
-    const runIds = new Set<string>();
-    for (const value of raw.acceptedRuns ?? []) {
-      const run = parseAcceptedRun(value);
-      if (!run || runIds.has(run.runId)) {
-        throw new Error(`Invalid operation journal '${this.filePath}'`);
-      }
-      runIds.add(run.runId);
-      acceptedRuns.push(run);
-    }
-    return { version: JOURNAL_VERSION, operations, acceptedRuns };
-  }
-
-  #write(document: JournalDocument): void {
-    const temporaryPath = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      fs.writeFileSync(temporaryPath, `${JSON.stringify(document, null, 2)}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
-      fs.renameSync(temporaryPath, this.filePath);
-    } finally {
-      fs.rmSync(temporaryPath, { force: true });
+      throw error;
     }
   }
 }

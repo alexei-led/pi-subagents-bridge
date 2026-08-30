@@ -677,6 +677,9 @@ export function registerBridge(
         try {
           bridgeJournal?.acceptRun(runId);
         } catch (error: unknown) {
+          // The native run already exists. Returning a failed spawn would invite
+          // TaskExecute to launch a duplicate, so keep ownership in memory and
+          // report the durability loss explicitly.
           console.error(`Failed to persist accepted bridge run '${runId}':`, error);
         }
         ownedRunIds.add(runId);
@@ -798,7 +801,7 @@ export default function bridgeExtension(pi: ExtensionAPI): void {
       os.homedir(),
       ".pi",
       "pi-subagents-bridge",
-      "plan-exec-operations.json",
+      "plan-exec-operations.sqlite",
     ),
   });
 }

@@ -311,11 +311,9 @@ function validateSpawn(
   }
 
   const cwd = topLevelCwd ?? paramsCwd;
-  const digestParams = { ...params };
-  delete digestParams.cwd;
   const fingerprint = operationFingerprint({
     ...(cwd !== undefined ? { cwd } : {}),
-    params: digestParams,
+    params,
   });
   const owner =
     protocolVersion === 2
@@ -895,7 +893,7 @@ export function registerPlanExecRpc(
         );
         if (identityFailure) return identityFailure;
         const operationData = !operation.outcome
-          ? { state: "pending" }
+          ? { state: "pending", requestDigest: operation.fingerprint }
           : operation.outcome.success
             ? { state: "found", ...operation.outcome.data }
             : {
@@ -924,7 +922,9 @@ export function registerPlanExecRpc(
         }
         const operationData = durable
           ? durableLookup(durable)
-          : { state: "absent" };
+          : protocolVersion === 2
+            ? { state: "absent", requestDigest: request.requestDigest }
+            : { state: "absent" };
         if (protocolVersion === 2) {
           return {
             success: true,

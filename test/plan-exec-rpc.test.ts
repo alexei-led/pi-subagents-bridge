@@ -73,6 +73,18 @@ test("plan-exec v2 exposes durable lookup and native terminal proof", async (t) 
   });
   const spawnUpstream = bus.last(SUBAGENTS_REQUEST_EVENT);
   assert.ok(isRecord(spawnUpstream));
+  const pending = once(bus, v2ReplyEvent("v2-pending"));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "v2-pending",
+    method: "operation",
+    operationId,
+    owner,
+  });
+  assert.deepEqual(await pending, {
+    success: true,
+    data: { state: "pending", operationId, requestDigest },
+  });
   replyUpstream(bus, spawnUpstream, "spawn", {
     details: { runId: "v2-run", asyncDir: "/tmp/v2-run" },
   });
@@ -82,7 +94,11 @@ test("plan-exec v2 exposes durable lookup and native terminal proof", async (t) 
   });
 
   const noCwdOperationId = "v2-no-cwd-operation";
-  const noCwdParams = { agent: "worker", task: "Use the default worktree.", mission: false };
+  const noCwdParams = {
+    agent: "worker",
+    task: "Use the default worktree.",
+    mission: false,
+  };
   const noCwdDigest = digest({ params: noCwdParams });
   const noCwdSpawn = once(bus, v2ReplyEvent("v2-no-cwd"));
   bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
@@ -109,6 +125,65 @@ test("plan-exec v2 exposes durable lookup and native terminal proof", async (t) 
       runId: "v2-no-cwd-run",
       asyncDir: "/tmp/v2-no-cwd-run",
       requestDigest: noCwdDigest,
+    },
+  });
+
+  const paramsCwdOperationId = "v2-params-cwd-operation";
+  const paramsCwd = {
+    agent: "worker",
+    task: "Use params cwd.",
+    mission: false,
+    cwd: "/tmp/v2-params-worktree",
+  };
+  const paramsCwdDigest = digest({
+    cwd: "/tmp/v2-params-worktree",
+    params: paramsCwd,
+  });
+  const paramsCwdSpawn = once(bus, v2ReplyEvent("v2-params-cwd"));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "v2-params-cwd",
+    method: "spawn",
+    operationId: paramsCwdOperationId,
+    owner: {
+      kind: "pi-plan-exec",
+      runId: "plan-run-params-cwd",
+      key: paramsCwdOperationId,
+      requestDigest: paramsCwdDigest,
+    },
+    params: paramsCwd,
+  });
+  const paramsCwdUpstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(paramsCwdUpstream));
+  replyUpstream(bus, paramsCwdUpstream, "spawn", {
+    details: { runId: "v2-params-cwd-run" },
+  });
+  assert.deepEqual(await paramsCwdSpawn, {
+    success: true,
+    data: { runId: "v2-params-cwd-run", requestDigest: paramsCwdDigest },
+  });
+
+  const absentOperationId = "v2-absent-operation";
+  const absentDigest = digest({ params });
+  const absent = once(bus, v2ReplyEvent("v2-absent"));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "v2-absent",
+    method: "operation",
+    operationId: absentOperationId,
+    owner: {
+      kind: "pi-plan-exec",
+      runId: "plan-run-absent",
+      key: absentOperationId,
+      requestDigest: absentDigest,
+    },
+  });
+  assert.deepEqual(await absent, {
+    success: true,
+    data: {
+      state: "absent",
+      operationId: absentOperationId,
+      requestDigest: absentDigest,
     },
   });
 
