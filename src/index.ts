@@ -25,6 +25,7 @@ const STOP_CHANNEL = "subagents:rpc:stop";
 const COMPLETED_EVENT = "subagents:completed";
 const FAILED_EVENT = "subagents:failed";
 const READY_EVENT = "subagents:ready";
+const WARNING_EVENT = "subagents:warning";
 const NB_REQUEST_CHANNEL = "subagents:rpc:v1:request";
 const NB_COMPLETE_EVENT = "subagent:async-complete";
 const NB_REPLY_PREFIX = "subagents:rpc:v1:reply:";
@@ -731,6 +732,12 @@ export function registerBridge(
         }
         ownedRunIds.delete(runId);
         clearCompletionPoll(runId);
+        pi.events.emit(WARNING_EVENT, {
+          code: "accepted_run_ownership_lost",
+          id: runId,
+          message:
+            "Bridge stopped delivering this run because another session owns its completion record.",
+        });
       }
       for (const accepted of claimed) {
         ownedRunIds.add(accepted.runId);
