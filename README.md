@@ -148,7 +148,7 @@ Because of that, the bridge also applies two execution defaults to bridge-spawne
 - disables `pi-subagents` acceptance gating
 - disables `pi-subagents` live control nudges
 
-This avoids false pauses on missing acceptance reports and avoids misleading background `needs attention` notices for normal task runs. Repeated copies of one live request are coalesced. The request ID is also journaled before native dispatch, so replay after the in-memory reply cache expires returns the existing run or fails closed as unknown instead of dispatching again.
+This avoids false pauses on missing acceptance reports and avoids misleading background `needs attention` notices for normal task runs. Repeated copies of one live request are coalesced only after their session and request digest match. The request ID is also journaled before native dispatch, so replay after the in-memory reply cache expires returns the existing run or fails closed as unknown instead of dispatching again. Transient persistence failures for known accepted runs and launch bindings are retried while the bridge process remains active.
 
 Accepted run IDs are tied to the originating Pi session ID and a leased process owner. A foreign Pi session cannot claim or delete them. The same resumed session can reclaim them after the owner exits or its heartbeat lease expires; the lease covers PID reuse. The owner renews its fence before emitting completion, and failed reconciliation is retried periodically.
 

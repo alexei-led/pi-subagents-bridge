@@ -78,8 +78,21 @@ interface BridgeRegistration {
 }
 
 interface SpawnReplyCacheEntry {
+  identity: string;
   reply: RpcReply<{ id: string }>;
   expiresAt: number;
+}
+
+interface InFlightSpawnReply {
+  identity: string;
+  reply: Promise<RpcReply<{ id: string }>>;
+}
+
+interface PendingLegacyBinding {
+  requestId: string;
+  requestDigest: string;
+  sessionId: string;
+  runId: string;
 }
 
 interface BridgeState {
@@ -87,9 +100,10 @@ interface BridgeState {
   completedRunIds: Set<string>;
   stoppingRunIds: Set<string>;
   pendingSpawnCount: number;
-  inFlightSpawnReplies: Map<string, Promise<RpcReply<{ id: string }>>>;
+  inFlightSpawnReplies: Map<string, InFlightSpawnReply>;
   spawnReplyCache: Map<string, SpawnReplyCacheEntry>;
   terminalResultDeadlines: Map<string, number>;
+  pendingLegacyBindings: Map<string, PendingLegacyBinding>;
   journal?: OperationJournal;
   registration?: BridgeRegistration;
 }
@@ -383,6 +397,7 @@ function getBridgeState(events: BridgeHost["events"]): BridgeState {
     inFlightSpawnReplies: new Map(),
     spawnReplyCache: new Map(),
     terminalResultDeadlines: new Map(),
+    pendingLegacyBindings: new Map(),
   };
   bridgeStates.set(events, created);
   return created;
@@ -438,6 +453,7 @@ export function registerBridge(
     inFlightSpawnReplies,
     spawnReplyCache,
     terminalResultDeadlines,
+    pendingLegacyBindings,
   } = state;
   const pendingRpcControllers = new Set<AbortController>();
   const completionPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -667,6 +683,23 @@ export function registerBridge(
     if (!bridgeJournal || disposed) return;
     const sessionId = currentSessionId();
     if (!sessionId) return;
+    for (const [runId, pending] of pendingLegacyBindings) {
+      if (pending.sessionId !== sessionId) continue;
+      try {
+        bridgeJournal.bindLegacySpawn(
+          pending.requestId,
+          pending.requestDigest,
+          pending.sessionId,
+          pending.runId,
+        );
+        pendingLegacyBindings.delete(runId);
+      } catch (error: unknown) {
+        console.error(
+          `Failed to retry legacy bridge run '${runId}' binding:`,
+          error,
+        );
+      }
+    }
     try {
       const claimed = bridgeJournal.claimAcceptedRuns(
         processOwner,
@@ -676,8 +709,22 @@ export function registerBridge(
       const claimedIds = new Set(claimed.map((run) => run.runId));
       for (const runId of [...ownedRunIds]) {
         const volatileSessionId = volatileOwnedRuns.get(runId);
-        if (volatileSessionId) {
-          if (volatileSessionId === sessionId) continue;
+        if (volatileSessionId === sessionId) {
+          try {
+            if (bridgeJournal.acceptRun(runId, processOwner, sessionId)) {
+              volatileOwnedRuns.delete(runId);
+              claimedIds.add(runId);
+              continue;
+            }
+            volatileOwnedRuns.delete(runId);
+          } catch (error: unknown) {
+            console.error(
+              `Failed to persist volatile bridge run '${runId}':`,
+              error,
+            );
+            continue;
+          }
+        } else if (volatileSessionId) {
           volatileOwnedRuns.delete(runId);
         } else if (claimedIds.has(runId)) {
           continue;
@@ -739,31 +786,6 @@ export function registerBridge(
     const requestId = text(raw.requestId);
     if (!requestId) return;
 
-    pruneSpawnReplyCache();
-    const cachedReply = spawnReplyCache.get(requestId)?.reply;
-    if (cachedReply) {
-      if (cachedReply.success) {
-        const error = rearmAcceptedRun(cachedReply.data.id);
-        if (error) {
-          emitReply(pi.events, SPAWN_CHANNEL, requestId, {
-            success: false,
-            error,
-          });
-          return;
-        }
-      }
-      emitReply(pi.events, SPAWN_CHANNEL, requestId, cachedReply);
-      return;
-    }
-
-    const inFlightReply = inFlightSpawnReplies.get(requestId);
-    if (inFlightReply) {
-      void inFlightReply.then((reply) => {
-        if (!disposed) emitReply(pi.events, SPAWN_CHANNEL, requestId, reply);
-      });
-      return;
-    }
-
     const agentType = text(raw.type);
     const prompt = text(raw.prompt);
     if (!agentType || !prompt) {
@@ -773,40 +795,80 @@ export function registerBridge(
       });
       return;
     }
+    const sessionId = currentSessionId();
+    if (!sessionId) {
+      emitReply(pi.events, SPAWN_CHANNEL, requestId, {
+        success: false,
+        error: "Pi session identity is not initialized",
+      });
+      return;
+    }
+    const optionsRaw = normalizeSpawnOptions(raw.options);
+    const model = text(optionsRaw?.model);
+    const maxTurns =
+      typeof optionsRaw?.maxTurns === "number" &&
+      Number.isInteger(optionsRaw.maxTurns) &&
+      optionsRaw.maxTurns > 0
+        ? optionsRaw.maxTurns
+        : defaultMaxTurns;
+    const spawnParams: Record<string, unknown> = {
+      workflowScript: singleChildWorkflowScript(
+        resolveAgentType(agentType),
+        prompt,
+        { control: BRIDGE_CONTROL_CONFIG },
+      ),
+      async: true,
+      context: "fresh",
+      acceptance: BRIDGE_ACCEPTANCE_CONFIG,
+      control: BRIDGE_CONTROL_CONFIG,
+      ...(model ? { model } : {}),
+      turnBudget: { maxTurns },
+    };
+    const legacyRequestDigest = `sha256:${createHash("sha256")
+      .update(JSON.stringify({ agentType, prompt, spawnParams }))
+      .digest("hex")}`;
+    const requestIdentity = `${sessionId}:${legacyRequestDigest}`;
+
+    pruneSpawnReplyCache();
+    const cached = spawnReplyCache.get(requestId);
+    if (cached) {
+      if (cached.identity !== requestIdentity) {
+        emitReply(pi.events, SPAWN_CHANNEL, requestId, {
+          success: false,
+          error: "spawn requestId was already used by another request",
+        });
+        return;
+      }
+      if (cached.reply.success) {
+        const error = rearmAcceptedRun(cached.reply.data.id);
+        if (error) {
+          emitReply(pi.events, SPAWN_CHANNEL, requestId, {
+            success: false,
+            error,
+          });
+          return;
+        }
+      }
+      emitReply(pi.events, SPAWN_CHANNEL, requestId, cached.reply);
+      return;
+    }
+
+    const inFlight = inFlightSpawnReplies.get(requestId);
+    if (inFlight) {
+      if (inFlight.identity !== requestIdentity) {
+        emitReply(pi.events, SPAWN_CHANNEL, requestId, {
+          success: false,
+          error: "spawn requestId was already used by another request",
+        });
+        return;
+      }
+      void inFlight.reply.then((reply) => {
+        if (!disposed) emitReply(pi.events, SPAWN_CHANNEL, requestId, reply);
+      });
+      return;
+    }
 
     const spawn = async (): Promise<RpcReply<{ id: string }>> => {
-      const optionsRaw = normalizeSpawnOptions(raw.options);
-      const model = text(optionsRaw?.model);
-      const maxTurns =
-        typeof optionsRaw?.maxTurns === "number" &&
-        Number.isInteger(optionsRaw.maxTurns) &&
-        optionsRaw.maxTurns > 0
-          ? optionsRaw.maxTurns
-          : defaultMaxTurns;
-      const spawnParams: Record<string, unknown> = {
-        workflowScript: singleChildWorkflowScript(
-          resolveAgentType(agentType),
-          prompt,
-          { control: BRIDGE_CONTROL_CONFIG },
-        ),
-        async: true,
-        context: "fresh",
-        acceptance: BRIDGE_ACCEPTANCE_CONFIG,
-        control: BRIDGE_CONTROL_CONFIG,
-        ...(model ? { model } : {}),
-        turnBudget: { maxTurns },
-      };
-
-      const sessionId = currentSessionId();
-      if (!sessionId) {
-        return {
-          success: false,
-          error: "Pi session identity is not initialized",
-        };
-      }
-      const legacyRequestDigest = `sha256:${createHash("sha256")
-        .update(JSON.stringify({ agentType, prompt, spawnParams }))
-        .digest("hex")}`;
       if (bridgeJournal) {
         try {
           const durable = bridgeJournal.getLegacySpawn(requestId);
@@ -899,8 +961,15 @@ export function registerBridge(
             sessionId,
             runId,
           );
+          pendingLegacyBindings.delete(runId);
           durableOperationStarted = false;
         } catch (error: unknown) {
+          pendingLegacyBindings.set(runId, {
+            requestId,
+            requestDigest: legacyRequestDigest,
+            sessionId,
+            runId,
+          });
           console.error(
             `Failed to persist legacy bridge run '${runId}' binding:`,
             error,
@@ -956,9 +1025,13 @@ export function registerBridge(
     };
 
     const spawnReply = spawn();
-    inFlightSpawnReplies.set(requestId, spawnReply);
+    const inFlightEntry: InFlightSpawnReply = {
+      identity: requestIdentity,
+      reply: spawnReply,
+    };
+    inFlightSpawnReplies.set(requestId, inFlightEntry);
     void spawnReply.then((reply) => {
-      if (inFlightSpawnReplies.get(requestId) === spawnReply) {
+      if (inFlightSpawnReplies.get(requestId) === inFlightEntry) {
         inFlightSpawnReplies.delete(requestId);
       }
       if (
@@ -966,6 +1039,7 @@ export function registerBridge(
         !reply.error.startsWith("bridge capacity reached:")
       ) {
         spawnReplyCache.set(requestId, {
+          identity: requestIdentity,
           reply,
           expiresAt: Date.now() + spawnReplyCacheTtlMs,
         });

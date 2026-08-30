@@ -348,6 +348,57 @@ test("duplicate spawn requests start one run and replay its response", async () 
   assert.equal(bus.count(replyChannel(SPAWN_CHANNEL, "spawn-duplicate")), 2);
 });
 
+test("in-memory legacy replay rejects request and session mismatches", async () => {
+  const bus = new FakeEventBus();
+  const session = { id: "session-a" };
+  const bridge = registerBridge(
+    { events: bus },
+    { getSessionId: () => session.id },
+  );
+  const request = {
+    requestId: "in-memory-identity",
+    type: "general-purpose",
+    prompt: "Original task",
+  };
+  bus.emit(SPAWN_CHANNEL, request);
+  const upstream = bus.lastPayload(NB_REQUEST_CHANNEL);
+  assert.ok(isRecord(upstream));
+
+  const payloadConflict = once(
+    bus,
+    replyChannel(SPAWN_CHANNEL, request.requestId),
+  );
+  bus.emit(SPAWN_CHANNEL, { ...request, prompt: "Different task" });
+  assert.deepEqual(await payloadConflict, {
+    success: false,
+    error: "spawn requestId was already used by another request",
+  });
+  assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
+
+  session.id = "session-b";
+  const sessionConflict = once(
+    bus,
+    replyChannel(SPAWN_CHANNEL, request.requestId),
+  );
+  bus.emit(SPAWN_CHANNEL, request);
+  assert.deepEqual(await sessionConflict, {
+    success: false,
+    error: "spawn requestId was already used by another request",
+  });
+  assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
+
+  bus.emit(nbReplyChannel(String(upstream.requestId)), {
+    version: 1,
+    requestId: upstream.requestId,
+    success: true,
+    data: { details: { runId: "in-memory-run" } },
+  });
+  await waitFor(
+    () => bus.count(replyChannel(SPAWN_CHANNEL, request.requestId)) === 3,
+  );
+  bridge.dispose();
+});
+
 test("durable legacy request identity prevents redispatch after reply-cache expiry", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-legacy-"));
   const journalPath = join(root, "operations.sqlite");
@@ -398,6 +449,54 @@ test("durable legacy request identity prevents redispatch after reply-cache expi
   assert.deepEqual(await conflict, {
     success: false,
     error: "spawn requestId was already used by another request",
+  });
+  assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
+});
+
+test("legacy binding persistence is retried after a transient failure", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-binding-"));
+  const journal = new OperationJournal(join(root, "operations.sqlite"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const bind = journal.bindLegacySpawn.bind(journal);
+  let attempts = 0;
+  journal.bindLegacySpawn = (...args) => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("transient binding failure");
+    return bind(...args);
+  };
+  const originalError = console.error;
+  console.error = () => undefined;
+  t.after(() => {
+    console.error = originalError;
+  });
+
+  const bus = new FakeEventBus();
+  const bridge = registerBridge(
+    { events: bus },
+    {
+      operationJournal: journal,
+      getSessionId: () => "session-a",
+      acceptedRunReconcileIntervalMs: 5,
+      spawnReplyCacheTtlMs: 1,
+    },
+  );
+  t.after(() => bridge.dispose());
+  await spawnOwnedRun(bus, "binding-retry-run");
+  await waitFor(() => attempts >= 2);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  const replay = once(
+    bus,
+    replyChannel(SPAWN_CHANNEL, "spawn-binding-retry-run"),
+  );
+  bus.emit(SPAWN_CHANNEL, {
+    requestId: "spawn-binding-retry-run",
+    type: "general-purpose",
+    prompt: "Do the task",
+  });
+  assert.deepEqual(await replay, {
+    success: true,
+    data: { id: "binding-retry-run" },
   });
   assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
 });
@@ -1197,6 +1296,61 @@ test("accepted-run reconciliation retries after a transient journal failure", as
     id: "retry-claimed-run",
     result: "claimed after retry",
   });
+});
+
+test("volatile accepted ownership is retried and survives restart", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-volatile-"));
+  const journal = new OperationJournal(join(root, "operations.sqlite"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const accept = journal.acceptRun.bind(journal);
+  let attempts = 0;
+  journal.acceptRun = (...args) => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("transient accept failure");
+    return accept(...args);
+  };
+
+  const firstBus = new FakeEventBus();
+  const first = registerBridge(
+    { events: firstBus },
+    {
+      operationJournal: journal,
+      getSessionId: () => "session-a",
+      acceptedRunReconcileIntervalMs: 5,
+      completionPollIntervalMs: 1_000,
+    },
+  );
+  const originalError = console.error;
+  console.error = () => undefined;
+  t.after(() => {
+    console.error = originalError;
+  });
+  await spawnOwnedRun(firstBus, "volatile-retry-run");
+  await waitFor(() => attempts >= 2);
+  first.dispose();
+
+  const secondBus = new FakeEventBus();
+  const second = registerBridge(
+    { events: secondBus },
+    {
+      operationJournal: journal,
+      getSessionId: () => "session-a",
+      acceptedRunReconcileIntervalMs: 5,
+      completionPollIntervalMs: 1_000,
+    },
+  );
+  const completed = once(secondBus, COMPLETED_EVENT);
+  secondBus.emit(NB_COMPLETE_EVENT, {
+    runId: "volatile-retry-run",
+    success: true,
+    state: "complete",
+    summary: "recovered",
+  });
+  assert.deepEqual(await completed, {
+    id: "volatile-retry-run",
+    result: "recovered",
+  });
+  second.dispose();
 });
 
 test("dispose unsubscribes handlers and ignores later events until re-registered", async () => {

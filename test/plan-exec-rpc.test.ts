@@ -11,6 +11,7 @@ import {
   PLAN_EXEC_V2_REQUEST_EVENT,
   registerPlanExecRpc,
 } from "../src/plan-exec-rpc.js";
+import { OperationJournal } from "../src/operation-journal.js";
 
 const SUBAGENTS_REQUEST_EVENT = "subagents:rpc:v1:request";
 const SUBAGENTS_REPLY_PREFIX = "subagents:rpc:v1:reply:";
@@ -706,6 +707,62 @@ test("plan-exec returns a known native run when binding persistence fails", asyn
       requestDigest,
     },
   });
+});
+
+test("plan-exec retries a transient durable binding failure", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-bridge-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const journal = new OperationJournal(path.join(root, "operations.sqlite"));
+  const bind = journal.bind.bind(journal);
+  let attempts = 0;
+  journal.bind = (...args) => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("transient binding failure");
+    return bind(...args);
+  };
+  const originalError = console.error;
+  console.error = () => undefined;
+  t.after(() => {
+    console.error = originalError;
+  });
+  const bus = new FakeEventBus();
+  const rpc = registerPlanExecRpc(bus, {
+    timeoutMs: 100,
+    journal,
+    bindingReconcileIntervalMs: 5,
+  });
+  t.after(() => rpc.dispose());
+
+  const params = { agent: "worker", task: "Retry binding." };
+  const requestDigest = digest({ params });
+  const reply = once(bus, v2ReplyEvent("retry-binding"));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: "retry-binding",
+    method: "spawn",
+    operationId: "retry-binding-operation",
+    owner: {
+      kind: "pi-plan-exec",
+      runId: "plan-run-retry",
+      key: "retry-binding-operation",
+      requestDigest,
+    },
+    params,
+  });
+  const upstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(upstream));
+  replyUpstream(bus, upstream, "spawn", {
+    details: { runId: "native-retry-binding" },
+  });
+  assert.equal((await reply as { success: boolean }).success, true);
+  for (let attempt = 0; attempts < 2 && attempt < 20; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(attempts >= 2, true);
+  assert.equal(
+    journal.get("retry-binding-operation")?.binding,
+    "bound",
+  );
 });
 
 test("plan-exec recovers an unknown launch instead of reporting it absent", async (t) => {

@@ -88,6 +88,8 @@ interface StopResult {
 interface PlanExecOptions {
   timeoutMs: number;
   journalPath?: string;
+  journal?: OperationJournal;
+  bindingReconcileIntervalMs?: number;
 }
 
 interface Operation {
@@ -95,6 +97,7 @@ interface Operation {
   ownerRunId?: string;
   reply: Promise<Reply<SpawnResult>>;
   outcome?: Reply<SpawnResult>;
+  pendingBinding?: { runId: string; asyncDir?: string };
 }
 
 interface PlanExecState {
@@ -562,9 +565,14 @@ function pruneCompletedOperations(state: PlanExecState): void {
 function getPlanExecState(
   events: EventBus,
   journalPath?: string,
+  journal?: OperationJournal,
 ): PlanExecState {
   const existing = planExecStates.get(events);
   if (existing) {
+    if (journal && existing.journal && existing.journal !== journal) {
+      throw new Error("plan-exec RPC was already registered with a different operation journal");
+    }
+    if (journal) existing.journal = journal;
     if (
       journalPath &&
       existing.journal &&
@@ -581,7 +589,11 @@ function getPlanExecState(
   const created: PlanExecState = {
     operations: new Map(),
     spawnControllers: new Set(),
-    ...(journalPath ? { journal: new OperationJournal(journalPath) } : {}),
+    ...(journal
+      ? { journal }
+      : journalPath
+        ? { journal: new OperationJournal(journalPath) }
+        : {}),
   };
   planExecStates.set(events, created);
   return created;
@@ -653,11 +665,44 @@ export function registerPlanExecRpc(
   events: EventBus,
   options: PlanExecOptions,
 ): { dispose(): void } {
-  const state = getPlanExecState(events, options.journalPath);
+  const state = getPlanExecState(
+    events,
+    options.journalPath,
+    options.journal,
+  );
   if (state.registration) return state.registration;
 
   const transientControllers = new Set<AbortController>();
   let disposed = false;
+
+  const reconcilePendingBindings = (): void => {
+    if (!state.journal || disposed) return;
+    for (const [operationId, operation] of state.operations) {
+      const pending = operation.pendingBinding;
+      if (!pending) continue;
+      try {
+        state.journal.bind(
+          operationId,
+          operation.fingerprint,
+          pending.runId,
+          pending.asyncDir,
+        );
+        delete operation.pendingBinding;
+      } catch (error: unknown) {
+        console.error(
+          `Failed to retry bridge operation '${operationId}' binding:`,
+          error,
+        );
+      }
+    }
+  };
+  const bindingReconcileTimer = state.journal
+    ? setInterval(
+        reconcilePendingBindings,
+        options.bindingReconcileIntervalMs ?? 2_000,
+      )
+    : undefined;
+  bindingReconcileTimer?.unref();
 
   const emit = (
     protocolVersion: ProtocolVersion,
@@ -769,7 +814,12 @@ export function registerPlanExecRpc(
               runId,
               asyncDir,
             );
+            delete operation.pendingBinding;
           } catch (error: unknown) {
+            operation.pendingBinding = {
+              runId,
+              ...(asyncDir ? { asyncDir } : {}),
+            };
             // The native run ID is stronger than a failed local persistence step.
             // Return it so plan-exec can durably attach instead of losing a known
             // launch and risking a replacement worker.
@@ -1057,6 +1107,7 @@ export function registerPlanExecRpc(
     dispose(): void {
       if (disposed) return;
       disposed = true;
+      if (bindingReconcileTimer) clearInterval(bindingReconcileTimer);
       for (const unsubscribe of unsubscribes) unsubscribe?.();
       if (state.registration === registration) {
         delete state.registration;
