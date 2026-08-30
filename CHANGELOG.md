@@ -1,13 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-08-30
 
-- Add the version 2 plan-exec RPC with durable operation lookup, request-digest validation, and validated native process-terminal proof while retaining the version 1 contract.
-- Persist launch bindings before native dispatch so bridge restarts recover bound runs and fail closed on unknown launch outcomes instead of spawning duplicates.
-- Persist accepted legacy TaskExecute run IDs so completion translation resumes after a full Pi restart.
-- Fence accepted-run delivery by originating Pi session, process instance, and heartbeat lease; retry transient claims and handle PID reuse without foreign-session completion loss.
-- Journal legacy spawn request identities before dispatch, validate in-memory replay identity, and retry transient accepted-run and known-run binding persistence failures.
-- Verify live pi-subagents capabilities before advertising version 2 workflow and terminal-proof support.
+- Add resilient v2 plan-exec RPC integration, session-fenced legacy run recovery, SQLite durability, replay identity checks, and retryable persistence.
+- Add durable launch bindings, native terminal proof, capability negotiation, and fail-closed unknown-launch recovery.
+- Retry transient accepted-run and known-run binding persistence failures.
+
+## Unreleased
 
 ## 0.2.3 - 2026-08-08
 
