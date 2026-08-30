@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import path from "node:path";
 import {
   OperationJournal,
   type OperationJournalRecord,
@@ -567,7 +568,7 @@ function getPlanExecState(
     if (
       journalPath &&
       existing.journal &&
-      existing.journal.filePath !== new OperationJournal(journalPath).filePath
+      existing.journal.filePath !== path.resolve(journalPath)
     ) {
       throw new Error("plan-exec RPC was already registered with a different operation journal");
     }
