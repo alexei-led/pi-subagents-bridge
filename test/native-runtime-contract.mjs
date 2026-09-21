@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
@@ -9,6 +10,11 @@ import { createJiti } from "jiti";
 
 const nativeRoot = process.env.PI_SUBAGENTS_SOURCE;
 assert.ok(nativeRoot, "Set PI_SUBAGENTS_SOURCE to the native source checkout with its dependencies installed");
+const manifest = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const pinnedRevision = /#([a-f0-9]{40})$/.exec(manifest.devDependencies["pi-subagents"])?.[1];
+assert.ok(pinnedRevision, "Native integration requires an immutable pi-subagents dependency pin");
+assert.equal(execFileSync("git", ["-C", nativeRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), pinnedRevision);
+execFileSync("git", ["-C", nativeRoot, "diff", "--quiet", "HEAD", "--"]);
 const artifacts = fs.mkdtempSync(new URL("../.native-test-", import.meta.url));
 process.env.PI_SUBAGENTS_TEMP_ROOT = artifacts;
 await import(pathToFileURL(path.join(nativeRoot, "test/support/register-loader.mjs")).href);
