@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import { constants as osConstants } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
@@ -23,6 +24,7 @@ await import(pathToFileURL(path.join(nativeRoot, "test/support/register-loader.m
 const fixture = await import(pathToFileURL(path.join(nativeRoot, "test/support/async-execution-fixture.ts")).href);
 const helpers = await import(pathToFileURL(path.join(nativeRoot, "test/support/helpers.ts")).href);
 const native = await import(pathToFileURL(path.join(nativeRoot, "src/extension/rpc.ts")).href);
+const kernel = await import(pathToFileURL(path.join(nativeRoot, "src/runs/background/kernel-owned-process.mjs")).href);
 const bridge = await import("../src/plan-exec-rpc.ts");
 const { setChildSessionFactoryModule } = await import(pathToFileURL(path.join(nativeRoot, "src/runs/shared/child-session.ts")).href);
 
@@ -430,5 +432,62 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     cleanupBody = undefined;
     assert.equal(fixture.mockPi.callCount(), 3);
     t.diagnostic("Confirmed root crash triggered scoped cleanup and a bound retirement proof after its detached descendant exited");
+    fs.rmSync(marker);
+    fixture.mockPi.onCall({ delay: 120000, output: "must not outlive the explicit bounded lifetime" });
+    const expiryParams = { ...params, executionLifetime: { mode: "bounded", timeoutMs: 10000 } };
+    const expiryDigest = `sha256:${createHash("sha256").update(canonical({ cwd: fixture.tempDir, params: expiryParams })).digest("hex")}`;
+    const expiryBody = { ...body, params: expiryParams, operationId: "bounded-gate-death",
+      owner: { ...body.owner, key: "bounded-gate-death", requestDigest: expiryDigest } };
+    cleanupBody = expiryBody;
+    const expiryClient = mainModule ? new mainModule.BridgeClient(events, 12000) : undefined;
+    if (expiryClient) await expiryClient.capabilities();
+    const expiryLaunch = expiryClient
+      ? await expiryClient.spawn(expiryBody.operationId, { ...expiryParams, cwd: fixture.tempDir }, expiryBody.owner)
+      : await request("spawn", expiryBody);
+    assert.equal(expiryLaunch.success, true, JSON.stringify(expiryLaunch));
+    await fixture.waitForMockPiRuntime(fixture.mockPi, 3, 30_000);
+    const expiryMarkerDeadline = Date.now() + 10_000;
+    while (!fs.existsSync(marker) && Date.now() < expiryMarkerDeadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    escapedPid = JSON.parse(fs.readFileSync(marker, "utf8")).pid;
+    assert.doesNotThrow(() => process.kill(escapedPid, 0));
+    const expiryIntent = fs.readdirSync(fixture.ASYNC_DIR, { recursive: true })
+      .filter((entry) => entry.endsWith("intent.json"))
+      .map((entry) => path.join(fixture.ASYNC_DIR, entry))
+      .find((file) => JSON.parse(fs.readFileSync(file, "utf8")).operationId === expiryBody.operationId);
+    assert.ok(expiryIntent);
+    const ownedDirectory = path.join(path.dirname(expiryIntent), "owned");
+    const activeKernel = await kernel.observeKernelOwnedProcess(ownedDirectory);
+    assert.equal(activeKernel.status, "active");
+    const prepared = JSON.parse(fs.readFileSync(path.join(ownedDirectory, "request.json"), "utf8"));
+    const workload = activeKernel.workloadIdentity;
+    assert.ok(workload);
+    execFileSync(prepared.request.nativeExecutable, ["signal", String(workload.pid), String(workload.pidVersion),
+      workload.uniqueId, activeKernel.identity.coalitionId, String(osConstants.signals.SIGSTOP)], { timeout: 2000 });
+    const leader = activeKernel.identity.leader;
+    execFileSync(prepared.request.nativeExecutable, ["signal", String(leader.pid), String(leader.pidVersion),
+      leader.uniqueId, activeKernel.identity.coalitionId, "9"], { timeout: 2000 });
+    assert.equal(JSON.parse(fs.readFileSync(path.join(fixture.ASYNC_DIR, expiryLaunch.data.runId, "status.json"), "utf8")).state, "running");
+    const observeExpiry = () => expiryClient
+      ? expiryClient.operation(expiryBody.operationId, expiryBody.owner)
+      : request("operation", expiryBody);
+    let expired = await observeExpiry();
+    const expiryDeadline = Date.now() + 30_000;
+    while ((!childHasClosed(expired) || expired.data.status !== "failed") && Date.now() < expiryDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expired = await observeExpiry();
+    }
+    assertOwnedProof(expired);
+    assert.equal(expired.data.status, "failed");
+    assert.equal(expired.data.statusPayload.state, "failed");
+    assert.equal(expired.data.statusPayload.timedOut, true);
+    assert.equal(expired.data.terminationReason, "execution_lifetime_expired");
+    assert.equal(expired.data.cancellationRequested, false);
+    assert.equal(fs.existsSync(path.join(ownedDirectory, "exit.json")), false);
+    assert.throws(() => process.kill(escapedPid, 0), { code: "ESRCH" });
+    if (mainProofValidator) assert.equal(mainProofValidator(expired.data, expired.data.runId,
+      { operationId: expiryBody.operationId, requestDigest: expiryDigest }), true);
+    cleanupBody = undefined;
+    assert.equal(fixture.mockPi.callCount(), 4);
+    t.diagnostic("Bounded expiry after helper death reaches the main client as failed with a retirement proof despite missing exit metadata");
   });
 });
