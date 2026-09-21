@@ -244,3 +244,26 @@ test("v4 native intents without frozen parameters migrate to lookup-only reconci
   assert.equal(reply.success, true);
   assert.equal((reply.data as Record<string, unknown>).runId, "prior-workflow");
 });
+
+test("asynchronous preflight cannot change the accepted lifetime or child budgets", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-frozen-preflight-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const params = { agent: "worker", task: "original task", executionLifetime: { mode: "unbounded" }, turnBudget: { maxTurns: 75 } };
+  const digest = `sha256:${createHash("sha256").update(canonical({ params })).digest("hex")}`;
+  const bridge = harness(path.join(root, "journal.sqlite"), (method, input) => {
+    if (method === "ping") {
+      Object.assign(params.executionLifetime, { mode: "bounded", timeoutMs: 5 });
+      params.turnBudget.maxTurns = 1;
+      params.task = "changed task";
+      return { capabilities };
+    }
+    assert.equal(method, "spawn");
+    assert.deepEqual(input.executionLifetime, { mode: "unbounded" });
+    assert.deepEqual(input.turnBudget, { maxTurns: 75 });
+    assert.equal(input.task, "original task");
+    return { operationId: input.operationId, digest: input.digest, runId: "frozen-run", effectiveExecutionLifetime: input.executionLifetime };
+  });
+  t.after(bridge.dispose);
+  const reply = await bridge.request("spawn", { operationId: "op", owner: { kind: "pi-plan-exec", runId: "plan", key: "op", requestDigest: digest }, params });
+  assert.equal(reply.success, true);
+});

@@ -26,11 +26,12 @@ const METHODS = [
   "stop",
   "adopt",
   "cancelOperation",
+  "diagnoseOperation",
 ] as const;
 
 type Method = (typeof METHODS)[number];
 type ProtocolVersion = 1 | 2;
-type UpstreamMethod = "ping" | "spawn" | "status" | "stop" | "lookup" | "cancel";
+type UpstreamMethod = "ping" | "spawn" | "status" | "stop" | "lookup" | "cancel" | "diagnose";
 type Unsubscribe = () => void;
 
 type EventBus = {
@@ -190,6 +191,12 @@ function supportsOwnedSingle(capabilities: Record<string, unknown>): boolean {
   return isRecord(ownership) && ownership.version === 1 && ownership.scope === "owned-process-tree" &&
     ownership.escapedDescendants === "contained" && ownership.requestMode === "kernel" &&
     Array.isArray(ownership.routes) && ownership.routes.includes("single-async");
+}
+
+function supportsDiagnosticGuidance(capabilities: Record<string, unknown> | undefined): boolean {
+  const value = capabilities?.diagnosticGuidance;
+  return isRecord(value) && value.version === 1 && value.idempotent === true &&
+    value.mode === "follow_up" && value.confirmedToolFailure === true;
 }
 
 function normalizeNativeOperation(operation: OperationJournalRecord, upstream: unknown): Record<string, unknown> {
@@ -434,8 +441,8 @@ function validateSpawn(
     operationId,
     fingerprint,
     ...(owner ? { ownerRunId: owner.runId } : {}),
-    params: executionLifetime ? { ...params, agent, task, async: true, executionOwnership: { mode: "kernel" },
-      ...(cwd !== undefined ? { cwd } : {}) } : forwarded,
+    params: structuredClone(executionLifetime ? { ...params, agent, task, async: true, executionLifetime, executionOwnership: { mode: "kernel" },
+      ...(cwd !== undefined ? { cwd } : {}) } : forwarded),
   };
 }
 
@@ -824,7 +831,7 @@ export function registerPlanExecRpc(
         return failure("upstream_error", "operation cancellation was requested before dispatch");
       }
       const frozen = claim.record.nativeParams;
-      const canReplay = frozen && nonEmptyString(frozen.operationId) && nonEmptyString(frozen.digest) &&
+      const canReplay = !claim.record.runId && frozen && nonEmptyString(frozen.operationId) && nonEmptyString(frozen.digest) &&
         isRecord(frozen.executionOwnership) && frozen.executionOwnership.mode === "kernel";
       const upstream = await nativeRequest(canReplay ? "spawn" : "lookup",
         canReplay ? frozen : nativeOperationIdentity(claim.record));
@@ -1078,6 +1085,8 @@ export function registerPlanExecRpc(
               workflowScriptSpawn: capabilities?.asyncSpawn === true,
               ...(capabilities && supportsNativeLifetime(capabilities) && supportsOwnedSingle(capabilities)
                 ? { singleAgentSpawn: true } : {}),
+              ...(state.journal && supportsDiagnosticGuidance(capabilities)
+                ? { diagnosticGuidance: capabilities?.diagnosticGuidance } : {}),
               ...(supportsNativeLifetime(capabilities) ? { executionLifetime: { version: 1, modes: ["unbounded", "bounded"] }, durableOperations: capabilities?.durableOperations } : {}),
               durableOperationLookup: state.journal
                 ? { version: 1 }
@@ -1103,6 +1112,59 @@ export function registerPlanExecRpc(
         );
       } finally {
         transientControllers.delete(controller);
+      }
+    }
+
+    if (method === "diagnoseOperation") {
+      const request = validateOperationRequest(raw, protocolVersion);
+      if (isFailure(request)) return request;
+      if (protocolVersion !== 2 || !request.requestDigest) return failure("invalid_request", "diagnoseOperation requires v2 operation ownership");
+      const params = raw.params;
+      if (!isRecord(params) || typeof params.diagnosticId !== "string" || !params.diagnosticId.trim() || params.diagnosticId.length > 256 ||
+        typeof params.toolCallId !== "string" || !params.toolCallId.trim() || params.toolCallId.length > 512 ||
+        typeof params.message !== "string" || !params.message.trim() || params.message.length > 4096) {
+        return failure("invalid_request", "diagnoseOperation requires diagnosticId, toolCallId, and message within native limits");
+      }
+      const diagnostic = { diagnosticId: params.diagnosticId, toolCallId: params.toolCallId, message: params.message };
+      const declined = (state: "cancelled" | "rejected", reason: string): Reply<object> => ({ success: true, data: {
+        operationId: request.operationId, requestDigest: request.requestDigest, diagnosticId: diagnostic.diagnosticId,
+        toolCallId: diagnostic.toolCallId, state, reason, guidanceOnly: true,
+      } });
+      try {
+        let operation = state.journal?.get(request.operationId);
+        if (!operation) return declined("rejected", "No durable operation mapping exists");
+        let invalid = validateOperationIdentity(request, operation.requestDigest, operation.ownerRunId);
+        if (invalid) return invalid;
+        if (operation.cancelRequested) return declined("cancelled", "Operation cancellation was already requested");
+        if (!operation.nativeCorrelated || !nonEmptyString(operation.nativeParams?.operationId) || !nonEmptyString(operation.nativeParams?.digest)) {
+          return declined("rejected", "No frozen native operation identity exists");
+        }
+        const ping = await nativeRequest("ping", {});
+        if (!isRecord(ping) || !isRecord(ping.capabilities) || !supportsDiagnosticGuidance(ping.capabilities)) {
+          return declined("rejected", "pi-subagents runtime does not support durable diagnostic guidance");
+        }
+        operation = state.journal?.get(request.operationId);
+        if (!operation) return declined("rejected", "Durable operation mapping disappeared");
+        invalid = validateOperationIdentity(request, operation.requestDigest, operation.ownerRunId);
+        if (invalid) return invalid;
+        if (operation.cancelRequested) return declined("cancelled", "Operation cancellation was already requested");
+        if (!operation.nativeCorrelated || !nonEmptyString(operation.nativeParams?.operationId) || !nonEmptyString(operation.nativeParams?.digest)) {
+          return declined("rejected", "Frozen native operation identity disappeared");
+        }
+        const reply = await nativeRequest("diagnose", { ...nativeOperationIdentity(operation), ...diagnostic });
+        if (!isRecord(reply) || reply.diagnosticId !== diagnostic.diagnosticId || reply.toolCallId !== diagnostic.toolCallId || reply.guidanceOnly !== true ||
+          typeof reply.state !== "string" || !["queued", "pending", "cancelled", "rejected"].includes(reply.state)) {
+          throw new Error("Malformed native diagnostic guidance receipt");
+        }
+        const data = normalizeNativeOperation(operation, reply);
+        return { success: true, data: {
+          operationId: data.operationId, requestDigest: data.requestDigest, callerBinding: data.callerBinding,
+          diagnosticId: reply.diagnosticId, toolCallId: reply.toolCallId, state: reply.state, guidanceOnly: true,
+          ...(nonEmptyString(data.runId) ? { runId: data.runId } : {}),
+          ...(nonEmptyString(reply.reason) ? { reason: reply.reason } : {}),
+        } };
+      } catch (error: unknown) {
+        return failure("upstream_error", error instanceof Error ? error.message : String(error));
       }
     }
 
@@ -1339,9 +1401,10 @@ export function registerPlanExecRpc(
         return;
       }
 
-      void invoke(methodName, raw, protocolVersion).then((reply) =>
-        emit(protocolVersion, requestId, reply),
-      );
+      void invoke(methodName, raw, protocolVersion)
+        .then((reply) => emit(protocolVersion, requestId, reply))
+        .catch((error: unknown) => emit(protocolVersion, requestId,
+          failure("upstream_error", error instanceof Error ? error.message : String(error))));
     });
   const unsubscribes = [
     subscribe(PLAN_EXEC_REQUEST_EVENT, 1),

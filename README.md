@@ -133,7 +133,7 @@ If `subagent:async-complete` does not arrive, the bridge polls `pi-subagents` `s
 
 This protocol is independent of `pi-tasks`. Version 1 remains available on `plan-exec:bridge:v1:request` with replies on `plan-exec:bridge:v1:reply:<requestId>`.
 
-Version 2 uses `plan-exec:bridge:v2:request` and `plan-exec:bridge:v2:reply:<requestId>`. It supports `ping`, `spawn`, `operation`, `status`, `result`, `stop`, `adopt`, and `cancelOperation` with durable launch identity and native process-terminal proof.
+Version 2 uses `plan-exec:bridge:v2:request` and `plan-exec:bridge:v2:reply:<requestId>`. It supports `ping`, `spawn`, `operation`, `status`, `result`, `stop`, `adopt`, `cancelOperation`, and optional `diagnoseOperation` with durable launch identity and native process-terminal proof.
 
 - `ping` verifies the live `pi-subagents` RPC before advertising `workflowScriptSpawn`, `durableOperationLookup`, and `processTerminalProof` capabilities.
 - `spawn` requires `operationId`, `cwd` when needed, `params.agent`, `params.task`, and an owner `{ kind: "pi-plan-exec", runId, key, requestDigest }`. The digest is SHA-256 over canonical `{ cwd, params }`. The bridge rejects mismatches before dispatch.
@@ -187,6 +187,17 @@ Observed kernel proofs include three distinct bindings: the bridge's
 request's `kernelBinding`. The bridge validates their persisted relationship
 without equating unrelated digests. A missing or ambiguous run-ID mapping returns
 `unknown`; it cannot attest a foreign terminal proof.
+
+When native `diagnosticGuidance` advertises durable, idempotent `follow_up`
+guidance for confirmed tool failures, `diagnoseOperation` accepts
+`{ operationId, owner, params: { diagnosticId, toolCallId, message } }`.
+The native runtime checks the referenced failed tool and queues guidance into the
+existing live session. Reuse the same diagnostic ID and payload after an uncertain
+reply: durable native receipts prevent a second enqueue. Replies bind the caller
+operation, request digest, diagnostic ID, and tool-call ID, with
+`guidanceOnly: true` and `queued`, `pending`, `cancelled`, or `rejected` state.
+An enqueue receipt does not confirm a repair. Cancellation fences late guidance;
+this method does not start or revive a worker.
 
 To test the full Bridge → native owned async child path against a modified
 native source checkout, install that checkout's development dependencies and run

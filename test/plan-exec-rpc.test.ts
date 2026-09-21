@@ -49,7 +49,7 @@ test("plan-exec v2 exposes durable lookup and native terminal proof", async (t) 
         durableOperationLookup: { version: 1 },
         processTerminalProof: { version: 1 },
       },
-      methods: ["ping", "spawn", "operation", "status", "result", "stop", "adopt", "cancelOperation"],
+      methods: ["ping", "spawn", "operation", "status", "result", "stop", "adopt", "cancelOperation", "diagnoseOperation"],
     },
   });
 
@@ -1171,6 +1171,7 @@ test("plan-exec ping advertises the supported generic methods", async (t) => {
         "stop",
         "adopt",
         "cancelOperation",
+        "diagnoseOperation",
       ],
     },
   });

@@ -78,6 +78,7 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     assert.ok(fixture.available && fixture.isAsyncAvailable(), "native async fixture must be available");
     const emitter = new EventEmitter();
     let dropSpawnReply = true;
+    let dropDiagnosticReply = false;
     let nativeSpawnRequests = 0;
     let weakProvider = false;
     const events = {
@@ -90,6 +91,10 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
         if (event === "subagents:rpc:v1:request" && value.method === "spawn") nativeSpawnRequests++;
         if (dropSpawnReply && event.startsWith("subagents:rpc:v1:reply:") && value.method === "spawn") {
           dropSpawnReply = false;
+          return;
+        }
+        if (dropDiagnosticReply && event.startsWith("subagents:rpc:v1:reply:") && value.method === "diagnose") {
+          dropDiagnosticReply = false;
           return;
         }
         emitter.emit(event, value);
@@ -125,14 +130,27 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     const requestDigest = `sha256:${createHash("sha256").update(canonical({ cwd: fixture.tempDir, params })).digest("hex")}`;
     const body = { cwd: fixture.tempDir, params, operationId: "bridge-native-operation",
       owner: { kind: "pi-plan-exec", runId: "plan", key: "bridge-native-operation", requestDigest } };
-    const ping = await request("ping", {});
+    const mainModule = process.env.PI_PLAN_EXEC_SOURCE
+      ? await createJiti(import.meta.url).import(path.join(process.env.PI_PLAN_EXEC_SOURCE, "src/bridge.ts")) : undefined;
+    const coldClient = mainModule ? new mainModule.BridgeClient(events, 2000) : undefined;
+    let ping;
+    let coldCapabilities;
+    const capabilityDeadline = Date.now() + 15000;
+    do {
+      if (coldClient) coldCapabilities = await coldClient.capabilities();
+      ping = await request("ping", {});
+      if (ping.data?.capabilities?.processTreeOwnership?.scope === "owned-process-tree" &&
+        (!coldClient || coldCapabilities.processTreeOwnership?.scope === "owned-process-tree")) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    } while (Date.now() < capabilityDeadline);
     const ownership = ping.data?.capabilities?.processTreeOwnership;
     assert.equal(ownership?.scope, "owned-process-tree", JSON.stringify(ping));
     assert.equal(ownership.escapedDescendants, "contained");
     assert.ok(ownership.routes.includes("single-async"));
     let mainProofValidator;
-    if (process.env.PI_PLAN_EXEC_SOURCE) {
-      const { BridgeClient, hasTerminalOwnershipProof } = await createJiti(import.meta.url).import(path.join(process.env.PI_PLAN_EXEC_SOURCE, "src/bridge.ts"));
+    if (mainModule) {
+      const { BridgeClient, hasTerminalOwnershipProof } = mainModule;
+      assert.equal(coldCapabilities.processTreeOwnership?.scope, "owned-process-tree");
       mainProofValidator = hasTerminalOwnershipProof;
       weakProvider = true;
       const weakClient = new BridgeClient(events, 2000);
@@ -151,6 +169,8 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     }
     const lost = await request("spawn", body);
     assert.equal(lost.success, false, JSON.stringify(lost));
+    ctx.cwd = fs.mkdtempSync(path.join(artifacts, "restarted-context-"));
+    ctx.sessionManager.getSessionId = () => "restarted-session";
     bridgeRpc.dispose();
     bridgeRpc = bridge.registerPlanExecRpc(events, { timeoutMs: 12000, journalPath });
     const recovered = await request("operation", body);
@@ -203,7 +223,14 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
       } catch { return; }
     });
     setChildSessionFactoryModule(escaped.factoryPath);
-    fixture.mockPi.onCall({ delay: 120000, output: "must be cancelled first" });
+    fixture.mockPi.onCall({ steps: [
+      { jsonl: [
+        { type: "tool_execution_start", toolCallId: "failed-tool", toolName: "read", args: { path: "missing-file" } },
+        { type: "tool_execution_end", toolCallId: "failed-tool", toolName: "read", isError: true,
+          result: { content: [{ type: "text", text: "ENOENT: missing-file" }] } },
+      ] },
+      { delay: 120000, jsonl: [helpers.events.assistantMessage("must be cancelled first")] },
+    ] });
     const stoppingBody = { ...body, operationId: "cancel-live-child", owner: { ...body.owner, key: "cancel-live-child" } };
     cleanupBody = stoppingBody;
     const live = await request("spawn", stoppingBody);
@@ -218,6 +245,35 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     const adopted = await request("adopt", { params: { runId: live.data.runId } });
     assert.equal(adopted.success, true, JSON.stringify(adopted));
     assert.equal(adopted.data.state, "running");
+    let failure = await request("operation", stoppingBody);
+    const failureDeadline = Date.now() + 10_000;
+    while (failure.data?.activity?.lastToolFailure?.toolCallId !== "failed-tool" && Date.now() < failureDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      failure = await request("operation", stoppingBody);
+    }
+    assert.equal(failure.data.activity.lastToolFailure.toolCallId, "failed-tool");
+    const diagnostic = { operationId: stoppingBody.operationId, owner: stoppingBody.owner,
+      params: { diagnosticId: "confirmed-tool-diagnosis", toolCallId: "failed-tool", message: "Use the corrected path for the confirmed missing-file error." } };
+    const rejected = await request("diagnoseOperation", { ...diagnostic, params: { ...diagnostic.params, diagnosticId: "unconfirmed-diagnosis", toolCallId: "healthy-tool" } });
+    assert.equal(rejected.data.state, "rejected");
+    bridgeRpc.dispose();
+    bridgeRpc = bridge.registerPlanExecRpc(events, { timeoutMs: 2000, journalPath });
+    dropDiagnosticReply = true;
+    const uncertainGuidance = await request("diagnoseOperation", diagnostic);
+    assert.equal(uncertainGuidance.success, false);
+    bridgeRpc.dispose();
+    bridgeRpc = bridge.registerPlanExecRpc(events, { timeoutMs: 12000, journalPath });
+    const guidanceReceipt = await request("diagnoseOperation", diagnostic);
+    assert.equal(guidanceReceipt.success, true, JSON.stringify(guidanceReceipt));
+    assert.equal(guidanceReceipt.data.state, "queued");
+    assert.equal(guidanceReceipt.data.guidanceOnly, true);
+    const steerLog = path.join(fixture.mockPi.dir, "steers.jsonl");
+    const guidanceDeadline = Date.now() + 10_000;
+    while (!fs.existsSync(steerLog) && Date.now() < guidanceDeadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    const messages = fs.readFileSync(steerLog, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const matchingGuidance = messages.filter((entry) => typeof entry.text === "string" && entry.text.includes(diagnostic.params.message));
+    assert.equal(matchingGuidance.length, 1, JSON.stringify(messages));
+    assert.equal(matchingGuidance[0].mode, "followUp");
     const stop = await request("stop", { params: { runId: live.data.runId } });
     assert.equal(stop.success, true, JSON.stringify(stop));
     assert.equal(stop.data.cancellationRequested, true);
@@ -233,11 +289,13 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     const childStatus = JSON.parse(fs.readFileSync(path.join(fixture.ASYNC_DIR, childId, "status.json"), "utf8"));
     assert.equal(childStatus.stopped, true, JSON.stringify(childStatus));
     assert.equal(stopped.data.cancellationRequested, true);
+    assert.equal((await request("diagnoseOperation", diagnostic)).data.state, "cancelled");
     if (mainProofValidator) assert.equal(mainProofValidator(stopped.data, stopped.data.runId, { operationId: stoppingBody.operationId, requestDigest }), true);
     assert.throws(() => process.kill(escapedPid, 0), { code: "ESRCH" });
     cleanupBody = undefined;
     assert.equal(fixture.mockPi.callCount(), 2);
     t.diagnostic("Known-ID stop retired the owned root and killed its reparented detached descendant");
+    t.diagnostic("Confirmed tool-error guidance queued once across a lost reply and Bridge restart; unconfirmed tools and stopped runs rejected");
     fs.rmSync(marker);
     fixture.mockPi.onCall({ delay: 120000, output: "must not outlive a crashed root" });
     const crashBody = { ...body, operationId: "crash-live-child", owner: { ...body.owner, key: "crash-live-child" } };

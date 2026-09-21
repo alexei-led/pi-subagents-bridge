@@ -9,9 +9,9 @@ import { OperationJournal, type OperationJournalRecord } from "../src/operation-
 import { registerPlanExecRpc, PLAN_EXEC_V2_REPLY_PREFIX, PLAN_EXEC_V2_REQUEST_EVENT } from "../src/plan-exec-rpc.js";
 
 function fixture() {
-  const binding = { operationId: "kernel-operation", requestDigest: "kernel-request-digest", hostId: "host", bootId: "boot" };
+  const binding = { operationId: "kernel-operation", requestDigest: "kernel-request-digest", hostId: "11111111-1111-1111-1111-111111111111", bootId: "22222222-2222-2222-2222-222222222222" };
   const identity = { ...binding, version: 1, backend: "darwin-resource-coalition-v1", coalitionId: "123",
-    leader: { pid: 456, uniqueId: "process-generation", pidVersion: 7 } };
+    leader: { pid: 456, uniqueId: "1001", pidVersion: 7 } };
   const proof = { version: 1, state: "observed", runId: "native-run", runnerProcessInstanceId: "runner-instance", observedAt: 1234, instances: [],
     nativeOperation: { operationId: "native-operation", digest: "native-request-digest" },
     processTreeOwnership: { version: 1, scope: "owned-process-tree", escapedDescendants: "contained" },
@@ -59,6 +59,15 @@ test("proof binding mismatches and weaker evidence cannot attest retirement", ()
   assert.equal(attestNativeTerminalProof(proof, operation, "native-run"), undefined);
 });
 
+test("retired kernel evidence needs no process callbacks and rejects contradictory callback hints", () => {
+  const { proof, operation } = fixture();
+  const { instances: _instances, ...withoutCallbacks } = proof;
+  assert.ok(attestNativeTerminalProof(withoutCallbacks, operation, "native-run"));
+  for (const instances of ["malformed", [{ processTree: { mechanism: "posix-process-group" } }], [{ processTree: { containment: "unverified" } }]]) {
+    assert.equal(attestNativeTerminalProof({ ...proof, instances }, operation, "native-run"), undefined);
+  }
+});
+
 test("status resolves native identity from the journal and refuses missing or ambiguous run mappings", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-proof-mapping-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -102,4 +111,9 @@ test("status resolves native identity from the journal and refuses missing or am
   journal.bind("other-caller", "other-digest", "native-run");
   assert.equal((await status("native-run")).data.state, "unknown");
   assert.equal(calls, 2);
+  t.mock.method(journal, "get", () => { throw new Error("journal temporarily unavailable"); });
+  const unavailable = new Promise<Record<string, unknown>>((resolve) => emitter.once(`${PLAN_EXEC_V2_REPLY_PREFIX}journal-failure`, resolve));
+  events.emit(PLAN_EXEC_V2_REQUEST_EVENT, { version: 2, requestId: "journal-failure", method: "operation", operationId: operation.operationId,
+    owner: { kind: "pi-plan-exec", runId: "plan", key: operation.operationId, requestDigest: operation.requestDigest } });
+  assert.deepEqual(await unavailable, { success: false, error: { code: "upstream_error", message: "journal temporarily unavailable" } });
 });
