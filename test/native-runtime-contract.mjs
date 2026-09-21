@@ -238,10 +238,11 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     if (mainProofValidator) assert.equal(mainProofValidator(rejectedLookup.data, rejectedLookup.data.runId,
       { operationId: rejectedBody.operationId, requestDigest: rejectedDigest }), false);
     const admissionFiles = fs.readdirSync(fixture.ASYNC_DIR, { recursive: true })
-      .filter((entry) => entry.endsWith("admission-rejected.json"));
+      .filter((entry) => entry.endsWith("dispatch-decision.json"));
     const admissionFile = admissionFiles.map((entry) => path.join(fixture.ASYNC_DIR, entry))
       .find((file) => JSON.parse(fs.readFileSync(file, "utf8")).operationId === rejectedBody.operationId);
     assert.ok(admissionFile);
+    assert.equal(JSON.parse(fs.readFileSync(admissionFile, "utf8")).state, "rejected");
     assert.equal(fs.existsSync(path.join(path.dirname(admissionFile), "owned", "request.json")), false);
     const rejectedFence = coldClient
       ? await coldClient.cancelOperation(rejectedBody.operationId, rejectedBody.owner)
@@ -260,6 +261,47 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     assert.equal(rejectedReplay.success, false, JSON.stringify(rejectedReplay));
     assert.equal(fixture.mockPi.callCount(), 1);
     t.diagnostic("Unknown-agent admission produced a caller-bound no-start cancellation fence without a kernel proof or worker dispatch");
+    const invalidCwd = path.join(artifacts, "regular-file-cwd");
+    fs.writeFileSync(invalidCwd, "not a directory");
+    const invalidCwdDigest = `sha256:${createHash("sha256").update(canonical({ cwd: invalidCwd, params })).digest("hex")}`;
+    const invalidCwdBody = { ...body, cwd: invalidCwd, operationId: "invalid-cwd-operation",
+      owner: { ...body.owner, key: "invalid-cwd-operation", requestDigest: invalidCwdDigest } };
+    const invalidCwdLaunch = coldClient
+      ? await coldClient.spawn(invalidCwdBody.operationId, { ...params, cwd: invalidCwd }, invalidCwdBody.owner)
+      : await request("spawn", invalidCwdBody);
+    assert.equal(invalidCwdLaunch.success, true, JSON.stringify(invalidCwdLaunch));
+    const invalidCwdLookup = coldClient
+      ? await coldClient.operation(invalidCwdBody.operationId, invalidCwdBody.owner)
+      : await request("operation", invalidCwdBody);
+    assert.equal(invalidCwdLookup.success, true, JSON.stringify(invalidCwdLookup));
+    assert.equal(invalidCwdLookup.data.neverStarted, true);
+    assert.equal(invalidCwdLookup.data.operationId, invalidCwdBody.operationId);
+    assert.equal(invalidCwdLookup.data.requestDigest, invalidCwdDigest);
+    assert.equal(invalidCwdLookup.data.runId, invalidCwdLaunch.data.runId);
+    assert.notEqual(invalidCwdLookup.data.processTerminalProof?.state, "observed");
+    if (mainProofValidator) assert.equal(mainProofValidator(invalidCwdLookup.data, invalidCwdLookup.data.runId,
+      { operationId: invalidCwdBody.operationId, requestDigest: invalidCwdDigest }), false);
+    const invalidCwdAdmission = fs.readdirSync(fixture.ASYNC_DIR, { recursive: true })
+      .filter((entry) => entry.endsWith("dispatch-decision.json"))
+      .map((entry) => path.join(fixture.ASYNC_DIR, entry))
+      .find((file) => JSON.parse(fs.readFileSync(file, "utf8")).operationId === invalidCwdBody.operationId);
+    assert.ok(invalidCwdAdmission);
+    assert.equal(JSON.parse(fs.readFileSync(invalidCwdAdmission, "utf8")).state, "rejected");
+    assert.equal(invalidCwdLookup.data.details.admission.reason, "launch-validation-rejected");
+    assert.equal(fs.existsSync(path.join(path.dirname(invalidCwdAdmission), "owned", "request.json")), false);
+    const invalidCwdFence = coldClient
+      ? await coldClient.cancelOperation(invalidCwdBody.operationId, invalidCwdBody.owner)
+      : await request("cancelOperation", invalidCwdBody);
+    assert.equal(invalidCwdFence.success, true, JSON.stringify(invalidCwdFence));
+    assert.equal(invalidCwdFence.data.state, "cancelled");
+    assert.equal(invalidCwdFence.data.neverStarted, true);
+    assert.equal(invalidCwdFence.data.cancellationRequested, true);
+    assert.equal(invalidCwdFence.data.operationId, invalidCwdBody.operationId);
+    assert.equal(invalidCwdFence.data.requestDigest, invalidCwdDigest);
+    const invalidCwdReplay = await request("spawn", invalidCwdBody);
+    assert.equal(invalidCwdReplay.success, false, JSON.stringify(invalidCwdReplay));
+    assert.equal(fixture.mockPi.callCount(), 1);
+    t.diagnostic("Existing-agent regular-file cwd rejection produced a correlated no-start fence without launching a kernel request");
     const fencedBody = { ...body, operationId: "cancel-before-dispatch", owner: { ...body.owner, key: "cancel-before-dispatch" } };
     const fenced = await request("cancelOperation", fencedBody);
     assert.equal(fenced.success, true, JSON.stringify(fenced));
