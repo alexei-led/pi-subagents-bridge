@@ -51,6 +51,15 @@ function descendantFactory(marker) {
   return { factoryPath, escapedScript };
 }
 
+function delayedNodeExecutable() {
+  const directory = path.join(artifacts, "delayed-node");
+  fs.mkdirSync(directory, { mode: 0o700 });
+  const executable = path.join(directory, "node");
+  const quotedNode = `'${process.execPath.replaceAll("'", "'\\''")}'`;
+  fs.writeFileSync(executable, `#!/bin/sh\n/bin/sleep 6\nexec ${quotedNode} "$@"\n`, { mode: 0o700 });
+  return executable;
+}
+
 function assertOwnedProof(observation) {
   const proof = observation.data.processTerminalProof;
   assert.equal(proof?.state, "observed", JSON.stringify(observation));
@@ -109,8 +118,17 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
       getSubagentSessionRoot: () => fixture.tempDir, expandTilde: (value) => value,
       discoverAgents: () => ({ agents: [{ ...helpers.makeAgent("worker"), defaultTimeoutMs: 5 }] }), });
     fixture.mockPi.onCall({ delay: 200, output: "native detached child finished" });
+    const delayedNode = delayedNodeExecutable();
+    let firstExecution = true;
     const nativeRpc = native.registerSubagentRpcBridge({ events, state, asyncDirRoot: fixture.ASYNC_DIR, getContext: () => ctx,
-      execute: (...args) => executor.execute(...args), });
+      execute: async (...args) => {
+        if (!firstExecution || !args[1].rpcOperationRunId) return executor.execute(...args);
+        firstExecution = false;
+        const originalExecutable = process.execPath;
+        process.execPath = delayedNode;
+        try { return await executor.execute(...args); }
+        finally { process.execPath = originalExecutable; }
+      }, });
     const journalPath = path.join(artifacts, "bridge.sqlite");
     let bridgeRpc = bridge.registerPlanExecRpc(events, { timeoutMs: 2000, journalPath });
     let cleanupBody;
@@ -175,6 +193,7 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     bridgeRpc = bridge.registerPlanExecRpc(events, { timeoutMs: 12000, journalPath });
     const recovered = await request("operation", body);
     assert.equal(recovered.success, true, JSON.stringify(recovered));
+    assert.equal(fixture.mockPi.callCount(), 0);
     const spawned = await request("spawn", body);
     assert.equal(spawned.success, true, JSON.stringify(spawned));
     assert.equal(spawned.data.runId, recovered.data.runId);
