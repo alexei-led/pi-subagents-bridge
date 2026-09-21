@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
+import { parseExecutionLifetime, type ExecutionLifetime } from "./execution-lifetime.js";
 import { DatabaseSync } from "node:sqlite";
 
-const JOURNAL_VERSION = 3;
-// The autonomous runtime's v4/v5 schemas only add optional operation fields.
-const COMPATIBLE_JOURNAL_VERSIONS = [0, 1, 2, JOURNAL_VERSION, 4, 5];
+const JOURNAL_VERSION = 4;
+// Schemas 0-5 are known: 4 is written here, 5 adds only optional fields.
+const COMPATIBLE_JOURNAL_VERSIONS = [0, 1, 2, 3, JOURNAL_VERSION, 5];
 const BUSY_TIMEOUT_MS = 2_000;
 
 export type OperationBinding = "dispatching" | "bound" | "unknown";
@@ -36,6 +37,9 @@ export interface LegacySpawnJournalRecord {
 }
 
 export interface OperationJournalRecord {
+  executionLifetime?: ExecutionLifetime;
+  nativeCorrelated?: boolean;
+  cancelRequested?: boolean;
   operationId: string;
   requestDigest: string;
   ownerRunId?: string;
@@ -48,6 +52,9 @@ export interface OperationJournalRecord {
 }
 
 interface OperationRow {
+  execution_lifetime: string | null;
+  native_correlated: number;
+  cancel_requested: number;
   operation_id: string;
   request_digest: string;
   owner_run_id: string | null;
@@ -81,8 +88,13 @@ interface AcceptedRunRow {
 }
 
 function operationRecord(row: OperationRow): OperationJournalRecord {
+  const executionLifetime = row.execution_lifetime ? parseExecutionLifetime(JSON.parse(row.execution_lifetime)) : undefined;
+  if (row.execution_lifetime && !executionLifetime) throw new Error("Invalid persisted execution lifetime");
   return {
+    ...(row.native_correlated ? { nativeCorrelated: true } : {}),
+    ...(row.cancel_requested ? { cancelRequested: true } : {}),
     operationId: row.operation_id,
+    ...(executionLifetime ? { executionLifetime } : {}),
     requestDigest: row.request_digest,
     ...(row.owner_run_id ? { ownerRunId: row.owner_run_id } : {}),
     binding: row.binding,
@@ -162,6 +174,9 @@ export class OperationJournal {
         operation_id TEXT PRIMARY KEY,
         request_digest TEXT NOT NULL,
         owner_run_id TEXT,
+        execution_lifetime TEXT,
+        native_correlated INTEGER NOT NULL DEFAULT 0,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
         binding TEXT NOT NULL CHECK (binding IN ('dispatching', 'bound', 'unknown')),
         run_id TEXT,
         async_dir TEXT,
@@ -195,7 +210,7 @@ export class OperationJournal {
     `);
     if (version === 0) {
       this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
-    } else if (version === 1 || version === 2) {
+    } else if (version === 1 || version === 2 || version === 3) {
       this.#transaction(() => {
         if (version === 1) {
           this.#db.exec(`
@@ -205,6 +220,7 @@ export class OperationJournal {
               ADD COLUMN owner_heartbeat_at INTEGER NOT NULL DEFAULT 0;
           `);
         }
+        this.#db.exec("ALTER TABLE operations ADD COLUMN execution_lifetime TEXT; ALTER TABLE operations ADD COLUMN native_correlated INTEGER NOT NULL DEFAULT 0; ALTER TABLE operations ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0");
         this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
       });
     }
@@ -392,7 +408,7 @@ export class OperationJournal {
   get(operationId: string): OperationJournalRecord | undefined {
     const row = this.#db
       .prepare(
-        `SELECT operation_id, request_digest, owner_run_id, binding, run_id,
+        `SELECT operation_id, request_digest, owner_run_id, execution_lifetime, native_correlated, cancel_requested, binding, run_id,
                 async_dir, error, created_at, updated_at
            FROM operations
           WHERE operation_id = ?`,
@@ -405,6 +421,7 @@ export class OperationJournal {
     operationId: string,
     requestDigest: string,
     ownerRunId?: string,
+    executionLifetime?: ExecutionLifetime,
   ): { created: boolean; record: OperationJournalRecord } {
     return this.#transaction(() => {
       const existing = this.get(operationId);
@@ -414,16 +431,45 @@ export class OperationJournal {
       this.#db
         .prepare(
           `INSERT INTO operations
-             (operation_id, request_digest, owner_run_id, binding, created_at, updated_at)
-           VALUES (?, ?, ?, 'dispatching', ?, ?)`,
+             (operation_id, request_digest, owner_run_id, execution_lifetime, native_correlated, binding, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'dispatching', ?, ?)`,
         )
-        .run(operationId, requestDigest, ownerRunId ?? null, now, now);
+        .run(operationId, requestDigest, ownerRunId ?? null, executionLifetime ? JSON.stringify(executionLifetime) : null, executionLifetime ? 1 : 0, now, now);
       const record = this.get(operationId);
       if (!record) {
         throw new Error(`Operation journal failed to create '${operationId}'`);
       }
       return { created: true, record };
     });
+  }
+
+  requestNativeCancel(operationId: string, requestDigest: string, ownerRunId?: string): OperationJournalRecord {
+    return this.#transaction(() => {
+      const existing = this.get(operationId);
+      if (existing && (existing.requestDigest !== requestDigest || existing.ownerRunId !== ownerRunId)) {
+        throw new Error("operation owner does not match the durable operation");
+      }
+      if (existing && !existing.nativeCorrelated) {
+        throw new Error("legacy launch cannot be fenced by operation identity; reconcile and stop its existing child");
+      }
+      if (!existing) {
+        const now = this.#now();
+        this.#db.prepare(`INSERT INTO operations
+          (operation_id, request_digest, owner_run_id, native_correlated, cancel_requested, binding, created_at, updated_at)
+          VALUES (?, ?, ?, 1, 1, 'dispatching', ?, ?)`)
+          .run(operationId, requestDigest, ownerRunId ?? null, now, now);
+      } else {
+        this.#db.prepare("UPDATE operations SET cancel_requested = 1 WHERE operation_id = ?").run(operationId);
+      }
+      const record = this.get(operationId);
+      if (!record) throw new Error("Native cancellation intent could not be persisted");
+      return record;
+    });
+  }
+
+  getNativeByRunId(runId: string): OperationJournalRecord | undefined {
+    const row = this.#db.prepare("SELECT operation_id FROM operations WHERE run_id = ? AND native_correlated = 1").get(runId) as { operation_id: string } | undefined;
+    return row ? this.get(row.operation_id) : undefined;
   }
 
   bind(

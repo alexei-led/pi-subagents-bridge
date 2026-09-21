@@ -10,6 +10,8 @@ export default tseslint.config(
       "dist/",
       ".pi/",
       ".pi-subagents/",
+      ".native-test-*/",
+      ".test-output/",
       "*.tgz",
       ".eslintcache",
     ],

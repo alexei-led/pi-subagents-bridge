@@ -49,7 +49,7 @@ test("plan-exec v2 exposes durable lookup and native terminal proof", async (t) 
         durableOperationLookup: { version: 1 },
         processTerminalProof: { version: 1 },
       },
-      methods: ["ping", "spawn", "operation", "status", "result", "stop", "adopt"],
+      methods: ["ping", "spawn", "operation", "status", "result", "stop", "adopt", "cancelOperation"],
     },
   });
 
@@ -236,6 +236,8 @@ test("plan-exec v2 exposes durable lookup and native terminal proof", async (t) 
       asyncDir: "/tmp/v2-run",
       text: "Run: v2-run\nState: complete\nDir: /tmp/v2-run",
       processTerminal,
+      processTerminalProof: processTerminal,
+      lifecycleStatus: { processTerminal },
     },
   });
   rpc.dispose();
@@ -1168,6 +1170,7 @@ test("plan-exec ping advertises the supported generic methods", async (t) => {
         "result",
         "stop",
         "adopt",
+        "cancelOperation",
       ],
     },
   });

@@ -6,3 +6,6 @@ dist/
 .eslintcache
 *.tgz
 .DS_Store
+
+.native-test-*/
+.test-output/

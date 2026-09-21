@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
+import { parseExecutionLifetime, type ExecutionLifetime } from "./execution-lifetime.js";
 import {
   OperationJournal,
   type OperationJournalRecord,
@@ -23,11 +24,12 @@ const METHODS = [
   "result",
   "stop",
   "adopt",
+  "cancelOperation",
 ] as const;
 
 type Method = (typeof METHODS)[number];
 type ProtocolVersion = 1 | 2;
-type UpstreamMethod = "ping" | "spawn" | "status" | "stop";
+type UpstreamMethod = "ping" | "spawn" | "status" | "stop" | "lookup" | "cancel";
 type Unsubscribe = () => void;
 
 type EventBus = {
@@ -45,6 +47,7 @@ type Failure = {
 type Reply<T> = { success: true; data: T } | Failure;
 
 interface SpawnRequest {
+  executionLifetime?: ExecutionLifetime;
   protocolVersion: ProtocolVersion;
   operationId: string;
   fingerprint: string;
@@ -53,6 +56,7 @@ interface SpawnRequest {
 }
 
 interface SpawnResult {
+  effectiveExecutionLifetime?: ExecutionLifetime;
   runId: string;
   asyncDir?: string;
   requestDigest: string;
@@ -77,6 +81,10 @@ interface Observation {
   resultPath?: string;
   text?: string;
   processTerminal?: Record<string, unknown>;
+  processTerminalProof?: Record<string, unknown>;
+  workflowTerminalProof?: Record<string, unknown>;
+  lifecycleStatus?: Record<string, unknown>;
+  effectiveExecutionLifetime?: ExecutionLifetime;
 }
 
 interface StopResult {
@@ -159,6 +167,42 @@ function extractSpawnAsyncDir(reply: unknown): string | undefined {
   if (!isRecord(reply)) return undefined;
   const details = isRecord(reply.details) ? reply.details : undefined;
   return nonEmptyString(details?.asyncDir) ?? nonEmptyString(reply.asyncDir);
+}
+
+function extractEffectiveLifetime(reply: unknown): ExecutionLifetime | undefined {
+  if (!isRecord(reply)) return undefined;
+  return parseExecutionLifetime(reply.effectiveExecutionLifetime) ??
+    (isRecord(reply.details) ? parseExecutionLifetime(reply.details.effectiveExecutionLifetime) : undefined);
+}
+
+function supportsNativeLifetime(capabilities: Record<string, unknown> | undefined): boolean {
+  const lifetime = capabilities?.executionLifetime;
+  const operations = capabilities?.durableOperations;
+  return capabilities?.asyncSpawn === true && isRecord(lifetime) && lifetime.version === 1 && Array.isArray(lifetime.modes) &&
+    lifetime.modes.includes("unbounded") && lifetime.modes.includes("bounded") &&
+    isRecord(operations) && operations.version === 1 && operations.lookup === true &&
+    operations.replay === true && operations.cancelFence === true;
+}
+
+function normalizeNativeOperation(request: OperationRequest, upstream: unknown): Record<string, unknown> {
+  if (!isRecord(upstream) || upstream.operationId !== request.operationId ||
+    (request.requestDigest && upstream.digest !== request.requestDigest &&
+      !(upstream.state === "absent" && upstream.safeToReplay === true && upstream.digest === undefined))) {
+    throw new Error("pi-subagents operation identity mismatch");
+  }
+  const data = { ...upstream, requestDigest: upstream.digest ?? request.requestDigest };
+  const runId = nonEmptyString(upstream.runId);
+  if ("processTerminalProof" in data) {
+    const proof = runId ? extractProcessTerminal(upstream, runId) : undefined;
+    if (proof) data.processTerminalProof = proof;
+    else delete data.processTerminalProof;
+  }
+  if ("workflowTerminalProof" in data) {
+    const proof = runId ? extractWorkflowTerminal(upstream, runId) : undefined;
+    if (proof) data.workflowTerminalProof = proof;
+    else delete data.workflowTerminalProof;
+  }
+  return data;
 }
 
 function parseStatusLine(
@@ -272,6 +316,13 @@ function validateSpawn(
     );
   }
 
+  const executionLifetime = parseExecutionLifetime(params.executionLifetime);
+  if ("executionLifetime" in params && !executionLifetime) {
+    return failure("invalid_request", "spawn executionLifetime must be unbounded or bounded with a positive integer timeoutMs");
+  }
+  if (executionLifetime && ("timeout" in params || "timeoutMs" in params)) {
+    return failure("invalid_request", "spawn executionLifetime cannot be combined with legacy timeout fields");
+  }
   const topLevelCwd = validateOptionalString(raw, "cwd");
   const paramsCwd = validateOptionalString(params, "cwd");
   const timeout = validateOptionalTimeout(params, "timeout");
@@ -337,7 +388,8 @@ function validateSpawn(
     workflowScript: singleChildWorkflowScript(
       agent,
       task,
-      completionGuard === undefined ? {} : { completionGuard },
+      { ...(completionGuard === undefined ? {} : { completionGuard }),
+        ...(executionLifetime ? { executionLifetime, async: true } : {}) },
     ),
     async: true,
   };
@@ -349,6 +401,7 @@ function validateSpawn(
 
   return {
     protocolVersion,
+    ...(executionLifetime ? { executionLifetime } : {}),
     operationId,
     fingerprint,
     ...(owner ? { ownerRunId: owner.runId } : {}),
@@ -414,12 +467,12 @@ function extractProcessTerminal(
   upstream: unknown,
   expectedRunId: string,
 ): Record<string, unknown> | undefined {
-  if (!isRecord(upstream) || !isRecord(upstream.details)) return undefined;
-  const lifecycleStatus = upstream.details.lifecycleStatus;
-  if (!isRecord(lifecycleStatus) || !isRecord(lifecycleStatus.processTerminal)) {
-    return undefined;
-  }
-  const proof = lifecycleStatus.processTerminal;
+  if (!isRecord(upstream)) return undefined;
+  const details = isRecord(upstream.details) ? upstream.details : undefined;
+  const lifecycleStatus = details?.lifecycleStatus;
+  const proof = upstream.processTerminalProof ?? details?.processTerminalProof ??
+    (isRecord(lifecycleStatus) ? lifecycleStatus.processTerminal : undefined);
+  if (!isRecord(proof)) return undefined;
   const state = proof.state;
   if (
     proof.version !== 1 ||
@@ -460,6 +513,8 @@ function normalizeObservation(
   const processTerminal = includeProcessTerminal
     ? extractProcessTerminal(upstream, request.runId)
     : undefined;
+  const workflowTerminalProof = includeProcessTerminal ? extractWorkflowTerminal(upstream, request.runId) : undefined;
+  const effectiveExecutionLifetime = extractEffectiveLifetime(upstream);
   return {
     runId: request.runId,
     ...(observed ? { observed: true } : {}),
@@ -467,8 +522,26 @@ function normalizeObservation(
     ...(asyncDir ? { asyncDir } : {}),
     ...(resultPath ? { resultPath } : {}),
     ...(text ? { text } : {}),
-    ...(processTerminal ? { processTerminal } : {}),
+    ...(processTerminal ? { processTerminal, processTerminalProof: processTerminal } : {}),
+    ...(workflowTerminalProof ? { workflowTerminalProof } : {}),
+    ...(isRecord(upstream) && isRecord(upstream.details) && isRecord(upstream.details.lifecycleStatus)
+      ? { lifecycleStatus: upstream.details.lifecycleStatus } : {}),
+    ...(effectiveExecutionLifetime ? { effectiveExecutionLifetime } : {}),
   };
+}
+
+function extractWorkflowTerminal(upstream: unknown, runId: string): Record<string, unknown> | undefined {
+  if (!isRecord(upstream)) return undefined;
+  const details = isRecord(upstream.details) ? upstream.details : undefined;
+  const lifecycle = isRecord(details?.lifecycleStatus) ? details.lifecycleStatus : undefined;
+  const proof = upstream.workflowTerminalProof ?? details?.workflowTerminalProof ?? lifecycle?.workflowTerminalProof;
+  if (!isRecord(proof) || proof.version !== 1 || proof.kind !== "workflow" || proof.runId !== runId) return undefined;
+  if (proof.state === "observed" && proof.dispatchClosed === true && typeof proof.observedAt === "number" &&
+    Number.isFinite(proof.observedAt) && Array.isArray(proof.children) && proof.children.every((child: unknown) =>
+      isRecord(child) && typeof child.runId === "string" &&
+      extractProcessTerminal({ processTerminalProof: child }, child.runId)?.state === "observed")) return proof;
+  if (proof.state === "pending" || proof.state === "unknown") return proof;
+  return undefined;
 }
 
 function normalizeStop(request: RunRequest, upstream: unknown): StopResult {
@@ -674,6 +747,64 @@ export function registerPlanExecRpc(
 
   const transientControllers = new Set<AbortController>();
   let disposed = false;
+
+  const nativeRequest = async (method: UpstreamMethod, params: Record<string, unknown>): Promise<unknown> => {
+    const controller = new AbortController();
+    transientControllers.add(controller);
+    try {
+      return await requestSubagents(events, method, params, options.timeoutMs, controller.signal);
+    } finally {
+      transientControllers.delete(controller);
+    }
+  };
+
+  const nativeCapabilities = async (): Promise<void> => {
+    const upstream = await nativeRequest("ping", {});
+    if (!isRecord(upstream) || !isRecord(upstream.capabilities) || !supportsNativeLifetime(upstream.capabilities)) {
+      throw new Error("pi-subagents runtime does not support explicit executionLifetime and durable operation cancellation");
+    }
+  };
+
+  const startNativeOperation = async (request: SpawnRequest): Promise<Reply<SpawnResult>> => {
+    if (!state.journal || request.protocolVersion !== 2) {
+      return failure("invalid_request", "explicit executionLifetime requires bridge v2 and a durable journal");
+    }
+    try {
+      await nativeCapabilities();
+      const claim = state.journal.begin(request.operationId, request.fingerprint, request.ownerRunId, request.executionLifetime);
+      if (claim.record.requestDigest !== request.fingerprint || claim.record.ownerRunId !== request.ownerRunId) {
+        return failure("invalid_request", "spawn operationId was already used with different parameters");
+      }
+      if (!claim.created && !claim.record.nativeCorrelated) {
+        return failure("upstream_error", "legacy launch has no native correlation; its existing child must be reconciled before native replay");
+      }
+      if (claim.record.cancelRequested) {
+        await nativeRequest("cancel", { operationId: request.operationId, digest: request.fingerprint });
+        return failure("upstream_error", "operation cancellation was requested before dispatch");
+      }
+      const reply = await nativeRequest("spawn", {
+        ...request.params,
+        operationId: request.operationId,
+        digest: request.fingerprint,
+      });
+      const runId = extractSpawnRunId(reply);
+      const effectiveExecutionLifetime = extractEffectiveLifetime(reply);
+      if (!runId) throw new Error("pi-subagents spawn pending or cancelled; reconcile operation identity");
+      const asyncDir = extractSpawnAsyncDir(reply);
+      state.journal.bind(request.operationId, request.fingerprint, runId, asyncDir);
+      if (canonicalJson(effectiveExecutionLifetime) !== canonicalJson(request.executionLifetime)) {
+        throw new Error("pi-subagents effective executionLifetime mismatch; reconcile and cancel the known operation");
+      }
+      return {
+        success: true,
+        data: { runId, requestDigest: request.fingerprint,
+          ...(asyncDir ? { asyncDir } : {}),
+          ...(effectiveExecutionLifetime ? { effectiveExecutionLifetime } : {}) },
+      };
+    } catch (error: unknown) {
+      return failure("upstream_error", error instanceof Error ? error.message : String(error));
+    }
+  };
 
   const reconcilePendingBindings = (): void => {
     if (!state.journal || disposed) return;
@@ -902,6 +1033,7 @@ export function registerPlanExecRpc(
             protocol: "plan-exec-bridge",
             capabilities: {
               workflowScriptSpawn: capabilities?.asyncSpawn === true,
+              ...(supportsNativeLifetime(capabilities) ? { executionLifetime: { version: 1, modes: ["unbounded", "bounded"] }, durableOperations: capabilities?.durableOperations } : {}),
               durableOperationLookup: state.journal
                 ? { version: 1 }
                 : false,
@@ -909,6 +1041,9 @@ export function registerPlanExecRpc(
                 isRecord(terminalCapability) && terminalCapability.version === 1
                   ? { version: 1 }
                   : false,
+              ...(isRecord(capabilities?.workflowTerminalProof) && capabilities.workflowTerminalProof.version === 1
+                ? { workflowTerminalProof: { version: 1 } } : {}),
+              ...(isRecord(capabilities?.processTreeOwnership) ? { processTreeOwnership: capabilities.processTreeOwnership } : {}),
             },
             methods: [...METHODS],
           },
@@ -923,6 +1058,26 @@ export function registerPlanExecRpc(
       }
     }
 
+    if (method === "cancelOperation") {
+      const request = validateOperationRequest(raw, protocolVersion);
+      if (isFailure(request)) return request;
+      if (protocolVersion !== 2 || !request.requestDigest) return failure("invalid_request", "cancelOperation requires v2 operation ownership");
+      const durable = state.journal?.get(request.operationId);
+      if (durable) {
+        const invalid = validateOperationIdentity(request, durable.requestDigest, durable.ownerRunId);
+        if (invalid) return invalid;
+      }
+      try {
+        await nativeCapabilities();
+        if (!state.journal) throw new Error("cancelOperation requires a durable journal");
+        state.journal.requestNativeCancel(request.operationId, request.requestDigest, request.ownerRunId);
+        const result = await nativeRequest("cancel", { operationId: request.operationId, digest: request.requestDigest });
+        return { success: true, data: normalizeNativeOperation(request, result) };
+      } catch (error: unknown) {
+        return failure("upstream_error", error instanceof Error ? error.message : String(error));
+      }
+    }
+
     if (method === "spawn") {
       if (protocolVersion === 2 && !state.journal) {
         return failure(
@@ -932,7 +1087,7 @@ export function registerPlanExecRpc(
       }
       const request = validateSpawn(raw, protocolVersion);
       if (isFailure(request)) return request;
-      const outcome = await startOperation(request);
+      const outcome = request.executionLifetime ? await startNativeOperation(request) : await startOperation(request);
       if (!outcome.success || protocolVersion === 2) return outcome;
       const { requestDigest: _requestDigest, ...data } = outcome.data;
       return { success: true, data };
@@ -947,6 +1102,23 @@ export function registerPlanExecRpc(
       }
       const request = validateOperationRequest(raw, protocolVersion);
       if (isFailure(request)) return request;
+      const nativeRecord = state.journal?.get(request.operationId);
+      if (nativeRecord?.nativeCorrelated) {
+        const invalid = validateOperationIdentity(request, nativeRecord.requestDigest, nativeRecord.ownerRunId);
+        if (invalid) return invalid;
+        try {
+          if (nativeRecord.cancelRequested) {
+            await nativeRequest("cancel", { operationId: request.operationId, digest: nativeRecord.requestDigest });
+          }
+          const upstream = await nativeRequest("lookup", { operationId: request.operationId, digest: nativeRecord.requestDigest });
+          const data = normalizeNativeOperation(request, upstream);
+          const runId = nonEmptyString(data.runId);
+          if (runId) state.journal?.bind(request.operationId, nativeRecord.requestDigest, runId, nonEmptyString(data.asyncDir));
+          return { success: true, data };
+        } catch (error: unknown) {
+          return failure("upstream_error", error instanceof Error ? error.message : String(error));
+        }
+      }
       const operation = state.operations.get(request.operationId);
       if (operation) {
         const identityFailure = validateOperationIdentity(
@@ -1014,6 +1186,13 @@ export function registerPlanExecRpc(
     transientControllers.add(controller);
     try {
       if (method === "stop") {
+        const operation = state.journal?.getNativeByRunId(request.runId);
+        if (operation) {
+          state.journal?.requestNativeCancel(operation.operationId, operation.requestDigest, operation.ownerRunId);
+          const upstream = await nativeRequest("cancel", { operationId: operation.operationId, digest: operation.requestDigest });
+          const data = normalizeNativeOperation({ operationId: operation.operationId, requestDigest: operation.requestDigest }, upstream);
+          return { success: true, data: { ...data, runId: request.runId, state: "stopping" } };
+        }
         const upstream = await requestSubagents(
           events,
           "stop",
@@ -1028,6 +1207,16 @@ export function registerPlanExecRpc(
       }
 
       // pi-subagents exposes terminal result metadata through its status RPC.
+      const operation = state.journal?.getNativeByRunId(request.runId);
+      if (operation) {
+        if (operation.cancelRequested) await nativeRequest("cancel", { operationId: operation.operationId, digest: operation.requestDigest });
+        const upstream = await nativeRequest("lookup", { operationId: operation.operationId, digest: operation.requestDigest });
+        const data = normalizeNativeOperation({ operationId: operation.operationId, requestDigest: operation.requestDigest }, upstream);
+        const nativeState = nonEmptyString(data.status);
+        return { success: true, data: { ...data, runId: request.runId,
+          ...(nativeState ? { state: nativeState } : { state: "unknown" }),
+          ...(method === "adopt" ? { observed: true } : {}) } };
+      }
       const upstream = await requestSubagents(
         events,
         "status",

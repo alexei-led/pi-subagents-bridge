@@ -133,15 +133,49 @@ If `subagent:async-complete` does not arrive, the bridge polls `pi-subagents` `s
 
 This protocol is independent of `pi-tasks`. Version 1 remains available on `plan-exec:bridge:v1:request` with replies on `plan-exec:bridge:v1:reply:<requestId>`.
 
-Version 2 uses `plan-exec:bridge:v2:request` and `plan-exec:bridge:v2:reply:<requestId>`. It keeps the same `ping`, `spawn`, `operation`, `status`, `result`, `stop`, and `adopt` methods while adding durable launch identity and native process-terminal proof.
+Version 2 uses `plan-exec:bridge:v2:request` and `plan-exec:bridge:v2:reply:<requestId>`. It supports `ping`, `spawn`, `operation`, `status`, `result`, `stop`, `adopt`, and `cancelOperation` with durable launch identity and native process-terminal proof.
 
 - `ping` verifies the live `pi-subagents` RPC before advertising `workflowScriptSpawn`, `durableOperationLookup`, and `processTerminalProof` capabilities.
 - `spawn` requires `operationId`, `cwd` when needed, `params.agent`, `params.task`, and an owner `{ kind: "pi-plan-exec", runId, key, requestDigest }`. The digest is SHA-256 over canonical `{ cwd, params }`. The bridge rejects mismatches before dispatch.
-- The durable journal is written before the native spawn is emitted. A bound operation survives a full Pi restart. A dispatch with no durable native reply becomes `unknown`; the bridge never launches it again automatically.
-- `operation` never starts work. Version 2 returns `operationId`, `requestDigest`, and `absent`, `pending`, `found`, or `unknown` binding state.
+- The durable journal is written before the native spawn is emitted. A bound operation survives a full Pi restart. A legacy dispatch with no durable native reply becomes `unknown`; the bridge never launches it again automatically.
+- `operation` never starts work. Version 2 returns `operationId`, `requestDigest`, and `absent`, `pending`, `found`, `cancelled`, or `unknown` binding state. It redelivers a durable cancellation intent when needed.
 - `status` and `adopt` include a validated native `processTerminal` value when `pi-subagents` returns one. Only an `observed` proof with the matching run ID proves process termination.
 - `result` uses the native status RPC because `pi-subagents` has no separate result RPC. `stop` delegates to the native stop RPC.
-- `adopt` is observational. It does not silently transfer session ownership.
+- `adopt` is observational. It does not silently transfer session ownership. Native correlated runs use durable lookup for `status`, `result`, and `adopt`, and durable cancellation for `stop`, including after the originating session changes.
+
+Explicit execution lifetimes require v2. Set `params.executionLifetime` to
+`{ mode: "unbounded" }` or `{ mode: "bounded", timeoutMs: 1800000 }`.
+Do not combine this field with legacy `timeout` or `timeoutMs`. The bridge passes
+the lifetime to the workflow and its generated detached child call, includes it in the
+durable digest, and verifies the native `effectiveExecutionLifetime` reply.
+Omitting the field preserves legacy behavior.
+
+`ping` advertises `executionLifetime: { version: 1, modes: ["unbounded", "bounded"] }`
+only when the native runtime also supports durable lookup, replay, and cancellation
+fences. An incompatible runtime is rejected before spawn. Explicit requests use
+native `operationId` and `digest` correlation: `operation` can recover a lost spawn
+reply after restart, and replay keeps the original identity. `cancelOperation`
+takes the same `operationId` and owner, installs a native cancellation fence, and
+can return `cancelled` without a run ID when dispatch was prevented. A cancellation
+request or RPC timeout does not prove that a running child exited. Reconcile the
+native `processTerminalProof` (also exposed as `processTerminal`) and lifecycle
+observations before starting replacement work. A workflow uses the separate
+`workflowTerminalProof`: dispatch must be closed and every child must have its
+own observed process-terminal proof. The workflow's hosting Pi process can remain
+alive.
+
+The bridge forwards `processTreeOwnership` unchanged. The current native runtime
+reports POSIX process-group ownership with escaped descendants unverified. This
+does not establish containment of every descendant; clients requiring full tree
+ownership must reject that capability before dispatch. A process-group exit must
+not be upgraded to a complete process-tree proof.
+
+To test the full Bridge → native workflow → detached child path against a modified
+native source checkout, install that checkout's development dependencies and run
+`PI_SUBAGENTS_SOURCE=/path/to/pi-subagents npm run test:native`. This uses native
+test fixtures and keeps artifacts under `.native-test-*` in this checkout.
+Set `PI_PLAN_EXEC_SOURCE=/path/to/pi-plan-exec` as well to verify that its real
+client refuses the native process-group capability before any spawn.
 
 The journal defaults to `~/.pi/pi-subagents-bridge/plan-exec-operations.sqlite`. SQLite transactions provide crash recovery and cross-process serialization without a stale application lock. Version 1 clients retain their existing response shape and also benefit from durable bound-operation lookup. Operation identity rows are retained as idempotency records; automatic pruning could make an old operation ID dispatch again. Remove the database only after all referenced plan runs are permanently retired and duplicate-launch protection is no longer needed. Existing v1 accepted-run rows migrate fail-closed with no session identity; they require explicit manual recovery rather than unsafe cross-session delivery.
 
@@ -157,7 +191,7 @@ Because of that, the bridge also applies two execution defaults to bridge-spawne
 
 This avoids false pauses on missing acceptance reports and avoids misleading background `needs attention` notices for normal task runs. Repeated copies of one live request are coalesced only after their session and request digest match. The request ID is also journaled before native dispatch, so replay after the in-memory reply cache expires returns the existing run or fails closed as unknown instead of dispatching again. Transient persistence failures for known accepted runs and launch bindings are retried while the bridge process remains active.
 
-Accepted run IDs are tied to the originating Pi session ID and a leased process owner. A foreign Pi session cannot claim or delete them. The same resumed session can reclaim them after the owner exits or its heartbeat lease expires; the lease covers PID reuse. The owner renews its fence before emitting completion, and failed reconciliation is retried periodically. If another session wins ownership, the bridge stops polling and emits `subagents:warning` with code `accepted_run_ownership_lost` instead of silently dropping the run.
+Accepted run IDs are tied to the originating Pi session ID and a leased process owner. A foreign Pi session cannot claim or delete them. The same resumed session can reclaim them after the owner exits. An expired heartbeat alone cannot prove exit; a reused or still-live PID leaves ownership unresolved. The owner renews its fence before emitting completion, and failed reconciliation is retried periodically. If another session wins ownership, the bridge stops polling and emits `subagents:warning` with code `accepted_run_ownership_lost` instead of silently dropping the run.
 
 The legacy `pi-tasks` spawn request does not contain task ID, list ID, or attempt generation. Therefore the bridge cannot recover a task binding after a crash that occurs after native dispatch but before the run ID is received. The durable request becomes unknown and is not launched again automatically. The bridge does not use prompt matching.
 

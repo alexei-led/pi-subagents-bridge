@@ -170,15 +170,14 @@ test("accepted-run ownership is session-scoped and rejects foreign conflicts", (
   assert.equal(journal.ownsAcceptedRun("run-1", owner.instanceId, "session-b"), false);
 });
 
-test("an expired heartbeat allows takeover despite PID reuse and fences the old owner", (t) => {
+test("an expired heartbeat does not prove a live owner has exited", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-bridge-leases-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   let now = 1_000;
   const journal = new OperationJournal(path.join(root, "operations.sqlite"), () => now);
   const oldOwner = { pid: process.pid, instanceId: "old-owner" };
   const newOwner = { pid: process.pid, instanceId: "new-owner" };
-  journal.acceptRun("reused-pid-run", oldOwner, "session-a");
-
+  journal.acceptRun("live-run", oldOwner, "session-a");
   now = 2_001;
   assert.deepEqual(
     journal.claimAcceptedRuns(newOwner, "session-a", 1_000).map((run) => run.runId),
