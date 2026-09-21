@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import vm from "node:vm";
+import { DatabaseSync } from "node:sqlite";
 import { registerPlanExecRpc, PLAN_EXEC_V2_REPLY_PREFIX, PLAN_EXEC_V2_REQUEST_EVENT } from "../src/plan-exec-rpc.js";
 import { parseExecutionLifetime } from "../src/execution-lifetime.js";
 import { OperationJournal } from "../src/operation-journal.js";
@@ -18,6 +18,7 @@ function canonical(value: unknown): string {
 
 const capabilities = {
   asyncSpawn: true,
+  processTreeOwnership: { version: 1, scope: "owned-process-tree", escapedDescendants: "contained", routes: ["single-async", "owned-workflow"], requestMode: "kernel" },
   executionLifetime: { version: 1, modes: ["unbounded", "bounded"] },
   durableOperations: { version: 1, lookup: true, replay: true, cancelFence: true, scope: "repository" },
 };
@@ -42,7 +43,7 @@ function harness(journalPath: string, native: (method: string, params: Record<st
   return { request, dispose: () => rpc.dispose() };
 }
 
-test("explicit lifetime reaches emitted workflow and real child parameters, and survives restart and lost spawn replies", async (t) => {
+test("explicit lifetime reaches the direct owned child and survives restart and lost spawn replies", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-lifetime-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const params = { agent: "worker", task: "Long silent tool", executionLifetime: { mode: "unbounded" } };
@@ -60,13 +61,11 @@ test("explicit lifetime reaches emitted workflow and real child parameters, and 
       launches++;
       assert.deepEqual(input.executionLifetime, { mode: "unbounded" });
       assert.equal(input.timeoutMs, undefined);
-      const runs = { run(_name: string, child: Record<string, unknown>) {
-        assert.equal(child.async, true);
-        assert.equal(JSON.stringify(child.executionLifetime), JSON.stringify({ mode: "unbounded" }));
-        assert.equal(child.timeoutMs, undefined);
-        assert.equal(child.agent, "worker");
-      } };
-      vm.runInNewContext(`(function() { ${String(input.workflowScript)} })()`, { runs });
+      assert.equal(input.workflowScript, undefined);
+      assert.equal(input.agent, "worker");
+      assert.equal(input.task, params.task);
+      assert.equal(input.async, true);
+      assert.deepEqual(input.executionOwnership, { mode: "kernel" });
       record = { state: "found", operationId: "operation", digest, runId: "native-run", effectiveExecutionLifetime: params.executionLifetime };
       return undefined;
     }
@@ -74,6 +73,10 @@ test("explicit lifetime reaches emitted workflow and real child parameters, and 
     return record;
   };
   const first = harness(path.join(root, "journal.sqlite"), native);
+  const ping = await first.request("ping");
+  const advertised = (ping.data as Record<string, unknown>).capabilities as Record<string, unknown>;
+  assert.equal(advertised.singleAgentSpawn, true);
+  assert.deepEqual((advertised.processTreeOwnership as Record<string, unknown>).routes, ["single-async"]);
   assert.equal((await first.request("spawn", body)).success, false);
   first.dispose();
   const resumed = harness(path.join(root, "journal.sqlite"), native);
@@ -114,6 +117,27 @@ test("lifetime validation rejects hidden sentinels and ambiguous objects", () =>
   assert.deepEqual(parseExecutionLifetime({ mode: "bounded", timeoutMs: 10 }), { mode: "bounded", timeoutMs: 10 });
 });
 
+test("a weak provider or unsupported owned route is rejected before any direct spawn", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-weak-provider-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const params = { agent: "worker", task: "work", executionLifetime: { mode: "unbounded" } };
+  const requestDigest = `sha256:${createHash("sha256").update(canonical({ params })).digest("hex")}`;
+  for (const [index, ownership] of [
+    { version: 1, scope: "posix-process-group", escapedDescendants: "unverified" },
+    { ...capabilities.processTreeOwnership, routes: ["workflow"] },
+  ].entries()) {
+    const methods: string[] = [];
+    const bridge = harness(path.join(root, `journal-${index}.sqlite`), (method) => {
+      methods.push(method);
+      return { capabilities: { ...capabilities, processTreeOwnership: ownership } };
+    });
+    t.after(bridge.dispose);
+    const reply = await bridge.request("spawn", { operationId: "op", owner: { kind: "pi-plan-exec", runId: "plan", key: "op", requestDigest }, params });
+    assert.equal(reply.success, false);
+    assert.deepEqual(methods, ["ping"]);
+  }
+});
+
 test("cancel before delayed dispatch persists its native fence through a bridge restart", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-fence-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -148,13 +172,11 @@ test("bounded lifetime and effective mode are preserved without legacy timeout a
     if (method === "ping") return { capabilities };
     assert.deepEqual(input.executionLifetime, params.executionLifetime);
     assert.equal(input.timeoutMs, undefined);
-    vm.runInNewContext(`(function() { ${String(input.workflowScript)} })()`, {
-      runs: { run(_name: string, child: Record<string, unknown>) {
-        assert.equal(child.async, true);
-        assert.equal(JSON.stringify(child.executionLifetime), JSON.stringify(params.executionLifetime));
-      } },
-    });
-    return { runId: "bounded", effectiveExecutionLifetime: params.executionLifetime };
+    assert.equal(input.workflowScript, undefined);
+    assert.equal(input.agent, "worker");
+    assert.equal(input.async, true);
+    assert.deepEqual(input.executionOwnership, { mode: "kernel" });
+    return { operationId: input.operationId, digest: input.digest, runId: "bounded", effectiveExecutionLifetime: params.executionLifetime };
   });
   t.after(bridge.dispose);
   const result = await bridge.request("spawn", { operationId: "op", owner: { kind: "pi-plan-exec", runId: "plan", key: "op", requestDigest: digest }, params });
@@ -181,4 +203,44 @@ test("a crash after local cancellation intent resumes the fence before any nativ
   const reply = await resumed.request("spawn", { operationId: "op", owner: { kind: "pi-plan-exec", runId: "plan", key: "op", requestDigest: digest }, params });
   assert.equal(reply.success, false);
   assert.equal(cancelled, 1);
+});
+
+test("replay preserves the frozen native request instead of recomputing its dispatch parameters", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-frozen-native-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const journalPath = path.join(root, "journal.sqlite");
+  const params = { agent: "worker", task: "work", executionLifetime: { mode: "unbounded" as const } };
+  const digest = `sha256:${createHash("sha256").update(canonical({ params })).digest("hex")}`;
+  const frozen = { operationId: "native-operation", digest: "native-digest", agent: "resolved-worker", task: "resolved task", executionLifetime: params.executionLifetime, executionOwnership: { mode: "kernel" }, async: true };
+  new OperationJournal(journalPath).begin("op", digest, "plan", params.executionLifetime, frozen);
+  const bridge = harness(journalPath, (method, input) => {
+    if (method === "ping") return { capabilities };
+    assert.equal(method, "spawn");
+    assert.deepEqual(input, frozen);
+    return { operationId: input.operationId, digest: input.digest, runId: "native-run", effectiveExecutionLifetime: params.executionLifetime };
+  });
+  t.after(bridge.dispose);
+  const reply = await bridge.request("spawn", { operationId: "op", owner: { kind: "pi-plan-exec", runId: "plan", key: "op", requestDigest: digest }, params });
+  assert.equal(reply.success, true);
+});
+
+test("v4 native intents without frozen parameters migrate to lookup-only reconciliation", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-v4-native-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const journalPath = path.join(root, "journal.sqlite");
+  const params = { agent: "worker", task: "work", executionLifetime: { mode: "unbounded" as const } };
+  const digest = `sha256:${createHash("sha256").update(canonical({ params })).digest("hex")}`;
+  new OperationJournal(journalPath).begin("op", digest, "plan", params.executionLifetime);
+  const db = new DatabaseSync(journalPath);
+  db.exec("ALTER TABLE operations DROP COLUMN native_params; PRAGMA user_version = 4");
+  db.close();
+  const bridge = harness(journalPath, (method) => {
+    if (method === "ping") return { capabilities };
+    assert.equal(method, "lookup");
+    return { operationId: "op", digest, state: "found", runId: "prior-workflow", effectiveExecutionLifetime: params.executionLifetime };
+  });
+  t.after(bridge.dispose);
+  const reply = await bridge.request("spawn", { operationId: "op", owner: { kind: "pi-plan-exec", runId: "plan", key: "op", requestDigest: digest }, params });
+  assert.equal(reply.success, true);
+  assert.equal((reply.data as Record<string, unknown>).runId, "prior-workflow");
 });

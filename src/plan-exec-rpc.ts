@@ -6,6 +6,7 @@ import {
   type OperationJournalRecord,
 } from "./operation-journal.js";
 import { singleChildWorkflowScript } from "./workflow-spawn.js";
+import { attestNativeTerminalProof, nativeOperationIdentity } from "./native-proof.js";
 
 export const PLAN_EXEC_REQUEST_EVENT = "plan-exec:bridge:v1:request";
 export const PLAN_EXEC_REPLY_PREFIX = "plan-exec:bridge:v1:reply:";
@@ -184,18 +185,43 @@ function supportsNativeLifetime(capabilities: Record<string, unknown> | undefine
     operations.replay === true && operations.cancelFence === true;
 }
 
-function normalizeNativeOperation(request: OperationRequest, upstream: unknown): Record<string, unknown> {
-  if (!isRecord(upstream) || upstream.operationId !== request.operationId ||
-    (request.requestDigest && upstream.digest !== request.requestDigest &&
+function supportsOwnedSingle(capabilities: Record<string, unknown>): boolean {
+  const ownership = capabilities.processTreeOwnership;
+  return isRecord(ownership) && ownership.version === 1 && ownership.scope === "owned-process-tree" &&
+    ownership.escapedDescendants === "contained" && ownership.requestMode === "kernel" &&
+    Array.isArray(ownership.routes) && ownership.routes.includes("single-async");
+}
+
+function normalizeNativeOperation(operation: OperationJournalRecord, upstream: unknown): Record<string, unknown> {
+  const native = nativeOperationIdentity(operation);
+  if (!isRecord(upstream) || upstream.operationId !== native.operationId ||
+    (upstream.digest !== native.digest &&
       !(upstream.state === "absent" && upstream.safeToReplay === true && upstream.digest === undefined))) {
     throw new Error("pi-subagents operation identity mismatch");
   }
-  const data = { ...upstream, requestDigest: upstream.digest ?? request.requestDigest };
+  const data: Record<string, unknown> = { ...upstream, operationId: operation.operationId, requestDigest: operation.requestDigest,
+    callerBinding: { operationId: operation.operationId, requestDigest: operation.requestDigest } };
   const runId = nonEmptyString(upstream.runId);
+  if (operation.runId && runId && operation.runId !== runId) throw new Error("pi-subagents runId does not match the durable operation");
   if ("processTerminalProof" in data) {
-    const proof = runId ? extractProcessTerminal(upstream, runId) : undefined;
+    const rawProof = data.processTerminalProof;
+    const isKernelProof = isRecord(rawProof) && ("kernelProof" in rawProof || "kernelBinding" in rawProof ||
+      (isRecord(operation.nativeParams?.executionOwnership) && operation.nativeParams.executionOwnership.mode === "kernel"));
+    const proof = runId ? isKernelProof && isRecord(rawProof) && rawProof.state === "observed"
+      ? attestNativeTerminalProof(rawProof, operation, runId)
+      : extractProcessTerminal(upstream, runId) : undefined;
     if (proof) data.processTerminalProof = proof;
-    else delete data.processTerminalProof;
+    else {
+      delete data.processTerminalProof;
+      if (isRecord(rawProof) && rawProof.state === "observed") {
+        data.state = "unknown";
+        data.status = "unknown";
+        data.reason = "Native terminal proof does not match the durable caller, native, and kernel bindings";
+      }
+    }
+    if (isRecord(data.statusPayload)) {
+      data.statusPayload = { ...data.statusPayload, processTerminalProof: proof };
+    }
   }
   if ("workflowTerminalProof" in data) {
     const proof = runId ? extractWorkflowTerminal(upstream, runId) : undefined;
@@ -323,6 +349,9 @@ function validateSpawn(
   if (executionLifetime && ("timeout" in params || "timeoutMs" in params)) {
     return failure("invalid_request", "spawn executionLifetime cannot be combined with legacy timeout fields");
   }
+  if (executionLifetime && ("workflowScript" in params || "workflow" in params || "ownedWorkflow" in params)) {
+    return failure("invalid_request", "explicit executionLifetime only supports a direct async agent task");
+  }
   const topLevelCwd = validateOptionalString(raw, "cwd");
   const paramsCwd = validateOptionalString(params, "cwd");
   const timeout = validateOptionalTimeout(params, "timeout");
@@ -405,7 +434,8 @@ function validateSpawn(
     operationId,
     fingerprint,
     ...(owner ? { ownerRunId: owner.runId } : {}),
-    params: forwarded,
+    params: executionLifetime ? { ...params, agent, task, async: true, executionOwnership: { mode: "kernel" },
+      ...(cwd !== undefined ? { cwd } : {}) } : forwarded,
   };
 }
 
@@ -758,10 +788,15 @@ export function registerPlanExecRpc(
     }
   };
 
-  const nativeCapabilities = async (): Promise<void> => {
+  const nativeCapabilities = async (requireOwnership = false): Promise<void> => {
     const upstream = await nativeRequest("ping", {});
     if (!isRecord(upstream) || !isRecord(upstream.capabilities) || !supportsNativeLifetime(upstream.capabilities)) {
       throw new Error("pi-subagents runtime does not support explicit executionLifetime and durable operation cancellation");
+    }
+    if (requireOwnership && !supportsOwnedSingle(upstream.capabilities)) {
+      const ownership = upstream.capabilities.processTreeOwnership;
+      const reason = isRecord(ownership) ? nonEmptyString(ownership.reason) : undefined;
+      throw new Error(`pi-subagents runtime does not support kernel-owned single-async execution on this host${reason ? `: ${reason}` : ""}`);
     }
   };
 
@@ -770,8 +805,14 @@ export function registerPlanExecRpc(
       return failure("invalid_request", "explicit executionLifetime requires bridge v2 and a durable journal");
     }
     try {
-      await nativeCapabilities();
-      const claim = state.journal.begin(request.operationId, request.fingerprint, request.ownerRunId, request.executionLifetime);
+      const existing = state.journal.get(request.operationId);
+      if (existing?.nativeCorrelated && existing.cancelRequested && existing.requestDigest === request.fingerprint && existing.ownerRunId === request.ownerRunId) {
+        await nativeRequest("cancel", nativeOperationIdentity(existing));
+        return failure("upstream_error", "operation cancellation was requested before dispatch");
+      }
+      await nativeCapabilities(true);
+      const nativeParams = { ...request.params, operationId: request.operationId, digest: request.fingerprint };
+      const claim = state.journal.begin(request.operationId, request.fingerprint, request.ownerRunId, request.executionLifetime, nativeParams);
       if (claim.record.requestDigest !== request.fingerprint || claim.record.ownerRunId !== request.ownerRunId) {
         return failure("invalid_request", "spawn operationId was already used with different parameters");
       }
@@ -779,14 +820,15 @@ export function registerPlanExecRpc(
         return failure("upstream_error", "legacy launch has no native correlation; its existing child must be reconciled before native replay");
       }
       if (claim.record.cancelRequested) {
-        await nativeRequest("cancel", { operationId: request.operationId, digest: request.fingerprint });
+        await nativeRequest("cancel", nativeOperationIdentity(claim.record));
         return failure("upstream_error", "operation cancellation was requested before dispatch");
       }
-      const reply = await nativeRequest("spawn", {
-        ...request.params,
-        operationId: request.operationId,
-        digest: request.fingerprint,
-      });
+      const frozen = claim.record.nativeParams;
+      const canReplay = frozen && nonEmptyString(frozen.operationId) && nonEmptyString(frozen.digest) &&
+        isRecord(frozen.executionOwnership) && frozen.executionOwnership.mode === "kernel";
+      const upstream = await nativeRequest(canReplay ? "spawn" : "lookup",
+        canReplay ? frozen : nativeOperationIdentity(claim.record));
+      const reply = normalizeNativeOperation(claim.record, upstream);
       const runId = extractSpawnRunId(reply);
       const effectiveExecutionLifetime = extractEffectiveLifetime(reply);
       if (!runId) throw new Error("pi-subagents spawn pending or cancelled; reconcile operation identity");
@@ -1026,6 +1068,7 @@ export function registerPlanExecRpc(
           ? upstream.capabilities
           : undefined;
         const terminalCapability = capabilities?.processTerminalProof;
+        const ownershipCapability = capabilities?.processTreeOwnership;
         return {
           success: true,
           data: {
@@ -1033,6 +1076,8 @@ export function registerPlanExecRpc(
             protocol: "plan-exec-bridge",
             capabilities: {
               workflowScriptSpawn: capabilities?.asyncSpawn === true,
+              ...(capabilities && supportsNativeLifetime(capabilities) && supportsOwnedSingle(capabilities)
+                ? { singleAgentSpawn: true } : {}),
               ...(supportsNativeLifetime(capabilities) ? { executionLifetime: { version: 1, modes: ["unbounded", "bounded"] }, durableOperations: capabilities?.durableOperations } : {}),
               durableOperationLookup: state.journal
                 ? { version: 1 }
@@ -1043,7 +1088,10 @@ export function registerPlanExecRpc(
                   : false,
               ...(isRecord(capabilities?.workflowTerminalProof) && capabilities.workflowTerminalProof.version === 1
                 ? { workflowTerminalProof: { version: 1 } } : {}),
-              ...(isRecord(capabilities?.processTreeOwnership) ? { processTreeOwnership: capabilities.processTreeOwnership } : {}),
+              ...(isRecord(ownershipCapability) &&
+                (ownershipCapability.scope !== "owned-process-tree" || (capabilities && supportsOwnedSingle(capabilities)))
+                ? { processTreeOwnership: ownershipCapability.scope === "owned-process-tree"
+                  ? { ...ownershipCapability, routes: ["single-async"] } : ownershipCapability } : {}),
             },
             methods: [...METHODS],
           },
@@ -1070,9 +1118,9 @@ export function registerPlanExecRpc(
       try {
         await nativeCapabilities();
         if (!state.journal) throw new Error("cancelOperation requires a durable journal");
-        state.journal.requestNativeCancel(request.operationId, request.requestDigest, request.ownerRunId);
-        const result = await nativeRequest("cancel", { operationId: request.operationId, digest: request.requestDigest });
-        return { success: true, data: normalizeNativeOperation(request, result) };
+        const cancelled = state.journal.requestNativeCancel(request.operationId, request.requestDigest, request.ownerRunId);
+        const result = await nativeRequest("cancel", nativeOperationIdentity(cancelled));
+        return { success: true, data: normalizeNativeOperation(cancelled, result) };
       } catch (error: unknown) {
         return failure("upstream_error", error instanceof Error ? error.message : String(error));
       }
@@ -1108,10 +1156,10 @@ export function registerPlanExecRpc(
         if (invalid) return invalid;
         try {
           if (nativeRecord.cancelRequested) {
-            await nativeRequest("cancel", { operationId: request.operationId, digest: nativeRecord.requestDigest });
+            await nativeRequest("cancel", nativeOperationIdentity(nativeRecord));
           }
-          const upstream = await nativeRequest("lookup", { operationId: request.operationId, digest: nativeRecord.requestDigest });
-          const data = normalizeNativeOperation(request, upstream);
+          const upstream = await nativeRequest("lookup", nativeOperationIdentity(nativeRecord));
+          const data = normalizeNativeOperation(nativeRecord, upstream);
           const runId = nonEmptyString(data.runId);
           if (runId) state.journal?.bind(request.operationId, nativeRecord.requestDigest, runId, nonEmptyString(data.asyncDir));
           return { success: true, data };
@@ -1185,13 +1233,22 @@ export function registerPlanExecRpc(
     const controller = new AbortController();
     transientControllers.add(controller);
     try {
+      let operation: OperationJournalRecord | undefined;
+      try {
+        operation = state.journal?.getByRunId(request.runId);
+      } catch (error: unknown) {
+        return { success: true, data: { runId: request.runId, state: "unknown",
+          reason: error instanceof Error ? error.message : String(error) } };
+      }
+      if (protocolVersion === 2 && !operation) {
+        return { success: true, data: { runId: request.runId, state: "unknown", reason: "No durable caller-to-native mapping exists for this runId" } };
+      }
       if (method === "stop") {
-        const operation = state.journal?.getNativeByRunId(request.runId);
-        if (operation) {
+        if (operation?.nativeCorrelated) {
           state.journal?.requestNativeCancel(operation.operationId, operation.requestDigest, operation.ownerRunId);
-          const upstream = await nativeRequest("cancel", { operationId: operation.operationId, digest: operation.requestDigest });
-          const data = normalizeNativeOperation({ operationId: operation.operationId, requestDigest: operation.requestDigest }, upstream);
-          return { success: true, data: { ...data, runId: request.runId, state: "stopping" } };
+          const upstream = await nativeRequest("cancel", nativeOperationIdentity(operation));
+          const data = normalizeNativeOperation(operation, upstream);
+          return { success: true, data: { ...data, runId: request.runId, state: data.state === "unknown" ? "unknown" : "stopping" } };
         }
         const upstream = await requestSubagents(
           events,
@@ -1207,11 +1264,10 @@ export function registerPlanExecRpc(
       }
 
       // pi-subagents exposes terminal result metadata through its status RPC.
-      const operation = state.journal?.getNativeByRunId(request.runId);
-      if (operation) {
-        if (operation.cancelRequested) await nativeRequest("cancel", { operationId: operation.operationId, digest: operation.requestDigest });
-        const upstream = await nativeRequest("lookup", { operationId: operation.operationId, digest: operation.requestDigest });
-        const data = normalizeNativeOperation({ operationId: operation.operationId, requestDigest: operation.requestDigest }, upstream);
+      if (operation?.nativeCorrelated) {
+        if (operation.cancelRequested) await nativeRequest("cancel", nativeOperationIdentity(operation));
+        const upstream = await nativeRequest("lookup", nativeOperationIdentity(operation));
+        const data = normalizeNativeOperation(operation, upstream);
         const nativeState = nonEmptyString(data.status);
         return { success: true, data: { ...data, runId: request.runId,
           ...(nativeState ? { state: nativeState } : { state: "unknown" }),

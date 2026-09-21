@@ -145,9 +145,12 @@ Version 2 uses `plan-exec:bridge:v2:request` and `plan-exec:bridge:v2:reply:<req
 
 Explicit execution lifetimes require v2. Set `params.executionLifetime` to
 `{ mode: "unbounded" }` or `{ mode: "bounded", timeoutMs: 1800000 }`.
-Do not combine this field with legacy `timeout` or `timeoutMs`. The bridge passes
-the lifetime to the workflow and its generated detached child call, includes it in the
-durable digest, and verifies the native `effectiveExecutionLifetime` reply.
+Do not combine this field with legacy `timeout` or `timeoutMs`. The bridge sends
+the agent and task directly to the native async executor with
+`executionOwnership: { mode: "kernel" }`, includes the lifetime in the durable
+digest, and verifies the native `effectiveExecutionLifetime` reply. Explicit
+lifetimes do not accept arbitrary workflow scripts. The exact native launch
+parameters are frozen in the journal and reused after restart.
 Omitting the field preserves legacy behavior.
 
 `ping` advertises `executionLifetime: { version: 1, modes: ["unbounded", "bounded"] }`
@@ -164,18 +167,36 @@ observations before starting replacement work. A workflow uses the separate
 own observed process-terminal proof. The workflow's hosting Pi process can remain
 alive.
 
-The bridge forwards `processTreeOwnership` unchanged. The current native runtime
-reports POSIX process-group ownership with escaped descendants unverified. This
-does not establish containment of every descendant; clients requiring full tree
-ownership must reject that capability before dispatch. A process-group exit must
-not be upgraded to a complete process-tree proof.
+Explicit launches also require `processTreeOwnership` to advertise
+`scope: "owned-process-tree"`, `escapedDescendants: "contained"`,
+`routes: ["single-async"]`, and `requestMode: "kernel"`. A provider must establish
+these capabilities on the current host before the bridge dispatches work. A
+POSIX process-group-only provider remains unsupported, and its weaker descriptor
+is preserved for diagnostics. The bridge never upgrades group exit into full
+process-tree proof. Cancellation and lookup remain available for existing runs
+when the owned execution route becomes unavailable.
 
-To test the full Bridge → native workflow → detached child path against a modified
+The pinned native backend supports this route on macOS arm64/x64 with the current
+user's launchd GUI domain and `/usr/bin/clang`. Its first probe builds the private
+helper in the runtime artifact directory. Unsupported hosts fail preflight before
+spawn. `singleAgentSpawn` identifies this supported direct route;
+`workflowScriptSpawn` describes the separate legacy wrapper capability.
+
+Observed kernel proofs include three distinct bindings: the bridge's
+`callerBinding`, the native RPC's `nativeOperation`, and the prepared kernel
+request's `kernelBinding`. The bridge validates their persisted relationship
+without equating unrelated digests. A missing or ambiguous run-ID mapping returns
+`unknown`; it cannot attest a foreign terminal proof.
+
+To test the full Bridge → native owned async child path against a modified
 native source checkout, install that checkout's development dependencies and run
 `PI_SUBAGENTS_SOURCE=/path/to/pi-subagents npm run test:native`. This uses native
 test fixtures and keeps artifacts under `.native-test-*` in this checkout.
-Set `PI_PLAN_EXEC_SOURCE=/path/to/pi-plan-exec` as well to verify that its real
-client refuses the native process-group capability before any spawn.
+The native source must match the immutable dependency pin and have no tracked
+modifications. During coordinated local development only,
+`PI_NATIVE_CONTRACT_DEVELOPMENT=1` allows testing an uncommitted native checkout.
+Set `PI_PLAN_EXEC_SOURCE=/path/to/pi-plan-exec` as well to verify the real client's
+capability negotiation and rejection of a weaker provider before any spawn.
 
 The journal defaults to `~/.pi/pi-subagents-bridge/plan-exec-operations.sqlite`. SQLite transactions provide crash recovery and cross-process serialization without a stale application lock. Version 1 clients retain their existing response shape and also benefit from durable bound-operation lookup. Operation identity rows are retained as idempotency records; automatic pruning could make an old operation ID dispatch again. Remove the database only after all referenced plan runs are permanently retired and duplicate-launch protection is no longer needed. Existing v1 accepted-run rows migrate fail-closed with no session identity; they require explicit manual recovery rather than unsafe cross-session delivery.
 

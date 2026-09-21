@@ -3,9 +3,9 @@ import path from "node:path";
 import { parseExecutionLifetime, type ExecutionLifetime } from "./execution-lifetime.js";
 import { DatabaseSync } from "node:sqlite";
 
-const JOURNAL_VERSION = 4;
-// Schemas 0-5 are known: 4 is written here, 5 adds only optional fields.
-const COMPATIBLE_JOURNAL_VERSIONS = [0, 1, 2, 3, JOURNAL_VERSION, 5];
+const JOURNAL_VERSION = 5;
+// Schemas 0-5 are known; legacy versions migrate below to the current schema.
+const COMPATIBLE_JOURNAL_VERSIONS = [0, 1, 2, 3, 4, JOURNAL_VERSION];
 const BUSY_TIMEOUT_MS = 2_000;
 
 export type OperationBinding = "dispatching" | "bound" | "unknown";
@@ -40,6 +40,7 @@ export interface OperationJournalRecord {
   executionLifetime?: ExecutionLifetime;
   nativeCorrelated?: boolean;
   cancelRequested?: boolean;
+  nativeParams?: Record<string, unknown>;
   operationId: string;
   requestDigest: string;
   ownerRunId?: string;
@@ -55,6 +56,7 @@ interface OperationRow {
   execution_lifetime: string | null;
   native_correlated: number;
   cancel_requested: number;
+  native_params: string | null;
   operation_id: string;
   request_digest: string;
   owner_run_id: string | null;
@@ -90,9 +92,14 @@ interface AcceptedRunRow {
 function operationRecord(row: OperationRow): OperationJournalRecord {
   const executionLifetime = row.execution_lifetime ? parseExecutionLifetime(JSON.parse(row.execution_lifetime)) : undefined;
   if (row.execution_lifetime && !executionLifetime) throw new Error("Invalid persisted execution lifetime");
+  const nativeParams: unknown = row.native_params ? JSON.parse(row.native_params) : undefined;
+  if (nativeParams !== undefined && (typeof nativeParams !== "object" || nativeParams === null || Array.isArray(nativeParams))) {
+    throw new Error("Invalid persisted native launch parameters");
+  }
   return {
     ...(row.native_correlated ? { nativeCorrelated: true } : {}),
     ...(row.cancel_requested ? { cancelRequested: true } : {}),
+    ...(nativeParams ? { nativeParams: nativeParams as Record<string, unknown> } : {}),
     operationId: row.operation_id,
     ...(executionLifetime ? { executionLifetime } : {}),
     requestDigest: row.request_digest,
@@ -177,6 +184,7 @@ export class OperationJournal {
         execution_lifetime TEXT,
         native_correlated INTEGER NOT NULL DEFAULT 0,
         cancel_requested INTEGER NOT NULL DEFAULT 0,
+        native_params TEXT,
         binding TEXT NOT NULL CHECK (binding IN ('dispatching', 'bound', 'unknown')),
         run_id TEXT,
         async_dir TEXT,
@@ -210,7 +218,7 @@ export class OperationJournal {
     `);
     if (version === 0) {
       this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
-    } else if (version === 1 || version === 2 || version === 3) {
+    } else if (version === 1 || version === 2 || version === 3 || version === 4) {
       this.#transaction(() => {
         if (version === 1) {
           this.#db.exec(`
@@ -220,7 +228,10 @@ export class OperationJournal {
               ADD COLUMN owner_heartbeat_at INTEGER NOT NULL DEFAULT 0;
           `);
         }
-        this.#db.exec("ALTER TABLE operations ADD COLUMN execution_lifetime TEXT; ALTER TABLE operations ADD COLUMN native_correlated INTEGER NOT NULL DEFAULT 0; ALTER TABLE operations ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0");
+        if (version !== 4) {
+          this.#db.exec("ALTER TABLE operations ADD COLUMN execution_lifetime TEXT; ALTER TABLE operations ADD COLUMN native_correlated INTEGER NOT NULL DEFAULT 0; ALTER TABLE operations ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0");
+        }
+        this.#db.exec("ALTER TABLE operations ADD COLUMN native_params TEXT");
         this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
       });
     }
@@ -408,7 +419,7 @@ export class OperationJournal {
   get(operationId: string): OperationJournalRecord | undefined {
     const row = this.#db
       .prepare(
-        `SELECT operation_id, request_digest, owner_run_id, execution_lifetime, native_correlated, cancel_requested, binding, run_id,
+        `SELECT operation_id, request_digest, owner_run_id, execution_lifetime, native_correlated, cancel_requested, native_params, binding, run_id,
                 async_dir, error, created_at, updated_at
            FROM operations
           WHERE operation_id = ?`,
@@ -422,6 +433,7 @@ export class OperationJournal {
     requestDigest: string,
     ownerRunId?: string,
     executionLifetime?: ExecutionLifetime,
+    nativeParams?: Record<string, unknown>,
   ): { created: boolean; record: OperationJournalRecord } {
     return this.#transaction(() => {
       const existing = this.get(operationId);
@@ -431,10 +443,10 @@ export class OperationJournal {
       this.#db
         .prepare(
           `INSERT INTO operations
-             (operation_id, request_digest, owner_run_id, execution_lifetime, native_correlated, binding, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, 'dispatching', ?, ?)`,
+             (operation_id, request_digest, owner_run_id, execution_lifetime, native_correlated, native_params, binding, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)`,
         )
-        .run(operationId, requestDigest, ownerRunId ?? null, executionLifetime ? JSON.stringify(executionLifetime) : null, executionLifetime ? 1 : 0, now, now);
+        .run(operationId, requestDigest, ownerRunId ?? null, executionLifetime ? JSON.stringify(executionLifetime) : null, executionLifetime ? 1 : 0, nativeParams ? JSON.stringify(nativeParams) : null, now, now);
       const record = this.get(operationId);
       if (!record) {
         throw new Error(`Operation journal failed to create '${operationId}'`);
@@ -467,9 +479,10 @@ export class OperationJournal {
     });
   }
 
-  getNativeByRunId(runId: string): OperationJournalRecord | undefined {
-    const row = this.#db.prepare("SELECT operation_id FROM operations WHERE run_id = ? AND native_correlated = 1").get(runId) as { operation_id: string } | undefined;
-    return row ? this.get(row.operation_id) : undefined;
+  getByRunId(runId: string): OperationJournalRecord | undefined {
+    const rows = this.#db.prepare("SELECT operation_id FROM operations WHERE run_id = ? LIMIT 2").all(runId) as unknown as { operation_id: string }[];
+    if (rows.length > 1) throw new Error("Native runId mapping is ambiguous");
+    return rows[0] ? this.get(rows[0].operation_id) : undefined;
   }
 
   bind(

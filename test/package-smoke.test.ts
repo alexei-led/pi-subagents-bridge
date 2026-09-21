@@ -58,6 +58,7 @@ test("npm pack includes only the runtime extension package", async (t) => {
     "package.json",
     "src/execution-lifetime.ts",
     "src/index.ts",
+    "src/native-proof.ts",
     "src/operation-journal.ts",
     "src/plan-exec-rpc.ts",
     "src/workflow-spawn.ts",
@@ -69,6 +70,7 @@ test("npm pack includes only the runtime extension package", async (t) => {
     "src/plan-exec-rpc.ts",
     "src/workflow-spawn.ts",
     "src/execution-lifetime.ts",
+    "src/native-proof.ts",
   ]);
   assert.deepEqual(manifest.pi.extensions, ["./src/index.ts"]);
   assert.match(manifest.pi.image ?? "", /^https:\/\//);

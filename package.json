@@ -24,7 +24,8 @@
     "src/operation-journal.ts",
     "src/plan-exec-rpc.ts",
     "src/workflow-spawn.ts",
-    "src/execution-lifetime.ts"
+    "src/execution-lifetime.ts",
+    "src/native-proof.ts"
   ],
   "type": "module",
   "main": "./src/index.ts",
@@ -49,7 +50,7 @@
     "eslint": "^10.6.0",
     "globals": "^17.7.0",
     "jiti": "^2.7.0",
-    "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#7a9f03a97c19468f92a9ec78551955da9ef580a7",
+    "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#e56cf1233aacb7ad7795e4645d9e06583b13e384",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.1"
   },
