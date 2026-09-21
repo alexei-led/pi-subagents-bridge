@@ -50,7 +50,7 @@
     "eslint": "^10.6.0",
     "globals": "^17.7.0",
     "jiti": "^2.7.0",
-    "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#778d7aeac0c6a8056f316f2e2a38381570c7bcae",
+    "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#83d0f646eceeaa9e858406afe4ba2c5f8ff5ed8a",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.1"
   },

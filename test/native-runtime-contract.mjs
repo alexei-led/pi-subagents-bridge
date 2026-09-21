@@ -218,6 +218,48 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     assertOwnedProof(lookup);
     if (mainProofValidator) assert.equal(mainProofValidator(lookup.data, lookup.data.runId, { operationId: body.operationId, requestDigest }), true);
     assert.equal(fixture.mockPi.callCount(), 1);
+    const rejectedParams = { ...params, agent: "unknown-agent" };
+    const rejectedDigest = `sha256:${createHash("sha256").update(canonical({ cwd: fixture.tempDir, params: rejectedParams })).digest("hex")}`;
+    const rejectedBody = { ...body, params: rejectedParams, operationId: "unknown-agent-operation",
+      owner: { ...body.owner, key: "unknown-agent-operation", requestDigest: rejectedDigest } };
+    const rejectedLaunch = coldClient
+      ? await coldClient.spawn(rejectedBody.operationId, { ...rejectedParams, cwd: fixture.tempDir }, rejectedBody.owner)
+      : await request("spawn", rejectedBody);
+    assert.equal(rejectedLaunch.success, true, JSON.stringify(rejectedLaunch));
+    const rejectedLookup = coldClient
+      ? await coldClient.operation(rejectedBody.operationId, rejectedBody.owner)
+      : await request("operation", rejectedBody);
+    assert.equal(rejectedLookup.success, true, JSON.stringify(rejectedLookup));
+    assert.equal(rejectedLookup.data.neverStarted, true);
+    assert.equal(rejectedLookup.data.operationId, rejectedBody.operationId);
+    assert.equal(rejectedLookup.data.requestDigest, rejectedDigest);
+    assert.equal(rejectedLookup.data.runId, rejectedLaunch.data.runId);
+    assert.notEqual(rejectedLookup.data.processTerminalProof?.state, "observed");
+    if (mainProofValidator) assert.equal(mainProofValidator(rejectedLookup.data, rejectedLookup.data.runId,
+      { operationId: rejectedBody.operationId, requestDigest: rejectedDigest }), false);
+    const admissionFiles = fs.readdirSync(fixture.ASYNC_DIR, { recursive: true })
+      .filter((entry) => entry.endsWith("admission-rejected.json"));
+    const admissionFile = admissionFiles.map((entry) => path.join(fixture.ASYNC_DIR, entry))
+      .find((file) => JSON.parse(fs.readFileSync(file, "utf8")).operationId === rejectedBody.operationId);
+    assert.ok(admissionFile);
+    assert.equal(fs.existsSync(path.join(path.dirname(admissionFile), "owned", "request.json")), false);
+    const rejectedFence = coldClient
+      ? await coldClient.cancelOperation(rejectedBody.operationId, rejectedBody.owner)
+      : await request("cancelOperation", rejectedBody);
+    assert.equal(rejectedFence.success, true, JSON.stringify(rejectedFence));
+    assert.equal(rejectedFence.data.state, "cancelled");
+    assert.equal(rejectedFence.data.neverStarted, true);
+    assert.equal(rejectedFence.data.cancellationRequested, true);
+    assert.equal(rejectedFence.data.operationId, rejectedBody.operationId);
+    assert.equal(rejectedFence.data.requestDigest, rejectedDigest);
+    bridgeRpc.dispose();
+    bridgeRpc = bridge.registerPlanExecRpc(events, { timeoutMs: 12000, journalPath });
+    const rejectedReplay = coldClient
+      ? await coldClient.spawn(rejectedBody.operationId, { ...rejectedParams, cwd: fixture.tempDir }, rejectedBody.owner)
+      : await request("spawn", rejectedBody);
+    assert.equal(rejectedReplay.success, false, JSON.stringify(rejectedReplay));
+    assert.equal(fixture.mockPi.callCount(), 1);
+    t.diagnostic("Unknown-agent admission produced a caller-bound no-start cancellation fence without a kernel proof or worker dispatch");
     const fencedBody = { ...body, operationId: "cancel-before-dispatch", owner: { ...body.owner, key: "cancel-before-dispatch" } };
     const fenced = await request("cancelOperation", fencedBody);
     assert.equal(fenced.success, true, JSON.stringify(fenced));
