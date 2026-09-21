@@ -115,12 +115,17 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
         emitter.emit(event, value);
       },
     };
+    execFileSync("git", ["init", "--quiet", fixture.tempDir]);
+    execFileSync("git", ["-C", fixture.tempDir, "-c", "user.name=Bridge Test", "-c", "user.email=bridge-test@example.invalid",
+      "commit", "--quiet", "--allow-empty", "-m", "Fixture base"]);
+    const originalHead = execFileSync("git", ["-C", fixture.tempDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const worktreeBaseDir = path.join(artifacts, "ambient-worktrees");
     const ctx = helpers.makeMinimalCtx(fixture.tempDir);
     ctx.sessionManager.getSessionId = () => "bridge-native-contract";
     const state = { baseCwd: fixture.tempDir, currentSessionId: "bridge-native-contract", asyncJobs: new Map(),
       foregroundControls: new Map(), lastForegroundControlId: null, workflowControllers: new Map() };
     const executor = fixture.createSubagentExecutor({ pi: { events, getSessionName: () => undefined, sendMessage() {} }, state,
-      config: { timeoutMs: 5 }, asyncByDefault: false, tempArtifactsDir: fixture.tempDir,
+      config: { timeoutMs: 5, worktree: true, worktreeProvider: "native", worktreeBaseDir }, asyncByDefault: false, tempArtifactsDir: fixture.tempDir,
       getSubagentSessionRoot: () => fixture.tempDir, expandTilde: (value) => value,
       discoverAgents: () => ({ agents: [{ ...helpers.makeAgent("worker"), defaultTimeoutMs: 5 }] }), });
     fixture.mockPi.onCall({ delay: 200, output: "native detached child finished" });
@@ -150,7 +155,7 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
       emitter.once(`${bridge.PLAN_EXEC_V2_REPLY_PREFIX}${requestId}`, (reply) => { clearTimeout(timer); resolve(reply); });
       events.emit(bridge.PLAN_EXEC_V2_REQUEST_EVENT, { version: 2, requestId, method, ...body });
     });
-    const params = { agent: "worker", task: "Say native detached child finished", executionLifetime: { mode: "unbounded" }, acceptance: false, mission: false, context: "fresh" };
+    const params = { agent: "worker", task: "Say native detached child finished", executionLifetime: { mode: "unbounded" }, worktree: false, acceptance: false, mission: false, context: "fresh" };
     const requestDigest = `sha256:${createHash("sha256").update(canonical({ cwd: fixture.tempDir, params })).digest("hex")}`;
     const body = { cwd: fixture.tempDir, params, operationId: "bridge-native-operation",
       owner: { kind: "pi-plan-exec", runId: "plan", key: "bridge-native-operation", requestDigest } };
@@ -519,5 +524,12 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     cleanupBody = undefined;
     assert.equal(fixture.mockPi.callCount(), 4);
     t.diagnostic("Bounded expiry after helper death reaches the main client as failed with a retirement proof despite missing exit metadata");
+    const childCalls = fs.readdirSync(fixture.mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+      .map((name) => JSON.parse(fs.readFileSync(path.join(fixture.mockPi.dir, name), "utf8")));
+    assert.equal(childCalls.length, 4);
+    for (const call of childCalls) assert.equal(call.cwd, fixture.tempDir);
+    assert.equal(execFileSync("git", ["-C", fixture.tempDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), originalHead);
+    assert.equal(fs.existsSync(worktreeBaseDir), false);
+    t.diagnostic("Explicit worktree false kept every owned child in the original caller cwd and HEAD despite ambient worktree true");
   });
 });
