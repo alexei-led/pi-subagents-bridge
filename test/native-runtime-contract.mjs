@@ -91,6 +91,7 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     let dropSpawnReply = true;
     let dropDiagnosticReply = false;
     let nativeSpawnRequests = 0;
+    const nativeSpawnIdentities = [];
     let weakProvider = false;
     const events = {
       on(event, handler) { emitter.on(event, handler); return () => emitter.off(event, handler); },
@@ -99,7 +100,10 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
           value = { ...value, data: { ...value.data, capabilities: { ...value.data.capabilities,
             processTreeOwnership: { version: 1, scope: "posix-process-group", escapedDescendants: "unverified" } } } };
         }
-        if (event === "subagents:rpc:v1:request" && value.method === "spawn") nativeSpawnRequests++;
+        if (event === "subagents:rpc:v1:request" && value.method === "spawn") {
+          nativeSpawnRequests++;
+          nativeSpawnIdentities.push({ operationId: value.params.operationId, digest: value.params.digest });
+        }
         if (dropSpawnReply && event.startsWith("subagents:rpc:v1:reply:") && value.method === "spawn") {
           dropSpawnReply = false;
           return;
@@ -122,7 +126,7 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     fixture.mockPi.onCall({ delay: 200, output: "native detached child finished" });
     const delayedNode = delayedNodeExecutable();
     let firstExecution = true;
-    const nativeRpc = native.registerSubagentRpcBridge({ events, state, asyncDirRoot: fixture.ASYNC_DIR, getContext: () => ctx,
+    let nativeRpc = native.registerSubagentRpcBridge({ events, state, asyncDirRoot: fixture.ASYNC_DIR, getContext: () => ctx,
       execute: async (...args) => {
         if (!firstExecution || !args[1].rpcOperationRunId) return executor.execute(...args);
         firstExecution = false;
@@ -340,6 +344,7 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     cleanupBody = stoppingBody;
     const live = await request("spawn", stoppingBody);
     assert.equal(live.success, true, JSON.stringify(live));
+    const originalLiveIdentity = nativeSpawnIdentities.at(-1);
     await fixture.waitForMockPiRuntime(fixture.mockPi, 1, 30_000);
     const escapedDeadline = Date.now() + 10_000;
     while (!fs.existsSync(marker) && Date.now() < escapedDeadline) await new Promise((resolve) => setTimeout(resolve, 50));
@@ -379,7 +384,29 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     const matchingGuidance = messages.filter((entry) => typeof entry.text === "string" && entry.text.includes(diagnostic.params.message));
     assert.equal(matchingGuidance.length, 1, JSON.stringify(messages));
     assert.equal(matchingGuidance[0].mode, "followUp");
-    const stop = await request("stop", { params: { runId: live.data.runId } });
+    const launchesBeforeColdCancel = nativeSpawnRequests;
+    bridgeRpc.dispose();
+    nativeRpc.dispose();
+    state.asyncJobs.clear();
+    state.foregroundControls.clear();
+    state.workflowControllers.clear();
+    ctx.sessionManager.getSessionId = () => "cold-restored-session";
+    state.currentSessionId = "cold-restored-session";
+    nativeRpc = native.registerSubagentRpcBridge({ events, state, asyncDirRoot: fixture.ASYNC_DIR, getContext: () => ctx,
+      execute: (...args) => executor.execute(...args) });
+    bridgeRpc = bridge.registerPlanExecRpc(events, { timeoutMs: 12000, journalPath });
+    const coldLookupClient = mainModule ? new mainModule.BridgeClient(events, 12000) : undefined;
+    const coldLookup = coldLookupClient
+      ? await coldLookupClient.operation(stoppingBody.operationId, stoppingBody.owner)
+      : await request("operation", stoppingBody);
+    assert.equal(coldLookup.success, true, JSON.stringify(coldLookup));
+    assert.equal(coldLookup.data.runId, live.data.runId);
+    assert.equal(coldLookup.data.operationId, stoppingBody.operationId);
+    assert.equal(coldLookup.data.requestDigest, requestDigest);
+    const coldCancelClient = mainModule ? new mainModule.BridgeClient(events, 12000) : undefined;
+    const stop = coldCancelClient
+      ? await coldCancelClient.cancelOperation(stoppingBody.operationId, stoppingBody.owner)
+      : await request("stop", { params: { runId: live.data.runId } });
     assert.equal(stop.success, true, JSON.stringify(stop));
     assert.equal(stop.data.cancellationRequested, true);
     assert.equal(stop.data.neverStarted, false);
@@ -390,6 +417,9 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
       stopped = await request("operation", stoppingBody);
     }
     assertOwnedProof(stopped);
+    assert.equal(stopped.data.runId, live.data.runId);
+    assert.deepEqual(stopped.data.processTerminalProof.nativeOperation, originalLiveIdentity);
+    assert.equal(nativeSpawnRequests, launchesBeforeColdCancel);
     const childId = stopped.data.runId;
     const childStatus = JSON.parse(fs.readFileSync(path.join(fixture.ASYNC_DIR, childId, "status.json"), "utf8"));
     assert.equal(childStatus.stopped, true, JSON.stringify(childStatus));
@@ -399,7 +429,7 @@ describe("bridge with native RPC and a kernel-owned direct async runner", () => 
     assert.throws(() => process.kill(escapedPid, 0), { code: "ESRCH" });
     cleanupBody = undefined;
     assert.equal(fixture.mockPi.callCount(), 2);
-    t.diagnostic("Known-ID stop retired the owned root and killed its reparented detached descendant");
+    t.diagnostic("Fresh main clients without capability negotiation recovered and cancelled the original worker after Bridge/native RPC recreation");
     t.diagnostic("Confirmed tool-error guidance queued once across a lost reply and Bridge restart; unconfirmed tools and stopped runs rejected");
     fs.rmSync(marker);
     fixture.mockPi.onCall({ delay: 120000, output: "must not outlive a crashed root" });
