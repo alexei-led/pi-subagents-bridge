@@ -50,7 +50,8 @@ Bridge decisions:
 - `requestDigest` is `sha256:` plus SHA-256 of canonical JSON `{ cwd: effectiveTopLevelCwd, params: originalParams }`.
 - A journal record is persisted before native dispatch. `dispatching` records that cannot be proven bound are `unknown` and never retried automatically.
 - Version 2 ping negotiates native `pi-subagents` capabilities. `processTerminalProof: { version: 1 }` is advertised only when upstream advertises version 1.
-- Status and adopt pass through only validated native `details.lifecycleStatus.processTerminal`; proof state `observed` is the only terminal proof.
+- Status and adopt pass through validated native `details.lifecycleStatus.processTerminal` with proof state `observed`.
+- A persistent workflow host publishes no exit of its own: when `details.workflowChildren` is version 1, carries the matching `workflowRunId`, `inventoryComplete: true`, a terminal `workflowState` (`completed`, `failed`, or `stopped`), and every child has an attested process-terminal proof, the bridge synthesizes `{ version: 1, kind: "workflow", state: "observed", runId, dispatchClosed: true, observedAt, children }`. Child proofs come from the cached `subagent:process-terminal` event or, on a cache miss, the child's upstream-written `process-terminal.json` next to the parent's async directory.
 - Owner and digest mismatches fail before native dispatch. Operation lookup is durable and never starts a child.
 
 ## pi-subagents v1 RPC contract
