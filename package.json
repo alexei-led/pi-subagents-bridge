@@ -43,14 +43,14 @@
     "test:native": "node --experimental-strip-types --test test/native-runtime-contract.mjs"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.86.1",
+    "@earendil-works/pi-coding-agent": "0.87.0",
     "@eslint/js": "^10.0.1",
     "@tintinweb/pi-tasks": "0.9.0",
     "@types/node": "^24.10.0",
     "eslint": "^10.6.0",
     "globals": "^17.7.0",
     "jiti": "^2.7.0",
-    "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#689d9378c4526826813da4ccd2402a9cd1acd036",
+    "pi-subagents": "git+https://github.com/alexei-led/pi-subagents-codex-fix.git#e78595340ff36ad481e205c0872fadba9412227d",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.1"
   },

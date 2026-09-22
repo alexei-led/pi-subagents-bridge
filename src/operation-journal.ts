@@ -241,11 +241,10 @@ export class OperationJournal {
   claimAcceptedRuns(
     owner: AcceptedRunOwner,
     sessionId: string,
-    leaseMs: number,
+    _leaseMs: number,
   ): AcceptedRunJournalRecord[] {
     return this.#transaction(() => {
       const now = this.#now();
-      const staleBefore = now - leaseMs;
       const rows = this.#db
         .prepare(
           `SELECT run_id, async_dir, accepted_at, session_id, owner_pid,
@@ -267,7 +266,7 @@ export class OperationJournal {
           claimed.push(acceptedRunRecord({ ...row, owner_heartbeat_at: now }));
           continue;
         }
-        if (isProcessAlive(row.owner_pid) && row.owner_heartbeat_at >= staleBefore) {
+        if (isProcessAlive(row.owner_pid)) {
           continue;
         }
         const result = this.#db

@@ -21,18 +21,15 @@ for (const version of [4, 5]) {
     const db = new DatabaseSync(journalPath);
     t.after(() => db.close());
     db.exec(`
-      ALTER TABLE operations ADD COLUMN execution_lifetime TEXT;
-      ALTER TABLE operations ADD COLUMN native_correlated INTEGER NOT NULL DEFAULT 0;
-      ALTER TABLE operations ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;
       UPDATE operations SET execution_lifetime = '{"mode":"unbounded"}',
         native_correlated = 1, cancel_requested = 1;
       PRAGMA user_version = ${version};
     `);
-    if (version === 5) {
-      db.exec(`
-        ALTER TABLE operations ADD COLUMN native_params TEXT;
-        UPDATE operations SET native_params = '{"task":"preserved"}';
-      `);
+    if (version === 4) {
+      // Schema 4 predates native_params; reopening migrates it to the current schema.
+      db.exec("ALTER TABLE operations DROP COLUMN native_params;");
+    } else {
+      db.exec("UPDATE operations SET native_params = '{\"task\":\"preserved\"}'");
     }
 
     const journal = new OperationJournal(journalPath);
@@ -42,15 +39,13 @@ for (const version of [4, 5]) {
     assert.equal(journal.bind("new", "sha256:new", "new-run").runId, "new-run");
     assert.equal(journal.getLegacySpawn("legacy")?.runId, "legacy-run");
     assert.equal(journal.ownsAcceptedRun("accepted-run", "instance-a", "session-a"), true);
-    assert.equal(db.prepare("PRAGMA user_version").get()?.user_version, version);
+    assert.equal(db.prepare("PRAGMA user_version").get()?.user_version, 5);
     const row = db.prepare("SELECT * FROM operations WHERE operation_id = 'existing'").get();
     assert.ok(row);
     assert.equal(row.execution_lifetime, '{"mode":"unbounded"}');
     assert.equal(row.native_correlated, 1);
     assert.equal(row.cancel_requested, 1);
-    if (version === 5) {
-      assert.equal(row.native_params, '{"task":"preserved"}');
-    }
+    assert.equal(row.native_params, version === 5 ? '{"task":"preserved"}' : null);
   });
 }
 
@@ -179,15 +174,11 @@ test("an expired heartbeat does not prove a live owner has exited", (t) => {
   const newOwner = { pid: process.pid, instanceId: "new-owner" };
   journal.acceptRun("live-run", oldOwner, "session-a");
   now = 2_001;
-  assert.deepEqual(
-    journal.claimAcceptedRuns(newOwner, "session-a", 1_000).map((run) => run.runId),
-    ["reused-pid-run"],
-  );
-  assert.equal(journal.ownsAcceptedRun("reused-pid-run", oldOwner.instanceId, "session-a"), false);
-  assert.equal(journal.ownsAcceptedRun("reused-pid-run", newOwner.instanceId, "session-a"), true);
-
-  journal.completeRun("reused-pid-run", oldOwner.instanceId, "session-a");
-  assert.equal(journal.ownsAcceptedRun("reused-pid-run", newOwner.instanceId, "session-a"), true);
+  assert.deepEqual(journal.claimAcceptedRuns(newOwner, "session-a", 1_000), []);
+  assert.equal(journal.ownsAcceptedRun("live-run", oldOwner.instanceId, "session-a"), true);
+  assert.equal(journal.ownsAcceptedRun("live-run", newOwner.instanceId, "session-a"), false);
+  journal.completeRun("live-run", newOwner.instanceId, "session-a");
+  assert.equal(journal.ownsAcceptedRun("live-run", oldOwner.instanceId, "session-a"), true);
 });
 
 test("accepted runs stay with one live process and transfer after owner exit", (t) => {
