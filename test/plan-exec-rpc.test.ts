@@ -1233,6 +1233,132 @@ function upstreamReplyEvent(requestId: string): string {
   return `${SUBAGENTS_REPLY_PREFIX}${requestId}`;
 }
 
+test('plan-exec v2 synthesizes a workflow terminal proof from closed child dispatch', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-subagents-bridge-'));
+  const journalPath = path.join(root, 'operations.json');
+  onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
+  const bus = new FakeEventBus();
+  const rpc = registerPlanExecRpc(bus, { timeoutMs: 100, journalPath });
+  onTestFinished(() => rpc.dispose());
+
+  const ping = once(bus, v2ReplyEvent('wf-ping'));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: 'wf-ping',
+    method: 'ping',
+  });
+  const pingUpstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(pingUpstream));
+  replyUpstream(bus, pingUpstream, 'ping', {
+    version: 1,
+    capabilities: {
+      asyncSpawn: true,
+      processTerminalProof: { version: 1, lifecycleArtifactVersion: 3 },
+      events: { processTerminal: 'subagent:process-terminal' },
+    },
+  });
+  await ping;
+
+  const operationId = 'wf-operation';
+  const params = {
+    agent: 'worker',
+    task: 'Workflow host task.',
+    mission: false,
+  };
+  const requestDigest = digest({ cwd: '/tmp/wf-worktree', params });
+  const owner = {
+    kind: 'pi-plan-exec',
+    runId: 'plan-run-wf',
+    key: operationId,
+    requestDigest,
+  } as const;
+  const spawned = once(bus, v2ReplyEvent('wf-spawn'));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: 'wf-spawn',
+    method: 'spawn',
+    operationId,
+    owner,
+    cwd: '/tmp/wf-worktree',
+    params,
+  });
+  const spawnUpstream = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(spawnUpstream));
+  replyUpstream(bus, spawnUpstream, 'spawn', {
+    details: { runId: 'parent-run', asyncDir: '/tmp/parent-run' },
+  });
+  assert.deepEqual(await spawned, {
+    success: true,
+    data: { runId: 'parent-run', asyncDir: '/tmp/parent-run', requestDigest },
+  });
+
+  const requestStatus = async (requestId: string): Promise<unknown> => {
+    const status = once(bus, v2ReplyEvent(requestId));
+    bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+      version: 2,
+      requestId,
+      method: 'status',
+      params: { runId: 'parent-run', asyncDir: '/tmp/parent-run' },
+    });
+    return status;
+  };
+  const replyParent = (): void => {
+    const request = bus.last(SUBAGENTS_REQUEST_EVENT);
+    assert.ok(isRecord(request));
+    replyUpstream(bus, request, 'status', {
+      text: 'Run: parent-run\nState: complete\nDir: /tmp/parent-run',
+      details: {
+        workflowChildren: {
+          version: 1,
+          parentToolCallId: 'call-1',
+          workflowRunId: 'parent-run',
+          inventoryComplete: true,
+          workflowState: 'completed',
+          children: [
+            { childId: 'main', state: 'completed', runId: 'child-run' },
+          ],
+        },
+      },
+    });
+  };
+
+  // Without the child's writer-exit proof there is no terminal evidence yet.
+  const pending = requestStatus('wf-status-pending');
+  replyParent();
+  const pendingData = await pending;
+  assert.ok(isRecord(pendingData) && pendingData.success === true);
+  const pendingBody = pendingData.data as Record<string, unknown>;
+  assert.equal(pendingBody.state, 'complete');
+  assert.equal('workflowTerminalProof' in pendingBody, false);
+
+  const childProof = {
+    version: 1,
+    state: 'observed',
+    runId: 'child-run',
+    runnerProcessInstanceId: 'child-runner-1',
+    observedAt: 4321,
+    instances: [],
+  };
+  bus.emit('subagent:process-terminal', childProof);
+
+  const proven = requestStatus('wf-status-proven');
+  replyParent();
+  const provenData = await proven;
+  assert.ok(isRecord(provenData) && provenData.success === true);
+  assert.deepEqual(
+    (provenData.data as Record<string, unknown>).workflowTerminalProof,
+    {
+      version: 1,
+      kind: 'workflow',
+      state: 'observed',
+      runId: 'parent-run',
+      dispatchClosed: true,
+      observedAt: 4321,
+      children: [childProof],
+    },
+  );
+});
+
 function replyUpstream(
   bus: FakeEventBus,
   request: Record<string, unknown>,
