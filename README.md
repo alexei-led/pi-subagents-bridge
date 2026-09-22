@@ -199,11 +199,11 @@ operation, request digest, diagnostic ID, and tool-call ID, with
 An enqueue receipt does not confirm a repair. Cancellation fences late guidance;
 this method does not start or revive a worker.
 
-The bridge is validated against the released pi-subagents runtime by the
-Vitest suite in this repository. The installed end-to-end path (controller,
-Bridge, native RPC, owned workers, checks, review, promotion, archive) is
-exercised from pi-plan-exec with `npm run test:runtime-smoke`; that smoke run
-covers the real client's capability negotiation as well.
+The Vitest suite covers the bridge protocol against capability fixtures. The
+installed end-to-end path (controller, Bridge, native RPC, owned workers,
+checks, review, promotion, archive) is exercised from pi-plan-exec with
+`npm run test:runtime-smoke`; that smoke run also covers the real client's
+capability negotiation against the released runtime.
 
 The journal defaults to `~/.pi/pi-subagents-bridge/plan-exec-operations.sqlite`. SQLite transactions provide crash recovery and cross-process serialization without a stale application lock. Version 1 clients retain their existing response shape and also benefit from durable bound-operation lookup. Operation identity rows are retained as idempotency records; automatic pruning could make an old operation ID dispatch again. Remove the database only after all referenced plan runs are permanently retired and duplicate-launch protection is no longer needed. Existing v1 accepted-run rows migrate fail-closed with no session identity; they require explicit manual recovery rather than unsafe cross-session delivery.
 
