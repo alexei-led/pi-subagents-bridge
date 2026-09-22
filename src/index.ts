@@ -1,11 +1,11 @@
-import { createHash, randomUUID } from "node:crypto";
-import * as fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { OperationJournal } from "./operation-journal.js";
-import { registerPlanExecRpc } from "./plan-exec-rpc.js";
-import { singleChildWorkflowScript } from "./workflow-spawn.js";
+import { createHash, randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { OperationJournal } from './operation-journal.js';
+import { registerPlanExecRpc } from './plan-exec-rpc.js';
+import { singleChildWorkflowScript } from './workflow-spawn.js';
 
 // Protocol evidence (installed sources verified against pi-subagents@0.60.0
 // and @tintinweb/pi-tasks@0.9.0):
@@ -19,16 +19,16 @@ import { singleChildWorkflowScript } from "./workflow-spawn.js";
 //   subagent-runner.ts:3066-3073 complete/failed/paused state values.
 // - pi-subagents src/agents/agents.ts:31-40 builtin names and
 //   src/agents/agent-selection.ts:4-19 exact-name merge; pi-tasks examples need aliases.
-const PING_CHANNEL = "subagents:rpc:ping";
-const SPAWN_CHANNEL = "subagents:rpc:spawn";
-const STOP_CHANNEL = "subagents:rpc:stop";
-const COMPLETED_EVENT = "subagents:completed";
-const FAILED_EVENT = "subagents:failed";
-const READY_EVENT = "subagents:ready";
-const WARNING_EVENT = "subagents:warning";
-const NB_REQUEST_CHANNEL = "subagents:rpc:v1:request";
-const NB_COMPLETE_EVENT = "subagent:async-complete";
-const NB_REPLY_PREFIX = "subagents:rpc:v1:reply:";
+const PING_CHANNEL = 'subagents:rpc:ping';
+const SPAWN_CHANNEL = 'subagents:rpc:spawn';
+const STOP_CHANNEL = 'subagents:rpc:stop';
+const COMPLETED_EVENT = 'subagents:completed';
+const FAILED_EVENT = 'subagents:failed';
+const READY_EVENT = 'subagents:ready';
+const WARNING_EVENT = 'subagents:warning';
+const NB_REQUEST_CHANNEL = 'subagents:rpc:v1:request';
+const NB_COMPLETE_EVENT = 'subagent:async-complete';
+const NB_REPLY_PREFIX = 'subagents:rpc:v1:reply:';
 const DEFAULT_SPAWN_TIMEOUT_MS = 24_000;
 const DEFAULT_COMPLETION_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_MAX_ACTIVE_RUNS = 2;
@@ -39,15 +39,15 @@ const DEFAULT_ACCEPTED_RUN_LEASE_MS = 30_000;
 const MAX_FAILURE_PARTIAL_OUTPUT_CHARS = 4_000;
 
 const AGENT_TYPE_ALIASES = new Map<string, string>([
-  ["general-purpose", "delegate"],
-  ["Explore", "scout"],
-  ["explore", "scout"],
+  ['general-purpose', 'delegate'],
+  ['Explore', 'scout'],
+  ['explore', 'scout'],
 ]);
 
 const BRIDGE_ACCEPTANCE_CONFIG = {
-  level: "none",
+  level: 'none',
   reason:
-    "pi-tasks bridge manages task lifecycle and result propagation; do not require pi-subagents acceptance reports.",
+    'pi-tasks bridge manages task lifecycle and result propagation; do not require pi-subagents acceptance reports.',
 } as const;
 
 const BRIDGE_CONTROL_CONFIG = {
@@ -68,11 +68,12 @@ interface BridgeOptions {
   operationJournal?: OperationJournal;
 }
 
-type BridgeHost = Pick<ExtensionAPI, "events">;
+type BridgeHost = Pick<ExtensionAPI, 'events'>;
 type Unsubscribe = () => void;
 type RpcReply<T> =
-  { success: true; data: T } | { success: false; error: string };
-type CompletionKind = "completed" | "failed" | "stopped";
+  | { success: true; data: T }
+  | { success: false; error: string };
+type CompletionKind = 'completed' | 'failed' | 'stopped';
 
 interface BridgeRegistration {
   dispose(): void;
@@ -109,9 +110,9 @@ interface BridgeState {
   registration?: BridgeRegistration;
 }
 
-const bridgeStates = new WeakMap<BridgeHost["events"], BridgeState>();
+const bridgeStates = new WeakMap<BridgeHost['events'], BridgeState>();
 const PROCESS_OWNER_KEY = Symbol.for(
-  "pi-subagents-bridge.accepted-run-owner.v1",
+  'pi-subagents-bridge.accepted-run-owner.v1',
 );
 
 interface ProcessOwnerStore {
@@ -149,11 +150,11 @@ interface AsyncCompleteRaw {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function text(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim().length > 0
+  return typeof value === 'string' && value.trim().length > 0
     ? value.trim()
     : undefined;
 }
@@ -167,7 +168,7 @@ function nbReplyChannel(requestId: string): string {
 }
 
 function emitReply<T>(
-  events: BridgeHost["events"],
+  events: BridgeHost['events'],
   channel: string,
   requestId: string,
   reply: RpcReply<T>,
@@ -204,14 +205,14 @@ function extractChildOutputs(payload: AsyncCompleteRaw): string[] {
 }
 
 function extractCompletedResult(payload: AsyncCompleteRaw): string | undefined {
-  const childOutput = extractChildOutputs(payload).join("\n\n") || undefined;
-  if (text(payload.mode) === "workflow" && childOutput) return childOutput;
+  const childOutput = extractChildOutputs(payload).join('\n\n') || undefined;
+  if (text(payload.mode) === 'workflow' && childOutput) return childOutput;
   return text(payload.summary) ?? text(payload.output) ?? childOutput;
 }
 
 function extractStoppedResult(payload: AsyncCompleteRaw): string | undefined {
   return (
-    (extractChildOutputs(payload).join("\n\n") || undefined) ??
+    (extractChildOutputs(payload).join('\n\n') || undefined) ??
     text(payload.output) ??
     text(payload.summary)
   );
@@ -234,26 +235,26 @@ function extractFailureError(payload: AsyncCompleteRaw): string {
           .filter(isRecord)
           .map((result) => text(result.output))
           .filter((output): output is string => output !== undefined)
-          .join("\n\n")
+          .join('\n\n')
       : undefined);
-  if (!partialOutput) return error ?? "Agent failed";
+  if (!partialOutput) return error ?? 'Agent failed';
 
   const truncatedOutput = partialOutput.slice(
     0,
     MAX_FAILURE_PARTIAL_OUTPUT_CHARS,
   );
   const suffix =
-    partialOutput.length > truncatedOutput.length ? "\n[truncated]" : "";
-  return `${error ?? "Agent failed"}\n\nPartial output:\n${truncatedOutput}${suffix}`;
+    partialOutput.length > truncatedOutput.length ? '\n[truncated]' : '';
+  return `${error ?? 'Agent failed'}\n\nPartial output:\n${truncatedOutput}${suffix}`;
 }
 
 function classifyCompleteEvent(payload: AsyncCompleteRaw): CompletionKind {
   const state = text(payload.state);
-  if (state === "paused" || state === "stopped") return "stopped";
-  if (state === "failed" || state === "aborted" || payload.success === false)
-    return "failed";
-  if (state === "complete" || payload.success === true) return "completed";
-  return "failed";
+  if (state === 'paused' || state === 'stopped') return 'stopped';
+  if (state === 'failed' || state === 'aborted' || payload.success === false)
+    return 'failed';
+  if (state === 'complete' || payload.success === true) return 'completed';
+  return 'failed';
 }
 
 function resolveAgentType(type: string): string {
@@ -261,8 +262,8 @@ function resolveAgentType(type: string): string {
 }
 
 function requestNicobailonRpc<T>(
-  events: BridgeHost["events"],
-  method: "spawn" | "status",
+  events: BridgeHost['events'],
+  method: 'spawn' | 'status',
   params: Record<string, unknown>,
   timeoutMs: number,
   signal?: AbortSignal,
@@ -277,7 +278,7 @@ function requestNicobailonRpc<T>(
       settled = true;
       unsubscribe();
       clearTimeout(timeout);
-      signal?.removeEventListener("abort", onAbort);
+      signal?.removeEventListener('abort', onAbort);
     };
 
     const fail = (error: Error): void => {
@@ -293,7 +294,7 @@ function requestNicobailonRpc<T>(
     };
 
     const onAbort = (): void => {
-      fail(new Error("Bridge disposed"));
+      fail(new Error('Bridge disposed'));
     };
 
     const timeout = setTimeout(() => {
@@ -303,8 +304,8 @@ function requestNicobailonRpc<T>(
     }, timeoutMs);
 
     const unsubscribe = events.on(nbReplyChannel(requestId), (raw: unknown) => {
-      if (!isRecord(raw) || typeof raw.success !== "boolean") {
-        fail(new Error("Malformed nicobailon RPC reply."));
+      if (!isRecord(raw) || typeof raw.success !== 'boolean') {
+        fail(new Error('Malformed nicobailon RPC reply.'));
         return;
       }
 
@@ -316,10 +317,10 @@ function requestNicobailonRpc<T>(
       const message = isRecord(raw.error)
         ? text(raw.error.message)
         : text(raw.error);
-      fail(new Error(message ?? "nicobailon RPC error"));
+      fail(new Error(message ?? 'nicobailon RPC error'));
     });
 
-    signal?.addEventListener("abort", onAbort, { once: true });
+    signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted) {
       onAbort();
       return;
@@ -355,9 +356,9 @@ function parseResultPath(statusText: string): string | undefined {
 function classifyStatusText(statusText: string): CompletionKind | undefined {
   const state = parseStatusState(statusText);
   if (!state) return undefined;
-  if (state === "paused" || state === "stopped") return "stopped";
-  if (state === "failed" || state === "aborted") return "failed";
-  if (state === "complete") return "completed";
+  if (state === 'paused' || state === 'stopped') return 'stopped';
+  if (state === 'failed' || state === 'aborted') return 'failed';
+  if (state === 'complete') return 'completed';
   return undefined;
 }
 
@@ -367,13 +368,13 @@ function readResultPayload(resultPath: string | undefined): {
 } {
   if (!resultPath) return {};
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+    const parsed: unknown = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
     if (!isRecord(parsed)) {
-      return { error: "result payload is not a JSON object" };
+      return { error: 'result payload is not a JSON object' };
     }
     return { payload: parsed };
   } catch {
-    return { error: "result payload is not readable yet" };
+    return { error: 'result payload is not readable yet' };
   }
 }
 
@@ -386,7 +387,7 @@ function positiveIntegerOrDefault(
     : fallback;
 }
 
-function getBridgeState(events: BridgeHost["events"]): BridgeState {
+function getBridgeState(events: BridgeHost['events']): BridgeState {
   const existing = bridgeStates.get(events);
   if (existing) return existing;
 
@@ -464,7 +465,7 @@ export function registerBridge(
   if (options.operationJournal) {
     if (state.journal && state.journal !== options.operationJournal) {
       throw new Error(
-        "bridge was already registered with a different operation journal",
+        'bridge was already registered with a different operation journal',
       );
     }
     state.journal = options.operationJournal;
@@ -472,7 +473,7 @@ export function registerBridge(
     const journalPath = path.resolve(options.planExecJournalPath);
     if (state.journal && state.journal.filePath !== journalPath) {
       throw new Error(
-        "bridge was already registered with a different operation journal",
+        'bridge was already registered with a different operation journal',
       );
     }
     state.journal ??= new OperationJournal(journalPath);
@@ -485,8 +486,8 @@ export function registerBridge(
       : {}),
   });
 
-  const track = (unsubscribe: Unsubscribe | void): void => {
-    if (typeof unsubscribe === "function") unsubscribes.push(unsubscribe);
+  const track = (unsubscribe: Unsubscribe | undefined): void => {
+    if (typeof unsubscribe === 'function') unsubscribes.push(unsubscribe);
   };
 
   const clearCompletionPoll = (runId: string): void => {
@@ -531,18 +532,18 @@ export function registerBridge(
     terminalResultDeadlines.delete(runId);
     clearCompletionPoll(runId);
 
-    if (kind === "stopped") {
+    if (kind === 'stopped') {
       const result = payload ? extractStoppedResult(payload) : undefined;
       pi.events.emit(FAILED_EVENT, {
         id: runId,
         ...(result ? { result } : {}),
-        status: "stopped",
+        status: 'stopped',
       });
-    } else if (kind === "failed") {
+    } else if (kind === 'failed') {
       pi.events.emit(FAILED_EVENT, {
         id: runId,
-        error: payload ? extractFailureError(payload) : "Agent failed",
-        status: "failed",
+        error: payload ? extractFailureError(payload) : 'Agent failed',
+        status: 'failed',
       });
     } else {
       const result = payload ? extractCompletedResult(payload) : undefined;
@@ -553,11 +554,7 @@ export function registerBridge(
     }
 
     try {
-      bridgeJournal?.completeRun(
-        runId,
-        processOwner.instanceId,
-        sessionId,
-      );
+      bridgeJournal?.completeRun(runId, processOwner.instanceId, sessionId);
       volatileOwnedRuns.delete(runId);
     } catch (error: unknown) {
       console.error(
@@ -580,7 +577,7 @@ export function registerBridge(
     try {
       const reply = await requestNicobailonRpc<unknown>(
         pi.events,
-        "status",
+        'status',
         { id: runId },
         spawnTimeoutMs,
         controller.signal,
@@ -619,8 +616,8 @@ export function registerBridge(
           }
 
           emitCompletion(runId, kind, {
-            [kind === "failed" ? "error" : "summary"]:
-              `Bridge warning: ${result.error ?? "result payload was unavailable"} after ${terminalResultGraceMs}ms.`,
+            [kind === 'failed' ? 'error' : 'summary']:
+              `Bridge warning: ${result.error ?? 'result payload was unavailable'} after ${terminalResultGraceMs}ms.`,
           });
           return;
         }
@@ -657,7 +654,7 @@ export function registerBridge(
 
   const rearmAcceptedRun = (runId: string): string | undefined => {
     const sessionId = currentSessionId();
-    if (!sessionId) return "Pi session identity is not initialized";
+    if (!sessionId) return 'Pi session identity is not initialized';
     if (bridgeJournal && volatileOwnedRuns.get(runId) !== sessionId) {
       try {
         if (!bridgeJournal.acceptRun(runId, processOwner, sessionId)) {
@@ -733,10 +730,10 @@ export function registerBridge(
         ownedRunIds.delete(runId);
         clearCompletionPoll(runId);
         pi.events.emit(WARNING_EVENT, {
-          code: "accepted_run_ownership_lost",
+          code: 'accepted_run_ownership_lost',
           id: runId,
           message:
-            "Bridge stopped delivering this run because another session owns its completion record.",
+            'Bridge stopped delivering this run because another session owns its completion record.',
         });
       }
       for (const accepted of claimed) {
@@ -744,7 +741,7 @@ export function registerBridge(
         ensureCompletionPoll(accepted.runId);
       }
     } catch (error: unknown) {
-      console.error("Failed to reconcile accepted bridge runs:", error);
+      console.error('Failed to reconcile accepted bridge runs:', error);
     }
   };
 
@@ -798,7 +795,7 @@ export function registerBridge(
     if (!agentType || !prompt) {
       emitReply(pi.events, SPAWN_CHANNEL, requestId, {
         success: false,
-        error: "spawn requires string type and prompt",
+        error: 'spawn requires string type and prompt',
       });
       return;
     }
@@ -806,14 +803,14 @@ export function registerBridge(
     if (!sessionId) {
       emitReply(pi.events, SPAWN_CHANNEL, requestId, {
         success: false,
-        error: "Pi session identity is not initialized",
+        error: 'Pi session identity is not initialized',
       });
       return;
     }
     const optionsRaw = normalizeSpawnOptions(raw.options);
     const model = text(optionsRaw?.model);
     const maxTurns =
-      typeof optionsRaw?.maxTurns === "number" &&
+      typeof optionsRaw?.maxTurns === 'number' &&
       Number.isInteger(optionsRaw.maxTurns) &&
       optionsRaw.maxTurns > 0
         ? optionsRaw.maxTurns
@@ -825,15 +822,15 @@ export function registerBridge(
         { control: BRIDGE_CONTROL_CONFIG },
       ),
       async: true,
-      context: "fresh",
+      context: 'fresh',
       acceptance: BRIDGE_ACCEPTANCE_CONFIG,
       control: BRIDGE_CONTROL_CONFIG,
       ...(model ? { model } : {}),
       turnBudget: { maxTurns },
     };
-    const legacyRequestDigest = `sha256:${createHash("sha256")
+    const legacyRequestDigest = `sha256:${createHash('sha256')
       .update(JSON.stringify({ agentType, prompt, spawnParams }))
-      .digest("hex")}`;
+      .digest('hex')}`;
     const requestIdentity = `${sessionId}:${legacyRequestDigest}`;
 
     pruneSpawnReplyCache();
@@ -842,7 +839,7 @@ export function registerBridge(
       if (cached.identity !== requestIdentity) {
         emitReply(pi.events, SPAWN_CHANNEL, requestId, {
           success: false,
-          error: "spawn requestId was already used by another request",
+          error: 'spawn requestId was already used by another request',
         });
         return;
       }
@@ -865,7 +862,7 @@ export function registerBridge(
       if (inFlight.identity !== requestIdentity) {
         emitReply(pi.events, SPAWN_CHANNEL, requestId, {
           success: false,
-          error: "spawn requestId was already used by another request",
+          error: 'spawn requestId was already used by another request',
         });
         return;
       }
@@ -886,10 +883,10 @@ export function registerBridge(
             ) {
               return {
                 success: false,
-                error: "spawn requestId was already used by another request",
+                error: 'spawn requestId was already used by another request',
               };
             }
-            if (durable.binding === "bound" && durable.runId) {
+            if (durable.binding === 'bound' && durable.runId) {
               const error = rearmAcceptedRun(durable.runId);
               return error
                 ? { success: false, error }
@@ -899,7 +896,7 @@ export function registerBridge(
               success: false,
               error:
                 durable.error ??
-                "legacy spawn outcome is unknown; manual recovery is required",
+                'legacy spawn outcome is unknown; manual recovery is required',
             };
           }
         } catch (error: unknown) {
@@ -928,7 +925,7 @@ export function registerBridge(
           if (!begun.created) {
             return {
               success: false,
-              error: "spawn requestId was concurrently claimed",
+              error: 'spawn requestId was concurrently claimed',
             };
           }
           durableOperationStarted = true;
@@ -947,18 +944,18 @@ export function registerBridge(
       try {
         const reply = await requestNicobailonRpc<unknown>(
           pi.events,
-          "spawn",
+          'spawn',
           spawnParams,
           spawnTimeoutMs,
           controller.signal,
         );
         if (disposed || controller.signal.aborted) {
-          throw new Error("Bridge disposed after native dispatch");
+          throw new Error('Bridge disposed after native dispatch');
         }
 
         const runId = extractSpawnRunId(reply);
         if (!runId) {
-          throw new Error("nicobailon spawn reply did not include a run id");
+          throw new Error('nicobailon spawn reply did not include a run id');
         }
 
         try {
@@ -1000,7 +997,10 @@ export function registerBridge(
           // TaskExecute to launch a duplicate, so keep session-scoped ownership
           // in memory and report the durability loss explicitly.
           volatileOwnedRuns.set(runId, sessionId);
-          console.error(`Failed to persist accepted bridge run '${runId}':`, error);
+          console.error(
+            `Failed to persist accepted bridge run '${runId}':`,
+            error,
+          );
         }
         ownedRunIds.add(runId);
         ensureCompletionPoll(runId);
@@ -1043,7 +1043,7 @@ export function registerBridge(
       }
       if (
         reply.success ||
-        !reply.error.startsWith("bridge capacity reached:")
+        !reply.error.startsWith('bridge capacity reached:')
       ) {
         spawnReplyCache.set(requestId, {
           identity: requestIdentity,
@@ -1071,7 +1071,7 @@ export function registerBridge(
           pi.events.emit(NB_REQUEST_CHANNEL, {
             version: 1,
             requestId: randomUUID(),
-            method: "stop",
+            method: 'stop',
             params: { id: agentId },
           });
         } catch {
@@ -1145,19 +1145,19 @@ export default function bridgeExtension(pi: ExtensionAPI): void {
     registration ??= registerBridge(pi, {
       planExecJournalPath: path.join(
         os.homedir(),
-        ".pi",
-        "pi-subagents-bridge",
-        "plan-exec-operations.sqlite",
+        '.pi',
+        'pi-subagents-bridge',
+        'plan-exec-operations.sqlite',
       ),
       getSessionId: () => sessionId,
     });
   };
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on('session_start', (_event, ctx) => {
     sessionId = ctx.sessionManager.getSessionId();
     register();
   });
-  pi.on("session_shutdown", () => {
+  pi.on('session_shutdown', () => {
     registration?.dispose();
     registration = undefined;
     sessionId = undefined;

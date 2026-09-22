@@ -17,9 +17,10 @@ Reload Pi after changing the extension:
 ## Validation
 
 ```bash
-npm run lint
-npm run check
-npm test
+npm run check          # Biome (format + lint) and TypeScript
+npm test               # Vitest
+npm run format         # rewrite formatting
+npm run lint:fix       # apply safe lint fixes
 npm run pack:dry
 npm run publish:dry
 ```
