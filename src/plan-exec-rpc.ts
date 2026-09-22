@@ -210,6 +210,7 @@ function supportsDiagnosticGuidance(
 function normalizeNativeOperation(
   operation: OperationJournalRecord,
   upstream: unknown,
+  terminalProofs?: Map<string, Record<string, unknown>>,
 ): Record<string, unknown> {
   if (!isRecord(upstream))
     throw new Error('pi-subagents operation reply is not an object');
@@ -232,7 +233,9 @@ function normalizeNativeOperation(
     else delete data.processTerminalProof;
   }
   if ('workflowTerminalProof' in data) {
-    const proof = runId ? extractWorkflowTerminal(upstream, runId) : undefined;
+    const proof = runId
+      ? extractWorkflowTerminal(upstream, runId, terminalProofs)
+      : undefined;
     if (proof) data.workflowTerminalProof = proof;
     else delete data.workflowTerminalProof;
   }
@@ -561,6 +564,7 @@ function normalizeObservation(
   upstream: unknown,
   observed = false,
   includeProcessTerminal = false,
+  terminalProofs?: Map<string, Record<string, unknown>>,
 ): Observation {
   const text = isRecord(upstream) ? nonEmptyString(upstream.text) : undefined;
   const state = text
@@ -573,7 +577,7 @@ function normalizeObservation(
     ? extractProcessTerminal(upstream, request.runId)
     : undefined;
   const workflowTerminalProof = includeProcessTerminal
-    ? extractWorkflowTerminal(upstream, request.runId)
+    ? extractWorkflowTerminal(upstream, request.runId, terminalProofs)
     : undefined;
   return {
     runId: request.runId,
@@ -597,6 +601,7 @@ function normalizeObservation(
 function extractWorkflowTerminal(
   upstream: unknown,
   runId: string,
+  terminalProofs?: Map<string, Record<string, unknown>>,
 ): Record<string, unknown> | undefined {
   if (!isRecord(upstream)) return undefined;
   const details = isRecord(upstream.details) ? upstream.details : undefined;
@@ -608,29 +613,86 @@ function extractWorkflowTerminal(
     details?.workflowTerminalProof ??
     lifecycle?.workflowTerminalProof;
   if (
-    !isRecord(proof) ||
-    proof.version !== 1 ||
-    proof.kind !== 'workflow' ||
-    proof.runId !== runId
+    isRecord(proof) &&
+    proof.version === 1 &&
+    proof.kind === 'workflow' &&
+    proof.runId === runId
+  ) {
+    if (
+      proof.state === 'observed' &&
+      proof.dispatchClosed === true &&
+      typeof proof.observedAt === 'number' &&
+      Number.isFinite(proof.observedAt) &&
+      Array.isArray(proof.children) &&
+      proof.children.every(
+        (child: unknown) =>
+          isRecord(child) &&
+          typeof child.runId === 'string' &&
+          extractProcessTerminal({ processTerminalProof: child }, child.runId)
+            ?.state === 'observed',
+      )
+    )
+      return proof;
+    if (proof.state === 'pending' || proof.state === 'unknown') return proof;
+    return undefined;
+  }
+  // A persistent workflow host publishes no exit of its own; a closed child
+  // inventory plus every child's writer-exit proof is the terminal evidence.
+  const childrenSummary =
+    upstream.workflowChildren ??
+    details?.workflowChildren ??
+    lifecycle?.workflowChildren;
+  return workflowProofFromChildren(childrenSummary, runId, terminalProofs);
+}
+
+function workflowProofFromChildren(
+  value: unknown,
+  runId: string,
+  terminalProofs: Map<string, Record<string, unknown>> | undefined,
+): Record<string, unknown> | undefined {
+  if (
+    !terminalProofs ||
+    !isRecord(value) ||
+    value.version !== 1 ||
+    value.workflowRunId !== runId ||
+    value.inventoryComplete !== true ||
+    !Array.isArray(value.children) ||
+    value.children.length === 0
   )
     return undefined;
+  const workflowState = value.workflowState;
   if (
-    proof.state === 'observed' &&
-    proof.dispatchClosed === true &&
-    typeof proof.observedAt === 'number' &&
-    Number.isFinite(proof.observedAt) &&
-    Array.isArray(proof.children) &&
-    proof.children.every(
-      (child: unknown) =>
-        isRecord(child) &&
-        typeof child.runId === 'string' &&
-        extractProcessTerminal({ processTerminalProof: child }, child.runId)
-          ?.state === 'observed',
-    )
+    workflowState !== 'completed' &&
+    workflowState !== 'failed' &&
+    workflowState !== 'cancelled'
   )
-    return proof;
-  if (proof.state === 'pending' || proof.state === 'unknown') return proof;
-  return undefined;
+    return undefined;
+  const children: Record<string, unknown>[] = [];
+  let observedAt = 0;
+  for (const child of value.children) {
+    if (!isRecord(child)) return undefined;
+    const childRunId = child.runId;
+    if (typeof childRunId !== 'string' || !childRunId.trim()) return undefined;
+    const childProof = terminalProofs.get(childRunId);
+    if (!childProof) return undefined;
+    const childObservedAt = childProof.observedAt;
+    if (
+      typeof childObservedAt !== 'number' ||
+      !Number.isFinite(childObservedAt)
+    )
+      return undefined;
+    observedAt = Math.max(observedAt, childObservedAt);
+    children.push(childProof);
+  }
+  return {
+    version: 1,
+    kind: 'workflow',
+    state: 'observed',
+    runId,
+    dispatchClosed: true,
+    observedAt,
+    children,
+  };
 }
 
 function normalizeStop(request: RunRequest, upstream: unknown): StopResult {
@@ -941,7 +1003,11 @@ export function registerPlanExecRpc(
         );
       }
       const upstream = await nativeRequest('spawn', request.params);
-      const reply = normalizeNativeOperation(claim.record, upstream);
+      const reply = normalizeNativeOperation(
+        claim.record,
+        upstream,
+        state.terminalProofs,
+      );
       const runId = extractSpawnRunId(reply);
       if (!runId)
         throw new Error(
@@ -1372,7 +1438,11 @@ export function registerPlanExecRpc(
         ) {
           throw new Error('Malformed native diagnostic guidance receipt');
         }
-        const data = normalizeNativeOperation(operation, reply);
+        const data = normalizeNativeOperation(
+          operation,
+          reply,
+          state.terminalProofs,
+        );
         return {
           success: true,
           data: {
@@ -1645,6 +1715,7 @@ export function registerPlanExecRpc(
           upstream,
           method === 'adopt',
           protocolVersion === 2,
+          state.terminalProofs,
         );
         const proof = state.terminalProofs.get(request.runId);
         if (proof && observed.state) {
@@ -1674,6 +1745,7 @@ export function registerPlanExecRpc(
         upstream,
         method === 'adopt',
         protocolVersion === 2,
+        state.terminalProofs,
       );
       const proof = state.terminalProofs.get(request.runId);
       return {
