@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.2 - 2026-09-22
+
+- Synthesize a workflow terminal proof for released pi-subagents async runs: a persistent workflow host publishes no exit of its own, so a closed `workflowChildren` inventory plus every child's attested writer-exit proof is now the terminal evidence.
+- Validate every child proof through `attestUpstreamTerminalProof`, accept the upstream terminal workflow states (`completed`, `failed`, `stopped`), and fall back to the child's `process-terminal.json` when the in-process proof cache missed it.
+
 ## 0.4.1 - 2026-09-22
 
 - Modernize tooling: TypeScript 7, Biome (replacing ESLint), Vitest (replacing node:test), npm 12, and the latest stable GitHub Actions.
