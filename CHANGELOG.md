@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1 - 2026-09-22
+
+- Modernize tooling: TypeScript 7, Biome (replacing ESLint), Vitest (replacing node:test), npm 12, and the latest stable GitHub Actions.
+- Consume pi-subagents from the npm registry (^0.70.1) instead of a private Git fork; the lockfile resolves the released tarball and npm ci works without allow-git.
+- Read upstream terminal-proof events from the ping reply's top level, so process-terminal proofs are subscribed with the released runtime.
+- Remove the obsolete kernel-contract native test and simplify the development and release workflows.
+
 ## 0.4.0 - 2026-09-22
 
 - Accept the released pi-subagents runtime: detached async spawn, stop control, writer-exit terminal proofs, and deadlines.

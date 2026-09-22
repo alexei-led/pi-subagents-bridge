@@ -1,6 +1,6 @@
 {
   "name": "@alexeiled/pi-subagents-bridge",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Protocol adapter that lets @tintinweb/pi-tasks TaskExecute spawn nicobailon/pi-subagents.",
   "keywords": [
     "bridge",
