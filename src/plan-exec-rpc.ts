@@ -1,48 +1,64 @@
-import { createHash, randomUUID } from "node:crypto";
-import path from "node:path";
-import { parseExecutionLifetime, type ExecutionLifetime } from "./execution-lifetime.js";
+import { createHash, randomUUID } from 'node:crypto';
+import path from 'node:path';
+import {
+  type ExecutionLifetime,
+  parseExecutionLifetime,
+} from './execution-lifetime.js';
+import {
+  attestUpstreamTerminalProof,
+  nativeOperationIdentity,
+} from './native-proof.js';
 import {
   OperationJournal,
   type OperationJournalRecord,
-} from "./operation-journal.js";
-import { singleChildWorkflowScript } from "./workflow-spawn.js";
-import { attestUpstreamTerminalProof, nativeOperationIdentity } from "./native-proof.js";
+} from './operation-journal.js';
+import { singleChildWorkflowScript } from './workflow-spawn.js';
 
-export const PLAN_EXEC_REQUEST_EVENT = "plan-exec:bridge:v1:request";
-export const PLAN_EXEC_REPLY_PREFIX = "plan-exec:bridge:v1:reply:";
-export const PLAN_EXEC_V2_REQUEST_EVENT = "plan-exec:bridge:v2:request";
-export const PLAN_EXEC_V2_REPLY_PREFIX = "plan-exec:bridge:v2:reply:";
+export const PLAN_EXEC_REQUEST_EVENT = 'plan-exec:bridge:v1:request';
+export const PLAN_EXEC_REPLY_PREFIX = 'plan-exec:bridge:v1:reply:';
+export const PLAN_EXEC_V2_REQUEST_EVENT = 'plan-exec:bridge:v2:request';
+export const PLAN_EXEC_V2_REPLY_PREFIX = 'plan-exec:bridge:v2:reply:';
 
-const SUBAGENTS_REQUEST_EVENT = "subagents:rpc:v1:request";
-const SUBAGENTS_REPLY_PREFIX = "subagents:rpc:v1:reply:";
+const SUBAGENTS_REQUEST_EVENT = 'subagents:rpc:v1:request';
+const SUBAGENTS_REPLY_PREFIX = 'subagents:rpc:v1:reply:';
 const PROTOCOL_VERSION = 1;
 const MAX_COMPLETED_OPERATION_HISTORY = 128;
 const METHODS = [
-  "ping",
-  "spawn",
-  "operation",
-  "status",
-  "result",
-  "stop",
-  "adopt",
-  "cancelOperation",
-  "diagnoseOperation",
+  'ping',
+  'spawn',
+  'operation',
+  'status',
+  'result',
+  'stop',
+  'adopt',
+  'cancelOperation',
+  'diagnoseOperation',
 ] as const;
 
 type Method = (typeof METHODS)[number];
 type ProtocolVersion = 1 | 2;
-type UpstreamMethod = "ping" | "spawn" | "status" | "stop" | "lookup" | "cancel" | "diagnose";
+type UpstreamMethod =
+  | 'ping'
+  | 'spawn'
+  | 'status'
+  | 'stop'
+  | 'lookup'
+  | 'cancel'
+  | 'diagnose';
 type Unsubscribe = () => void;
 
 type EventBus = {
-  on(event: string, handler: (payload: unknown) => void): Unsubscribe | void;
+  on(
+    event: string,
+    handler: (payload: unknown) => void,
+  ): Unsubscribe | undefined;
   emit(event: string, payload: unknown): void;
 };
 
 type Failure = {
   success: false;
   error: {
-    code: "invalid_request" | "upstream_error" | "operation_capacity";
+    code: 'invalid_request' | 'upstream_error' | 'operation_capacity';
     message: string;
   };
 };
@@ -121,11 +137,11 @@ interface PlanExecState {
 const planExecStates = new WeakMap<EventBus, PlanExecState>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function nonEmptyString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim().length > 0
+  return typeof value === 'string' && value.trim().length > 0
     ? value.trim()
     : undefined;
 }
@@ -141,7 +157,7 @@ function upstreamReplyEvent(requestId: string): string {
 }
 
 function failure(
-  code: "invalid_request" | "upstream_error" | "operation_capacity",
+  code: 'invalid_request' | 'upstream_error' | 'operation_capacity',
   message: string,
 ): Failure {
   return { success: false, error: { code, message } };
@@ -172,30 +188,50 @@ function extractSpawnAsyncDir(reply: unknown): string | undefined {
   return nonEmptyString(details?.asyncDir) ?? nonEmptyString(reply.asyncDir);
 }
 
-function supportsAsyncRuntime(capabilities: Record<string, unknown> | undefined): boolean {
+function supportsAsyncRuntime(
+  capabilities: Record<string, unknown> | undefined,
+): boolean {
   return capabilities?.asyncSpawn === true && capabilities.stop === true;
 }
 
-function supportsDiagnosticGuidance(capabilities: Record<string, unknown> | undefined): boolean {
+function supportsDiagnosticGuidance(
+  capabilities: Record<string, unknown> | undefined,
+): boolean {
   const value = capabilities?.diagnosticGuidance;
-  return isRecord(value) && value.version === 1 && value.idempotent === true &&
-    value.mode === "follow_up" && value.confirmedToolFailure === true;
+  return (
+    isRecord(value) &&
+    value.version === 1 &&
+    value.idempotent === true &&
+    value.mode === 'follow_up' &&
+    value.confirmedToolFailure === true
+  );
 }
 
-function normalizeNativeOperation(operation: OperationJournalRecord, upstream: unknown): Record<string, unknown> {
-  if (!isRecord(upstream)) throw new Error("pi-subagents operation reply is not an object");
+function normalizeNativeOperation(
+  operation: OperationJournalRecord,
+  upstream: unknown,
+): Record<string, unknown> {
+  if (!isRecord(upstream))
+    throw new Error('pi-subagents operation reply is not an object');
   const native = nativeOperationIdentity(operation);
   const reportedId = nonEmptyString(upstream.operationId);
-  if (reportedId !== undefined && reportedId !== native.operationId) throw new Error("pi-subagents operation identity mismatch");
-  const data: Record<string, unknown> = { ...upstream, operationId: operation.operationId };
+  if (reportedId !== undefined && reportedId !== native.operationId)
+    throw new Error('pi-subagents operation identity mismatch');
+  const data: Record<string, unknown> = {
+    ...upstream,
+    operationId: operation.operationId,
+  };
   const runId = nonEmptyString(upstream.runId);
-  if (operation.runId && runId && operation.runId !== runId) throw new Error("pi-subagents runId does not match the durable operation");
-  if ("processTerminalProof" in data) {
-    const proof = runId ? attestUpstreamTerminalProof(data.processTerminalProof, runId) : undefined;
+  if (operation.runId && runId && operation.runId !== runId)
+    throw new Error('pi-subagents runId does not match the durable operation');
+  if ('processTerminalProof' in data) {
+    const proof = runId
+      ? attestUpstreamTerminalProof(data.processTerminalProof, runId)
+      : undefined;
     if (proof) data.processTerminalProof = proof;
     else delete data.processTerminalProof;
   }
-  if ("workflowTerminalProof" in data) {
+  if ('workflowTerminalProof' in data) {
     const proof = runId ? extractWorkflowTerminal(upstream, runId) : undefined;
     if (proof) data.workflowTerminalProof = proof;
     else delete data.workflowTerminalProof;
@@ -205,9 +241,9 @@ function normalizeNativeOperation(operation: OperationJournalRecord, upstream: u
 
 function parseStatusLine(
   text: string,
-  name: "State" | "Result" | "Dir",
+  name: 'State' | 'Result' | 'Dir',
 ): string | undefined {
-  const match = new RegExp(`^${name}:\\s+(.+)$`, "im").exec(text);
+  const match = new RegExp(`^${name}:\\s+(.+)$`, 'im').exec(text);
   return nonEmptyString(match?.[1]);
 }
 
@@ -222,44 +258,44 @@ function validateOptionalString(
   if (!(key in value)) return undefined;
   return (
     nonEmptyString(value[key]) ??
-    failure("invalid_request", `spawn ${key} must be a non-empty string`)
+    failure('invalid_request', `spawn ${key} must be a non-empty string`)
   );
 }
 
 function validateOptionalTimeout(
   params: Record<string, unknown>,
-  key: "timeout" | "timeoutMs",
+  key: 'timeout' | 'timeoutMs',
 ): number | undefined | Failure {
   if (!(key in params)) return undefined;
   const value = params[key];
-  return typeof value === "number" && Number.isFinite(value) && value > 0
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
     ? value
-    : failure("invalid_request", `spawn ${key} must be a positive number`);
+    : failure('invalid_request', `spawn ${key} must be a positive number`);
 }
 
 function canonicalJson(value: unknown): string {
-  if (value === null) return "null";
+  if (value === null) return 'null';
   if (Array.isArray(value)) {
-    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+    return `[${value.map((item) => canonicalJson(item)).join(',')}]`;
   }
   if (isRecord(value)) {
     return `{${Object.keys(value)
       .sort()
       .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
-      .join(",")}}`;
+      .join(',')}}`;
   }
-  if (typeof value === "string") return JSON.stringify(value);
-  if (typeof value === "number" || typeof value === "boolean") {
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'number' || typeof value === 'boolean') {
     return JSON.stringify(value);
   }
-  if (typeof value === "bigint") return `bigint:${value.toString()}`;
-  if (typeof value === "symbol") return `symbol:${value.description ?? ""}`;
-  if (typeof value === "undefined") return "undefined";
-  return "function";
+  if (typeof value === 'bigint') return `bigint:${value.toString()}`;
+  if (typeof value === 'symbol') return `symbol:${value.description ?? ''}`;
+  if (typeof value === 'undefined') return 'undefined';
+  return 'function';
 }
 
 function operationFingerprint(value: unknown): string {
-  return `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
+  return `sha256:${createHash('sha256').update(canonicalJson(value)).digest('hex')}`;
 }
 
 function validateOwner(
@@ -269,23 +305,23 @@ function validateOwner(
 ): { runId: string } | Failure {
   const owner = raw.owner;
   if (!isRecord(owner)) {
-    return failure("invalid_request", "spawn requires an object owner");
+    return failure('invalid_request', 'spawn requires an object owner');
   }
   const runId = nonEmptyString(owner.runId);
   if (
-    owner.kind !== "pi-plan-exec" ||
+    owner.kind !== 'pi-plan-exec' ||
     !runId ||
     nonEmptyString(owner.key) !== operationId
   ) {
     return failure(
-      "invalid_request",
-      "spawn owner must identify the pi-plan-exec run and operation",
+      'invalid_request',
+      'spawn owner must identify the pi-plan-exec run and operation',
     );
   }
   if (nonEmptyString(owner.requestDigest) !== requestDigest) {
     return failure(
-      "invalid_request",
-      "spawn owner requestDigest does not match cwd and params",
+      'invalid_request',
+      'spawn owner requestDigest does not match cwd and params',
     );
   }
   return { runId };
@@ -297,44 +333,58 @@ function validateSpawn(
 ): SpawnRequest | Failure {
   const operationId = nonEmptyString(raw.operationId);
   if (!operationId) {
-    return failure("invalid_request", "spawn requires a non-empty operationId");
+    return failure('invalid_request', 'spawn requires a non-empty operationId');
   }
 
   const params = raw.params;
   if (!isRecord(params)) {
-    return failure("invalid_request", "spawn requires an object params");
+    return failure('invalid_request', 'spawn requires an object params');
   }
 
   const agent = nonEmptyString(params.agent);
   const task = nonEmptyString(params.task);
   if (!agent || !task) {
     return failure(
-      "invalid_request",
-      "spawn requires non-empty string agent and task",
+      'invalid_request',
+      'spawn requires non-empty string agent and task',
     );
   }
 
   const executionLifetime = parseExecutionLifetime(params.executionLifetime);
-  if ("executionLifetime" in params && !executionLifetime) {
-    return failure("invalid_request", "spawn executionLifetime must be unbounded or bounded with a positive integer timeoutMs");
+  if ('executionLifetime' in params && !executionLifetime) {
+    return failure(
+      'invalid_request',
+      'spawn executionLifetime must be unbounded or bounded with a positive integer timeoutMs',
+    );
   }
-  if (executionLifetime && ("timeout" in params || "timeoutMs" in params)) {
-    return failure("invalid_request", "spawn executionLifetime cannot be combined with legacy timeout fields");
+  if (executionLifetime && ('timeout' in params || 'timeoutMs' in params)) {
+    return failure(
+      'invalid_request',
+      'spawn executionLifetime cannot be combined with legacy timeout fields',
+    );
   }
-  if (executionLifetime && ("workflowScript" in params || "workflow" in params || "ownedWorkflow" in params)) {
-    return failure("invalid_request", "explicit executionLifetime only supports a direct async agent task");
+  if (
+    executionLifetime &&
+    ('workflowScript' in params ||
+      'workflow' in params ||
+      'ownedWorkflow' in params)
+  ) {
+    return failure(
+      'invalid_request',
+      'explicit executionLifetime only supports a direct async agent task',
+    );
   }
-  const topLevelCwd = validateOptionalString(raw, "cwd");
-  const paramsCwd = validateOptionalString(params, "cwd");
-  const timeout = validateOptionalTimeout(params, "timeout");
-  const timeoutMs = validateOptionalTimeout(params, "timeoutMs");
+  const topLevelCwd = validateOptionalString(raw, 'cwd');
+  const paramsCwd = validateOptionalString(params, 'cwd');
+  const timeout = validateOptionalTimeout(params, 'timeout');
+  const timeoutMs = validateOptionalTimeout(params, 'timeoutMs');
   for (const value of [topLevelCwd, paramsCwd, timeout, timeoutMs]) {
     if (isFailure(value)) return value;
   }
   if (topLevelCwd && paramsCwd && topLevelCwd !== paramsCwd) {
     return failure(
-      "invalid_request",
-      "spawn cwd must match when supplied at both the request and params levels",
+      'invalid_request',
+      'spawn cwd must match when supplied at both the request and params levels',
     );
   }
   if (
@@ -343,26 +393,26 @@ function validateSpawn(
     timeout !== timeoutMs
   ) {
     return failure(
-      "invalid_request",
-      "spawn timeout and timeoutMs must match when both are supplied",
+      'invalid_request',
+      'spawn timeout and timeoutMs must match when both are supplied',
     );
   }
   if (params.async === false) {
     return failure(
-      "invalid_request",
-      "spawn only supports detached async execution",
+      'invalid_request',
+      'spawn only supports detached async execution',
     );
   }
   if (params.clarify === true) {
-    return failure("invalid_request", "spawn cannot set clarify to true");
+    return failure('invalid_request', 'spawn cannot set clarify to true');
   }
   if (
-    "completionGuard" in params &&
-    typeof params.completionGuard !== "boolean"
+    'completionGuard' in params &&
+    typeof params.completionGuard !== 'boolean'
   ) {
     return failure(
-      "invalid_request",
-      "spawn completionGuard must be a boolean",
+      'invalid_request',
+      'spawn completionGuard must be a boolean',
     );
   }
 
@@ -388,16 +438,19 @@ function validateSpawn(
   } = params;
   const forwarded: Record<string, unknown> = {
     ...workflowDefaults,
-    workflowScript: singleChildWorkflowScript(
-      agent,
-      task,
-      { ...(completionGuard === undefined ? {} : { completionGuard }) },
-    ),
+    workflowScript: singleChildWorkflowScript(agent, task, {
+      ...(completionGuard === undefined ? {} : { completionGuard }),
+    }),
     async: true,
   };
   delete forwarded.timeout;
   if (cwd !== undefined) forwarded.cwd = cwd;
-  const effectiveTimeout = timeout ?? timeoutMs ?? (executionLifetime?.mode === "bounded" ? executionLifetime.timeoutMs : undefined);
+  const effectiveTimeout =
+    timeout ??
+    timeoutMs ??
+    (executionLifetime?.mode === 'bounded'
+      ? executionLifetime.timeoutMs
+      : undefined);
   if (effectiveTimeout !== undefined) forwarded.timeoutMs = effectiveTimeout;
 
   return {
@@ -416,50 +469,53 @@ function validateOperationRequest(
 ): OperationRequest | Failure {
   const operationId = nonEmptyString(raw.operationId);
   if (!operationId) {
-    return failure("invalid_request", "operation requires a non-empty operationId");
+    return failure(
+      'invalid_request',
+      'operation requires a non-empty operationId',
+    );
   }
   if (protocolVersion === 1) return { operationId };
 
   const owner = raw.owner;
   if (!isRecord(owner)) {
-    return failure("invalid_request", "operation requires an object owner");
+    return failure('invalid_request', 'operation requires an object owner');
   }
   const ownerRunId = nonEmptyString(owner.runId);
   const requestDigest = nonEmptyString(owner.requestDigest);
   if (
-    owner.kind !== "pi-plan-exec" ||
+    owner.kind !== 'pi-plan-exec' ||
     !ownerRunId ||
     nonEmptyString(owner.key) !== operationId ||
     !requestDigest
   ) {
     return failure(
-      "invalid_request",
-      "operation owner must identify the pi-plan-exec run, operation, and request digest",
+      'invalid_request',
+      'operation owner must identify the pi-plan-exec run, operation, and request digest',
     );
   }
   return { operationId, ownerRunId, requestDigest };
 }
 
 function validateRunRequest(
-  method: "status" | "result" | "stop" | "adopt",
+  method: 'status' | 'result' | 'stop' | 'adopt',
   raw: Record<string, unknown>,
 ): RunRequest | Failure {
   const params = raw.params;
   if (!isRecord(params)) {
-    return failure("invalid_request", `${method} requires an object params`);
+    return failure('invalid_request', `${method} requires an object params`);
   }
 
   const runId = nonEmptyString(params.runId);
   if (!runId) {
-    return failure("invalid_request", `${method} requires a non-empty runId`);
+    return failure('invalid_request', `${method} requires a non-empty runId`);
   }
 
-  if (!("asyncDir" in params)) return { runId };
+  if (!('asyncDir' in params)) return { runId };
   const asyncDir = nonEmptyString(params.asyncDir);
   return asyncDir
     ? { runId, asyncDir }
     : failure(
-        "invalid_request",
+        'invalid_request',
         `${method} asyncDir must be a non-empty string`,
       );
 }
@@ -471,7 +527,9 @@ function extractProcessTerminal(
   if (!isRecord(upstream)) return undefined;
   const details = isRecord(upstream.details) ? upstream.details : undefined;
   const lifecycleStatus = details?.lifecycleStatus;
-  const proof = upstream.processTerminalProof ?? details?.processTerminalProof ??
+  const proof =
+    upstream.processTerminalProof ??
+    details?.processTerminalProof ??
     (isRecord(lifecycleStatus) ? lifecycleStatus.processTerminal : undefined);
   if (!isRecord(proof)) return undefined;
   const state = proof.state;
@@ -479,22 +537,22 @@ function extractProcessTerminal(
     proof.version !== 1 ||
     proof.runId !== expectedRunId ||
     !nonEmptyString(proof.runnerProcessInstanceId) ||
-    (state !== "pending" &&
-      state !== "not-started" &&
-      state !== "observed" &&
-      state !== "unknown")
+    (state !== 'pending' &&
+      state !== 'not-started' &&
+      state !== 'observed' &&
+      state !== 'unknown')
   ) {
     return undefined;
   }
   if (
-    state === "observed" &&
-    (typeof proof.observedAt !== "number" ||
+    state === 'observed' &&
+    (typeof proof.observedAt !== 'number' ||
       !Number.isFinite(proof.observedAt) ||
       !Array.isArray(proof.instances))
   ) {
     return undefined;
   }
-  if (state === "unknown" && !nonEmptyString(proof.reason)) return undefined;
+  if (state === 'unknown' && !nonEmptyString(proof.reason)) return undefined;
   return { ...proof };
 }
 
@@ -506,15 +564,17 @@ function normalizeObservation(
 ): Observation {
   const text = isRecord(upstream) ? nonEmptyString(upstream.text) : undefined;
   const state = text
-    ? normalizeState(parseStatusLine(text, "State"))
+    ? normalizeState(parseStatusLine(text, 'State'))
     : undefined;
   const asyncDir =
-    request.asyncDir ?? (text ? parseStatusLine(text, "Dir") : undefined);
-  const resultPath = text ? parseStatusLine(text, "Result") : undefined;
+    request.asyncDir ?? (text ? parseStatusLine(text, 'Dir') : undefined);
+  const resultPath = text ? parseStatusLine(text, 'Result') : undefined;
   const processTerminal = includeProcessTerminal
     ? extractProcessTerminal(upstream, request.runId)
     : undefined;
-  const workflowTerminalProof = includeProcessTerminal ? extractWorkflowTerminal(upstream, request.runId) : undefined;
+  const workflowTerminalProof = includeProcessTerminal
+    ? extractWorkflowTerminal(upstream, request.runId)
+    : undefined;
   return {
     runId: request.runId,
     ...(observed ? { observed: true } : {}),
@@ -522,24 +582,54 @@ function normalizeObservation(
     ...(asyncDir ? { asyncDir } : {}),
     ...(resultPath ? { resultPath } : {}),
     ...(text ? { text } : {}),
-    ...(processTerminal ? { processTerminal, processTerminalProof: processTerminal } : {}),
+    ...(processTerminal
+      ? { processTerminal, processTerminalProof: processTerminal }
+      : {}),
     ...(workflowTerminalProof ? { workflowTerminalProof } : {}),
-    ...(isRecord(upstream) && isRecord(upstream.details) && isRecord(upstream.details.lifecycleStatus)
-      ? { lifecycleStatus: upstream.details.lifecycleStatus } : {}),
+    ...(isRecord(upstream) &&
+    isRecord(upstream.details) &&
+    isRecord(upstream.details.lifecycleStatus)
+      ? { lifecycleStatus: upstream.details.lifecycleStatus }
+      : {}),
   };
 }
 
-function extractWorkflowTerminal(upstream: unknown, runId: string): Record<string, unknown> | undefined {
+function extractWorkflowTerminal(
+  upstream: unknown,
+  runId: string,
+): Record<string, unknown> | undefined {
   if (!isRecord(upstream)) return undefined;
   const details = isRecord(upstream.details) ? upstream.details : undefined;
-  const lifecycle = isRecord(details?.lifecycleStatus) ? details.lifecycleStatus : undefined;
-  const proof = upstream.workflowTerminalProof ?? details?.workflowTerminalProof ?? lifecycle?.workflowTerminalProof;
-  if (!isRecord(proof) || proof.version !== 1 || proof.kind !== "workflow" || proof.runId !== runId) return undefined;
-  if (proof.state === "observed" && proof.dispatchClosed === true && typeof proof.observedAt === "number" &&
-    Number.isFinite(proof.observedAt) && Array.isArray(proof.children) && proof.children.every((child: unknown) =>
-      isRecord(child) && typeof child.runId === "string" &&
-      extractProcessTerminal({ processTerminalProof: child }, child.runId)?.state === "observed")) return proof;
-  if (proof.state === "pending" || proof.state === "unknown") return proof;
+  const lifecycle = isRecord(details?.lifecycleStatus)
+    ? details.lifecycleStatus
+    : undefined;
+  const proof =
+    upstream.workflowTerminalProof ??
+    details?.workflowTerminalProof ??
+    lifecycle?.workflowTerminalProof;
+  if (
+    !isRecord(proof) ||
+    proof.version !== 1 ||
+    proof.kind !== 'workflow' ||
+    proof.runId !== runId
+  )
+    return undefined;
+  if (
+    proof.state === 'observed' &&
+    proof.dispatchClosed === true &&
+    typeof proof.observedAt === 'number' &&
+    Number.isFinite(proof.observedAt) &&
+    Array.isArray(proof.children) &&
+    proof.children.every(
+      (child: unknown) =>
+        isRecord(child) &&
+        typeof child.runId === 'string' &&
+        extractProcessTerminal({ processTerminalProof: child }, child.runId)
+          ?.state === 'observed',
+    )
+  )
+    return proof;
+  if (proof.state === 'pending' || proof.state === 'unknown') return proof;
   return undefined;
 }
 
@@ -547,7 +637,7 @@ function normalizeStop(request: RunRequest, upstream: unknown): StopResult {
   const data = isRecord(upstream) ? upstream : undefined;
   const runId = nonEmptyString(data?.runId) ?? request.runId;
   const asyncDir = nonEmptyString(data?.asyncDir) ?? request.asyncDir;
-  const state = normalizeState(data?.state) ?? "stopping";
+  const state = normalizeState(data?.state) ?? 'stopping';
   return {
     runId,
     ...(asyncDir ? { asyncDir } : {}),
@@ -569,9 +659,9 @@ function requestSubagents(
     const cleanup = (): void => {
       if (settled) return;
       settled = true;
-      if (typeof unsubscribe === "function") unsubscribe();
+      if (typeof unsubscribe === 'function') unsubscribe();
       clearTimeout(timeout);
-      signal.removeEventListener("abort", onAbort);
+      signal.removeEventListener('abort', onAbort);
     };
     const rejectWith = (error: Error): void => {
       if (settled) return;
@@ -583,7 +673,7 @@ function requestSubagents(
       cleanup();
       resolve(value);
     };
-    const onAbort = (): void => rejectWith(new Error("Bridge disposed"));
+    const onAbort = (): void => rejectWith(new Error('Bridge disposed'));
     const timeout = setTimeout(() => {
       rejectWith(
         new Error(`pi-subagents ${method} RPC timed out after ${timeoutMs}ms`),
@@ -596,10 +686,10 @@ function requestSubagents(
           !isRecord(raw) ||
           raw.version !== PROTOCOL_VERSION ||
           raw.requestId !== requestId ||
-          typeof raw.success !== "boolean" ||
+          typeof raw.success !== 'boolean' ||
           (raw.method !== undefined && raw.method !== method)
         ) {
-          rejectWith(new Error("Malformed pi-subagents RPC reply"));
+          rejectWith(new Error('Malformed pi-subagents RPC reply'));
           return;
         }
         if (raw.success) {
@@ -609,11 +699,11 @@ function requestSubagents(
         const message = isRecord(raw.error)
           ? nonEmptyString(raw.error.message)
           : nonEmptyString(raw.error);
-        rejectWith(new Error(message ?? "pi-subagents RPC error"));
+        rejectWith(new Error(message ?? 'pi-subagents RPC error'));
       },
     );
 
-    signal.addEventListener("abort", onAbort, { once: true });
+    signal.addEventListener('abort', onAbort, { once: true });
     if (signal.aborted) {
       onAbort();
       return;
@@ -642,7 +732,9 @@ function getPlanExecState(
   const existing = planExecStates.get(events);
   if (existing) {
     if (journal && existing.journal && existing.journal !== journal) {
-      throw new Error("plan-exec RPC was already registered with a different operation journal");
+      throw new Error(
+        'plan-exec RPC was already registered with a different operation journal',
+      );
     }
     if (journal) existing.journal = journal;
     if (
@@ -650,7 +742,9 @@ function getPlanExecState(
       existing.journal &&
       existing.journal.filePath !== path.resolve(journalPath)
     ) {
-      throw new Error("plan-exec RPC was already registered with a different operation journal");
+      throw new Error(
+        'plan-exec RPC was already registered with a different operation journal',
+      );
     }
     if (journalPath && !existing.journal) {
       existing.journal = new OperationJournal(journalPath);
@@ -672,10 +766,8 @@ function getPlanExecState(
   return created;
 }
 
-function durableSpawnReply(
-  record: OperationJournalRecord,
-): Reply<SpawnResult> {
-  if (record.binding === "bound" && record.runId) {
+function durableSpawnReply(record: OperationJournalRecord): Reply<SpawnResult> {
+  if (record.binding === 'bound' && record.runId) {
     return {
       success: true,
       data: {
@@ -686,9 +778,9 @@ function durableSpawnReply(
     };
   }
   return failure(
-    "upstream_error",
+    'upstream_error',
     record.error ??
-      "pi-subagents spawn outcome is unknown after bridge restart",
+      'pi-subagents spawn outcome is unknown after bridge restart',
   );
 }
 
@@ -703,8 +795,8 @@ function validateOperationIdentity(
     request.ownerRunId !== ownerRunId
   ) {
     return failure(
-      "invalid_request",
-      "operation owner does not match the durable operation",
+      'invalid_request',
+      'operation owner does not match the durable operation',
     );
   }
   return undefined;
@@ -713,20 +805,20 @@ function validateOperationIdentity(
 function durableLookup(
   record: OperationJournalRecord,
 ): Record<string, unknown> {
-  if (record.binding === "bound" && record.runId) {
+  if (record.binding === 'bound' && record.runId) {
     return {
-      state: "found",
+      state: 'found',
       requestDigest: record.requestDigest,
       runId: record.runId,
       ...(record.asyncDir ? { asyncDir: record.asyncDir } : {}),
     };
   }
   return {
-    state: "unknown",
+    state: 'unknown',
     requestDigest: record.requestDigest,
     error:
       record.error ??
-      "pi-subagents spawn outcome is unknown after bridge restart",
+      'pi-subagents spawn outcome is unknown after bridge restart',
   };
 }
 
@@ -738,82 +830,144 @@ export function registerPlanExecRpc(
   events: EventBus,
   options: PlanExecOptions,
 ): { dispose(): void } {
-  const state = getPlanExecState(
-    events,
-    options.journalPath,
-    options.journal,
-  );
+  const state = getPlanExecState(events, options.journalPath, options.journal);
   if (state.registration) return state.registration;
 
   const transientControllers = new Set<AbortController>();
   let disposed = false;
 
-  const nativeRequest = async (method: UpstreamMethod, params: Record<string, unknown>): Promise<unknown> => {
+  const nativeRequest = async (
+    method: UpstreamMethod,
+    params: Record<string, unknown>,
+  ): Promise<unknown> => {
     const controller = new AbortController();
     transientControllers.add(controller);
     try {
-      return await requestSubagents(events, method, params, options.timeoutMs, controller.signal);
+      return await requestSubagents(
+        events,
+        method,
+        params,
+        options.timeoutMs,
+        controller.signal,
+      );
     } finally {
       transientControllers.delete(controller);
     }
   };
 
   let proofUnsubscribe: Unsubscribe | undefined;
-  const subscribeToTerminalProofs = (capabilities: Record<string, unknown> | undefined): void => {
+  const subscribeToTerminalProofs = (
+    capabilities: Record<string, unknown> | undefined,
+  ): void => {
     if (proofUnsubscribe) return;
-    const capabilityEvents = isRecord(capabilities) && isRecord(capabilities.events) ? capabilities.events : undefined;
-    const event = capabilityEvents ? nonEmptyString(capabilityEvents.processTerminal) : undefined;
+    const capabilityEvents =
+      isRecord(capabilities) && isRecord(capabilities.events)
+        ? capabilities.events
+        : undefined;
+    const event = capabilityEvents
+      ? nonEmptyString(capabilityEvents.processTerminal)
+      : undefined;
     if (!event) return;
     const unsubscribe = events.on(event, (raw: unknown) => {
       if (!isRecord(raw)) return;
       const runId = nonEmptyString(raw.runId);
       if (!runId) return;
-      if (state.terminalProofs.size >= MAX_COMPLETED_OPERATION_HISTORY) state.terminalProofs.clear();
+      if (state.terminalProofs.size >= MAX_COMPLETED_OPERATION_HISTORY)
+        state.terminalProofs.clear();
       state.terminalProofs.set(runId, raw);
     });
-    if (typeof unsubscribe === "function") proofUnsubscribe = unsubscribe;
+    if (typeof unsubscribe === 'function') proofUnsubscribe = unsubscribe;
   };
   const nativeCapabilities = async (): Promise<void> => {
-    const upstream = await nativeRequest("ping", {});
-    if (!isRecord(upstream) || !isRecord(upstream.capabilities) || !supportsAsyncRuntime(upstream.capabilities)) {
-      throw new Error("pi-subagents runtime does not support detached async spawn with stop control");
+    const upstream = await nativeRequest('ping', {});
+    if (
+      !isRecord(upstream) ||
+      !isRecord(upstream.capabilities) ||
+      !supportsAsyncRuntime(upstream.capabilities)
+    ) {
+      throw new Error(
+        'pi-subagents runtime does not support detached async spawn with stop control',
+      );
     }
     subscribeToTerminalProofs(upstream.capabilities);
   };
 
-  const startNativeOperation = async (request: SpawnRequest): Promise<Reply<SpawnResult>> => {
+  const startNativeOperation = async (
+    request: SpawnRequest,
+  ): Promise<Reply<SpawnResult>> => {
     if (!state.journal || request.protocolVersion !== 2) {
-      return failure("invalid_request", "durable native spawn requires bridge v2 and a durable journal");
+      return failure(
+        'invalid_request',
+        'durable native spawn requires bridge v2 and a durable journal',
+      );
     }
     try {
       const existing = state.journal.get(request.operationId);
       if (existing?.cancelRequested && !existing.runId) {
-        return failure("upstream_error", "operation cancellation was requested before dispatch");
+        return failure(
+          'upstream_error',
+          'operation cancellation was requested before dispatch',
+        );
       }
       await nativeCapabilities();
-      const nativeParams = { operationId: request.operationId, digest: request.fingerprint };
-      const claim = state.journal.begin(request.operationId, request.fingerprint, request.ownerRunId, request.executionLifetime, nativeParams);
-      if (claim.record.requestDigest !== request.fingerprint || claim.record.ownerRunId !== request.ownerRunId) {
-        return failure("invalid_request", "spawn operationId was already used with different parameters");
+      const nativeParams = {
+        operationId: request.operationId,
+        digest: request.fingerprint,
+      };
+      const claim = state.journal.begin(
+        request.operationId,
+        request.fingerprint,
+        request.ownerRunId,
+        request.executionLifetime,
+        nativeParams,
+      );
+      if (
+        claim.record.requestDigest !== request.fingerprint ||
+        claim.record.ownerRunId !== request.ownerRunId
+      ) {
+        return failure(
+          'invalid_request',
+          'spawn operationId was already used with different parameters',
+        );
       }
-      if (claim.record.runId || !claim.created) return durableSpawnReply(claim.record);
+      if (claim.record.runId || !claim.created)
+        return durableSpawnReply(claim.record);
       if (claim.record.cancelRequested) {
-        return failure("upstream_error", "operation cancellation was requested before dispatch");
+        return failure(
+          'upstream_error',
+          'operation cancellation was requested before dispatch',
+        );
       }
-      const upstream = await nativeRequest("spawn", request.params);
+      const upstream = await nativeRequest('spawn', request.params);
       const reply = normalizeNativeOperation(claim.record, upstream);
       const runId = extractSpawnRunId(reply);
-      if (!runId) throw new Error("pi-subagents spawn has no runId; the launch outcome is unknown");
+      if (!runId)
+        throw new Error(
+          'pi-subagents spawn has no runId; the launch outcome is unknown',
+        );
       const asyncDir = extractSpawnAsyncDir(reply);
-      state.journal.bind(request.operationId, request.fingerprint, runId, asyncDir);
+      state.journal.bind(
+        request.operationId,
+        request.fingerprint,
+        runId,
+        asyncDir,
+      );
       return {
         success: true,
-        data: { runId, requestDigest: request.fingerprint,
+        data: {
+          runId,
+          requestDigest: request.fingerprint,
           ...(asyncDir ? { asyncDir } : {}),
-          ...(request.executionLifetime ? { effectiveExecutionLifetime: request.executionLifetime } : {}) },
+          ...(request.executionLifetime
+            ? { effectiveExecutionLifetime: request.executionLifetime }
+            : {}),
+        },
       };
     } catch (error: unknown) {
-      return failure("upstream_error", error instanceof Error ? error.message : String(error));
+      return failure(
+        'upstream_error',
+        error instanceof Error ? error.message : String(error),
+      );
     }
   };
 
@@ -864,8 +1018,8 @@ export function registerPlanExecRpc(
         ? existing.reply
         : Promise.resolve(
             failure(
-              "invalid_request",
-              "spawn operationId was already used with different parameters",
+              'invalid_request',
+              'spawn operationId was already used with different parameters',
             ),
           );
     }
@@ -879,15 +1033,15 @@ export function registerPlanExecRpc(
             ? Promise.resolve(durableSpawnReply(durable))
             : Promise.resolve(
                 failure(
-                  "invalid_request",
-                  "spawn operationId was already used with different parameters",
+                  'invalid_request',
+                  'spawn operationId was already used with different parameters',
                 ),
               );
         }
       } catch (error: unknown) {
         return Promise.resolve(
           failure(
-            "upstream_error",
+            'upstream_error',
             error instanceof Error ? error.message : String(error),
           ),
         );
@@ -898,8 +1052,8 @@ export function registerPlanExecRpc(
     if (state.operations.size >= MAX_COMPLETED_OPERATION_HISTORY)
       return Promise.resolve(
         failure(
-          "operation_capacity",
-          "plan-exec operation history is full of active operations",
+          'operation_capacity',
+          'plan-exec operation history is full of active operations',
         ),
       );
 
@@ -916,15 +1070,15 @@ export function registerPlanExecRpc(
             ? Promise.resolve(durableSpawnReply(begun.record))
             : Promise.resolve(
                 failure(
-                  "invalid_request",
-                  "spawn operationId was already used with different parameters",
+                  'invalid_request',
+                  'spawn operationId was already used with different parameters',
                 ),
               );
         }
       } catch (error: unknown) {
         return Promise.resolve(
           failure(
-            "upstream_error",
+            'upstream_error',
             error instanceof Error ? error.message : String(error),
           ),
         );
@@ -938,7 +1092,7 @@ export function registerPlanExecRpc(
       ...(request.ownerRunId ? { ownerRunId: request.ownerRunId } : {}),
       reply: requestSubagents(
         events,
-        "spawn",
+        'spawn',
         request.params,
         options.timeoutMs,
         controller.signal,
@@ -947,7 +1101,7 @@ export function registerPlanExecRpc(
           const runId = extractSpawnRunId(reply);
           const asyncDir = extractSpawnAsyncDir(reply);
           if (!runId) {
-            throw new Error("pi-subagents spawn reply did not include a runId");
+            throw new Error('pi-subagents spawn reply did not include a runId');
           }
           try {
             state.journal?.bind(
@@ -980,7 +1134,8 @@ export function registerPlanExecRpc(
           };
         })
         .catch((error: unknown): Reply<SpawnResult> => {
-          const message = error instanceof Error ? error.message : String(error);
+          const message =
+            error instanceof Error ? error.message : String(error);
           try {
             state.journal?.markUnknown(
               request.operationId,
@@ -989,11 +1144,11 @@ export function registerPlanExecRpc(
             );
           } catch (journalError: unknown) {
             return failure(
-              "upstream_error",
+              'upstream_error',
               `pi-subagents spawn outcome is unknown and the operation journal could not be updated: ${journalError instanceof Error ? journalError.message : String(journalError)}`,
             );
           }
-          return failure("upstream_error", message);
+          return failure('upstream_error', message);
         })
         .then((outcome) => {
           operation.outcome = outcome;
@@ -1011,7 +1166,7 @@ export function registerPlanExecRpc(
     raw: Record<string, unknown>,
     protocolVersion: ProtocolVersion,
   ): Promise<Reply<object>> => {
-    if (method === "ping") {
+    if (method === 'ping') {
       if (protocolVersion === 1) {
         return {
           success: true,
@@ -1028,14 +1183,15 @@ export function registerPlanExecRpc(
       try {
         const upstream = await requestSubagents(
           events,
-          "ping",
+          'ping',
           {},
           options.timeoutMs,
           controller.signal,
         );
-        const capabilities = isRecord(upstream) && isRecord(upstream.capabilities)
-          ? upstream.capabilities
-          : undefined;
+        const capabilities =
+          isRecord(upstream) && isRecord(upstream.capabilities)
+            ? upstream.capabilities
+            : undefined;
         const terminalCapability = capabilities?.processTerminalProof;
         const asyncRuntime = supportsAsyncRuntime(capabilities);
         subscribeToTerminalProofs(capabilities);
@@ -1043,24 +1199,42 @@ export function registerPlanExecRpc(
           success: true,
           data: {
             version: 2,
-            protocol: "plan-exec-bridge",
+            protocol: 'plan-exec-bridge',
             capabilities: {
               workflowScriptSpawn: capabilities?.asyncSpawn === true,
-              ...(asyncRuntime && state.journal ? { singleAgentSpawn: true } : {}),
+              ...(asyncRuntime && state.journal
+                ? { singleAgentSpawn: true }
+                : {}),
               ...(state.journal && supportsDiagnosticGuidance(capabilities)
-                ? { diagnosticGuidance: capabilities?.diagnosticGuidance } : {}),
-              ...(asyncRuntime ? { executionLifetime: { version: 1, modes: ["unbounded", "bounded"] } } : {}),
-              durableOperationLookup: state.journal
-                ? { version: 1 }
-                : false,
+                ? { diagnosticGuidance: capabilities?.diagnosticGuidance }
+                : {}),
+              ...(asyncRuntime
+                ? {
+                    executionLifetime: {
+                      version: 1,
+                      modes: ['unbounded', 'bounded'],
+                    },
+                  }
+                : {}),
+              durableOperationLookup: state.journal ? { version: 1 } : false,
               processTerminalProof:
                 isRecord(terminalCapability) && terminalCapability.version === 1
                   ? { version: 1 }
                   : false,
-              ...(isRecord(capabilities?.workflowTerminalProof) && capabilities.workflowTerminalProof.version === 1
-                ? { workflowTerminalProof: { version: 1 } } : {}),
+              ...(isRecord(capabilities?.workflowTerminalProof) &&
+              capabilities.workflowTerminalProof.version === 1
+                ? { workflowTerminalProof: { version: 1 } }
+                : {}),
               ...(asyncRuntime && state.journal
-                ? { processTreeOwnership: { version: 1, scope: "owned-process-tree", escapedDescendants: "best-effort", requestMode: "supervised", routes: ["single-async"] } }
+                ? {
+                    processTreeOwnership: {
+                      version: 1,
+                      scope: 'owned-process-tree',
+                      escapedDescendants: 'best-effort',
+                      requestMode: 'supervised',
+                      routes: ['single-async'],
+                    },
+                  }
                 : {}),
             },
             methods: [...METHODS],
@@ -1068,7 +1242,7 @@ export function registerPlanExecRpc(
         };
       } catch (error: unknown) {
         return failure(
-          "upstream_error",
+          'upstream_error',
           error instanceof Error ? error.message : String(error),
         );
       } finally {
@@ -1076,125 +1250,265 @@ export function registerPlanExecRpc(
       }
     }
 
-    if (method === "diagnoseOperation") {
+    if (method === 'diagnoseOperation') {
       const request = validateOperationRequest(raw, protocolVersion);
       if (isFailure(request)) return request;
-      if (protocolVersion !== 2 || !request.requestDigest) return failure("invalid_request", "diagnoseOperation requires v2 operation ownership");
+      if (protocolVersion !== 2 || !request.requestDigest)
+        return failure(
+          'invalid_request',
+          'diagnoseOperation requires v2 operation ownership',
+        );
       const params = raw.params;
-      if (!isRecord(params) || typeof params.diagnosticId !== "string" || !params.diagnosticId.trim() || params.diagnosticId.length > 256 ||
-        typeof params.toolCallId !== "string" || !params.toolCallId.trim() || params.toolCallId.length > 512 ||
-        typeof params.message !== "string" || !params.message.trim() || params.message.length > 4096) {
-        return failure("invalid_request", "diagnoseOperation requires diagnosticId, toolCallId, and message within native limits");
+      if (
+        !isRecord(params) ||
+        typeof params.diagnosticId !== 'string' ||
+        !params.diagnosticId.trim() ||
+        params.diagnosticId.length > 256 ||
+        typeof params.toolCallId !== 'string' ||
+        !params.toolCallId.trim() ||
+        params.toolCallId.length > 512 ||
+        typeof params.message !== 'string' ||
+        !params.message.trim() ||
+        params.message.length > 4096
+      ) {
+        return failure(
+          'invalid_request',
+          'diagnoseOperation requires diagnosticId, toolCallId, and message within native limits',
+        );
       }
-      const diagnostic = { diagnosticId: params.diagnosticId, toolCallId: params.toolCallId, message: params.message };
-      const declined = (state: "cancelled" | "rejected", reason: string): Reply<object> => ({ success: true, data: {
-        operationId: request.operationId, requestDigest: request.requestDigest, diagnosticId: diagnostic.diagnosticId,
-        toolCallId: diagnostic.toolCallId, state, reason, guidanceOnly: true,
-      } });
+      const diagnostic = {
+        diagnosticId: params.diagnosticId,
+        toolCallId: params.toolCallId,
+        message: params.message,
+      };
+      const declined = (
+        state: 'cancelled' | 'rejected',
+        reason: string,
+      ): Reply<object> => ({
+        success: true,
+        data: {
+          operationId: request.operationId,
+          requestDigest: request.requestDigest,
+          diagnosticId: diagnostic.diagnosticId,
+          toolCallId: diagnostic.toolCallId,
+          state,
+          reason,
+          guidanceOnly: true,
+        },
+      });
       try {
         let operation = state.journal?.get(request.operationId);
-        if (!operation) return declined("rejected", "No durable operation mapping exists");
-        let invalid = validateOperationIdentity(request, operation.requestDigest, operation.ownerRunId);
+        if (!operation)
+          return declined('rejected', 'No durable operation mapping exists');
+        let invalid = validateOperationIdentity(
+          request,
+          operation.requestDigest,
+          operation.ownerRunId,
+        );
         if (invalid) return invalid;
-        if (operation.cancelRequested) return declined("cancelled", "Operation cancellation was already requested");
-        if (!operation.nativeCorrelated || !nonEmptyString(operation.nativeParams?.operationId) || !nonEmptyString(operation.nativeParams?.digest)) {
-          return declined("rejected", "No frozen native operation identity exists");
+        if (operation.cancelRequested)
+          return declined(
+            'cancelled',
+            'Operation cancellation was already requested',
+          );
+        if (
+          !operation.nativeCorrelated ||
+          !nonEmptyString(operation.nativeParams?.operationId) ||
+          !nonEmptyString(operation.nativeParams?.digest)
+        ) {
+          return declined(
+            'rejected',
+            'No frozen native operation identity exists',
+          );
         }
-        const ping = await nativeRequest("ping", {});
-        if (!isRecord(ping) || !isRecord(ping.capabilities) || !supportsDiagnosticGuidance(ping.capabilities)) {
-          return declined("rejected", "pi-subagents runtime does not support durable diagnostic guidance");
+        const ping = await nativeRequest('ping', {});
+        if (
+          !isRecord(ping) ||
+          !isRecord(ping.capabilities) ||
+          !supportsDiagnosticGuidance(ping.capabilities)
+        ) {
+          return declined(
+            'rejected',
+            'pi-subagents runtime does not support durable diagnostic guidance',
+          );
         }
         operation = state.journal?.get(request.operationId);
-        if (!operation) return declined("rejected", "Durable operation mapping disappeared");
-        invalid = validateOperationIdentity(request, operation.requestDigest, operation.ownerRunId);
+        if (!operation)
+          return declined('rejected', 'Durable operation mapping disappeared');
+        invalid = validateOperationIdentity(
+          request,
+          operation.requestDigest,
+          operation.ownerRunId,
+        );
         if (invalid) return invalid;
-        if (operation.cancelRequested) return declined("cancelled", "Operation cancellation was already requested");
-        if (!operation.nativeCorrelated || !nonEmptyString(operation.nativeParams?.operationId) || !nonEmptyString(operation.nativeParams?.digest)) {
-          return declined("rejected", "Frozen native operation identity disappeared");
+        if (operation.cancelRequested)
+          return declined(
+            'cancelled',
+            'Operation cancellation was already requested',
+          );
+        if (
+          !operation.nativeCorrelated ||
+          !nonEmptyString(operation.nativeParams?.operationId) ||
+          !nonEmptyString(operation.nativeParams?.digest)
+        ) {
+          return declined(
+            'rejected',
+            'Frozen native operation identity disappeared',
+          );
         }
-        const reply = await nativeRequest("diagnose", { ...nativeOperationIdentity(operation), ...diagnostic });
-        if (!isRecord(reply) || reply.diagnosticId !== diagnostic.diagnosticId || reply.toolCallId !== diagnostic.toolCallId || reply.guidanceOnly !== true ||
-          typeof reply.state !== "string" || !["queued", "pending", "cancelled", "rejected"].includes(reply.state)) {
-          throw new Error("Malformed native diagnostic guidance receipt");
+        const reply = await nativeRequest('diagnose', {
+          ...nativeOperationIdentity(operation),
+          ...diagnostic,
+        });
+        if (
+          !isRecord(reply) ||
+          reply.diagnosticId !== diagnostic.diagnosticId ||
+          reply.toolCallId !== diagnostic.toolCallId ||
+          reply.guidanceOnly !== true ||
+          typeof reply.state !== 'string' ||
+          !['queued', 'pending', 'cancelled', 'rejected'].includes(reply.state)
+        ) {
+          throw new Error('Malformed native diagnostic guidance receipt');
         }
         const data = normalizeNativeOperation(operation, reply);
-        return { success: true, data: {
-          operationId: operation.operationId, requestDigest: operation.requestDigest,
-          callerBinding: { operationId: operation.operationId, requestDigest: operation.requestDigest },
-          diagnosticId: reply.diagnosticId, toolCallId: reply.toolCallId, state: reply.state, guidanceOnly: true,
-          ...(nonEmptyString(data.runId) ? { runId: data.runId } : {}),
-          ...(nonEmptyString(reply.reason) ? { reason: reply.reason } : {}),
-        } };
+        return {
+          success: true,
+          data: {
+            operationId: operation.operationId,
+            requestDigest: operation.requestDigest,
+            callerBinding: {
+              operationId: operation.operationId,
+              requestDigest: operation.requestDigest,
+            },
+            diagnosticId: reply.diagnosticId,
+            toolCallId: reply.toolCallId,
+            state: reply.state,
+            guidanceOnly: true,
+            ...(nonEmptyString(data.runId) ? { runId: data.runId } : {}),
+            ...(nonEmptyString(reply.reason) ? { reason: reply.reason } : {}),
+          },
+        };
       } catch (error: unknown) {
-        return failure("upstream_error", error instanceof Error ? error.message : String(error));
+        return failure(
+          'upstream_error',
+          error instanceof Error ? error.message : String(error),
+        );
       }
     }
 
-    if (method === "cancelOperation") {
+    if (method === 'cancelOperation') {
       const request = validateOperationRequest(raw, protocolVersion);
       if (isFailure(request)) return request;
-      if (protocolVersion !== 2 || !request.requestDigest) return failure("invalid_request", "cancelOperation requires v2 operation ownership");
+      if (protocolVersion !== 2 || !request.requestDigest)
+        return failure(
+          'invalid_request',
+          'cancelOperation requires v2 operation ownership',
+        );
       const durable = state.journal?.get(request.operationId);
       if (durable) {
-        const invalid = validateOperationIdentity(request, durable.requestDigest, durable.ownerRunId);
+        const invalid = validateOperationIdentity(
+          request,
+          durable.requestDigest,
+          durable.ownerRunId,
+        );
         if (invalid) return invalid;
       }
       try {
         await nativeCapabilities();
-        if (!state.journal) throw new Error("cancelOperation requires a durable journal");
-        const cancelled = state.journal.requestNativeCancel(request.operationId, request.requestDigest, request.ownerRunId);
+        if (!state.journal)
+          throw new Error('cancelOperation requires a durable journal');
+        const cancelled = state.journal.requestNativeCancel(
+          request.operationId,
+          request.requestDigest,
+          request.ownerRunId,
+        );
         if (!cancelled.runId) {
-          return { success: true, data: { operationId: cancelled.operationId, requestDigest: cancelled.requestDigest,
-            state: "cancelled", cancellationRequested: true, neverStarted: true, replaySafe: false } };
+          return {
+            success: true,
+            data: {
+              operationId: cancelled.operationId,
+              requestDigest: cancelled.requestDigest,
+              state: 'cancelled',
+              cancellationRequested: true,
+              neverStarted: true,
+              replaySafe: false,
+            },
+          };
         }
-        const result = await nativeRequest("stop", {
+        const result = await nativeRequest('stop', {
           id: cancelled.runId,
           ...(cancelled.asyncDir ? { dir: cancelled.asyncDir } : {}),
         });
-        const stopRequest: RunRequest = { runId: cancelled.runId, ...(cancelled.asyncDir ? { asyncDir: cancelled.asyncDir } : {}) };
-        return { success: true, data: { operationId: cancelled.operationId, requestDigest: cancelled.requestDigest,
-          runId: cancelled.runId, state: "cancelled", cancellationRequested: true, neverStarted: false,
+        const stopRequest: RunRequest = {
+          runId: cancelled.runId,
           ...(cancelled.asyncDir ? { asyncDir: cancelled.asyncDir } : {}),
-          nativeState: normalizeStop(stopRequest, result).state } };
+        };
+        return {
+          success: true,
+          data: {
+            operationId: cancelled.operationId,
+            requestDigest: cancelled.requestDigest,
+            runId: cancelled.runId,
+            state: 'cancelled',
+            cancellationRequested: true,
+            neverStarted: false,
+            ...(cancelled.asyncDir ? { asyncDir: cancelled.asyncDir } : {}),
+            nativeState: normalizeStop(stopRequest, result).state,
+          },
+        };
       } catch (error: unknown) {
-        return failure("upstream_error", error instanceof Error ? error.message : String(error));
+        return failure(
+          'upstream_error',
+          error instanceof Error ? error.message : String(error),
+        );
       }
     }
 
-    if (method === "spawn") {
+    if (method === 'spawn') {
       if (protocolVersion === 2 && !state.journal) {
         return failure(
-          "upstream_error",
-          "plan-exec bridge v2 requires a durable operation journal",
+          'upstream_error',
+          'plan-exec bridge v2 requires a durable operation journal',
         );
       }
       const request = validateSpawn(raw, protocolVersion);
       if (isFailure(request)) return request;
-      const outcome = request.executionLifetime ? await startNativeOperation(request) : await startOperation(request);
+      const outcome = request.executionLifetime
+        ? await startNativeOperation(request)
+        : await startOperation(request);
       if (!outcome.success || protocolVersion === 2) return outcome;
       const { requestDigest: _requestDigest, ...data } = outcome.data;
       return { success: true, data };
     }
 
-    if (method === "operation") {
+    if (method === 'operation') {
       if (protocolVersion === 2 && !state.journal) {
         return failure(
-          "upstream_error",
-          "plan-exec bridge v2 requires a durable operation journal",
+          'upstream_error',
+          'plan-exec bridge v2 requires a durable operation journal',
         );
       }
       const request = validateOperationRequest(raw, protocolVersion);
       if (isFailure(request)) return request;
       const nativeRecord = state.journal?.get(request.operationId);
       if (nativeRecord?.nativeCorrelated) {
-        const invalid = validateOperationIdentity(request, nativeRecord.requestDigest, nativeRecord.ownerRunId);
+        const invalid = validateOperationIdentity(
+          request,
+          nativeRecord.requestDigest,
+          nativeRecord.ownerRunId,
+        );
         if (invalid) return invalid;
-        const proof = nativeRecord.runId ? state.terminalProofs.get(nativeRecord.runId) : undefined;
+        const proof = nativeRecord.runId
+          ? state.terminalProofs.get(nativeRecord.runId)
+          : undefined;
         const data = proof
           ? { ...durableLookup(nativeRecord), processTerminalProof: proof }
           : durableLookup(nativeRecord);
         if (protocolVersion === 2) {
-          return { success: true, data: { operationId: request.operationId, ...data } };
+          return {
+            success: true,
+            data: { operationId: request.operationId, ...data },
+          };
         }
         const { requestDigest: _requestDigest, ...legacyData } = data;
         return { success: true, data: legacyData };
@@ -1208,11 +1522,11 @@ export function registerPlanExecRpc(
         );
         if (identityFailure) return identityFailure;
         const operationData = !operation.outcome
-          ? { state: "pending", requestDigest: operation.fingerprint }
+          ? { state: 'pending', requestDigest: operation.fingerprint }
           : operation.outcome.success
-            ? { state: "found", ...operation.outcome.data }
+            ? { state: 'found', ...operation.outcome.data }
             : {
-                state: "unknown",
+                state: 'unknown',
                 requestDigest: operation.fingerprint,
                 error: operation.outcome.error.message,
               };
@@ -1238,8 +1552,8 @@ export function registerPlanExecRpc(
         const operationData = durable
           ? durableLookup(durable)
           : protocolVersion === 2
-            ? { state: "absent", requestDigest: request.requestDigest }
-            : { state: "absent" };
+            ? { state: 'absent', requestDigest: request.requestDigest }
+            : { state: 'absent' };
         if (protocolVersion === 2) {
           return {
             success: true,
@@ -1247,14 +1561,12 @@ export function registerPlanExecRpc(
           };
         }
         if (!durable) return { success: true, data: operationData };
-        const {
-          requestDigest: _requestDigest,
-          ...legacyData
-        } = durableLookup(durable);
+        const { requestDigest: _requestDigest, ...legacyData } =
+          durableLookup(durable);
         return { success: true, data: legacyData };
       } catch (error: unknown) {
         return failure(
-          "upstream_error",
+          'upstream_error',
           error instanceof Error ? error.message : String(error),
         );
       }
@@ -1269,17 +1581,35 @@ export function registerPlanExecRpc(
       try {
         operation = state.journal?.getByRunId(request.runId);
       } catch (error: unknown) {
-        return { success: true, data: { runId: request.runId, state: "unknown",
-          reason: error instanceof Error ? error.message : String(error) } };
+        return {
+          success: true,
+          data: {
+            runId: request.runId,
+            state: 'unknown',
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        };
       }
       if (protocolVersion === 2 && !operation) {
-        return { success: true, data: { runId: request.runId, state: "unknown", reason: "No durable caller-to-native mapping exists for this runId" } };
+        return {
+          success: true,
+          data: {
+            runId: request.runId,
+            state: 'unknown',
+            reason: 'No durable caller-to-native mapping exists for this runId',
+          },
+        };
       }
-      if (method === "stop") {
-        if (operation) state.journal?.requestNativeCancel(operation.operationId, operation.requestDigest, operation.ownerRunId);
+      if (method === 'stop') {
+        if (operation)
+          state.journal?.requestNativeCancel(
+            operation.operationId,
+            operation.requestDigest,
+            operation.ownerRunId,
+          );
         const upstream = await requestSubagents(
           events,
-          "stop",
+          'stop',
           {
             id: request.runId,
             ...(request.asyncDir ? { dir: request.asyncDir } : {}),
@@ -1292,10 +1622,15 @@ export function registerPlanExecRpc(
 
       // pi-subagents exposes terminal result metadata through its status RPC.
       if (operation?.nativeCorrelated) {
-        if (operation.cancelRequested) state.journal?.requestNativeCancel(operation.operationId, operation.requestDigest, operation.ownerRunId);
+        if (operation.cancelRequested)
+          state.journal?.requestNativeCancel(
+            operation.operationId,
+            operation.requestDigest,
+            operation.ownerRunId,
+          );
         const upstream = await requestSubagents(
           events,
-          "status",
+          'status',
           {
             id: request.runId,
             ...(request.asyncDir ? { dir: request.asyncDir } : {}),
@@ -1303,16 +1638,28 @@ export function registerPlanExecRpc(
           options.timeoutMs,
           controller.signal,
         );
-        const observed = normalizeObservation(request, upstream, method === "adopt", protocolVersion === 2);
+        const observed = normalizeObservation(
+          request,
+          upstream,
+          method === 'adopt',
+          protocolVersion === 2,
+        );
         const proof = state.terminalProofs.get(request.runId);
         if (proof && observed.state) {
-          return { success: true, data: { ...observed, processTerminal: proof, processTerminalProof: proof } };
+          return {
+            success: true,
+            data: {
+              ...observed,
+              processTerminal: proof,
+              processTerminalProof: proof,
+            },
+          };
         }
         return { success: true, data: observed };
       }
       const upstream = await requestSubagents(
         events,
-        "status",
+        'status',
         {
           id: request.runId,
           ...(request.asyncDir ? { dir: request.asyncDir } : {}),
@@ -1323,17 +1670,24 @@ export function registerPlanExecRpc(
       const observed = normalizeObservation(
         request,
         upstream,
-        method === "adopt",
+        method === 'adopt',
         protocolVersion === 2,
       );
       const proof = state.terminalProofs.get(request.runId);
       return {
         success: true,
-        data: proof && observed.state ? { ...observed, processTerminal: proof, processTerminalProof: proof } : observed,
+        data:
+          proof && observed.state
+            ? {
+                ...observed,
+                processTerminal: proof,
+                processTerminalProof: proof,
+              }
+            : observed,
       };
     } catch (error: unknown) {
       return failure(
-        "upstream_error",
+        'upstream_error',
         error instanceof Error ? error.message : String(error),
       );
     } finally {
@@ -1344,7 +1698,7 @@ export function registerPlanExecRpc(
   const subscribe = (
     event: string,
     protocolVersion: ProtocolVersion,
-  ): Unsubscribe | void =>
+  ): Unsubscribe | undefined =>
     events.on(event, (raw: unknown) => {
       if (!isRecord(raw)) return;
       const requestId = nonEmptyString(raw.requestId);
@@ -1354,7 +1708,7 @@ export function registerPlanExecRpc(
           protocolVersion,
           requestId,
           failure(
-            "invalid_request",
+            'invalid_request',
             `unsupported plan-exec RPC version: ${String(raw.version)}`,
           ),
         );
@@ -1365,7 +1719,7 @@ export function registerPlanExecRpc(
         emit(
           protocolVersion,
           requestId,
-          failure("invalid_request", "request requires a method"),
+          failure('invalid_request', 'request requires a method'),
         );
         return;
       }
@@ -1373,15 +1727,23 @@ export function registerPlanExecRpc(
         emit(
           protocolVersion,
           requestId,
-          failure("invalid_request", `unsupported method: ${methodName}`),
+          failure('invalid_request', `unsupported method: ${methodName}`),
         );
         return;
       }
 
       void invoke(methodName, raw, protocolVersion)
         .then((reply) => emit(protocolVersion, requestId, reply))
-        .catch((error: unknown) => emit(protocolVersion, requestId,
-          failure("upstream_error", error instanceof Error ? error.message : String(error))));
+        .catch((error: unknown) =>
+          emit(
+            protocolVersion,
+            requestId,
+            failure(
+              'upstream_error',
+              error instanceof Error ? error.message : String(error),
+            ),
+          ),
+        );
     });
   const unsubscribes = [
     subscribe(PLAN_EXEC_REQUEST_EVENT, 1),

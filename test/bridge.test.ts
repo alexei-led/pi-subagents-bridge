@@ -1,37 +1,37 @@
-import assert from "node:assert/strict";
-import { spawn, type ChildProcessByStdio } from "node:child_process";
-import type { Readable } from "node:stream";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import test from "node:test";
-import { registerBridge } from "../src/index.js";
-import { OperationJournal } from "../src/operation-journal.js";
+import assert from 'node:assert/strict';
+import { type ChildProcessByStdio, spawn } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { Readable } from 'node:stream';
+import { onTestFinished, test } from 'vitest';
+import { registerBridge } from '../src/index.js';
+import { OperationJournal } from '../src/operation-journal.js';
 
-const PING_CHANNEL = "subagents:rpc:ping";
-const SPAWN_CHANNEL = "subagents:rpc:spawn";
-const STOP_CHANNEL = "subagents:rpc:stop";
-const COMPLETED_EVENT = "subagents:completed";
-const FAILED_EVENT = "subagents:failed";
-const READY_EVENT = "subagents:ready";
-const NB_REQUEST_CHANNEL = "subagents:rpc:v1:request";
-const NB_COMPLETE_EVENT = "subagent:async-complete";
-const NB_REPLY_PREFIX = "subagents:rpc:v1:reply:";
+const PING_CHANNEL = 'subagents:rpc:ping';
+const SPAWN_CHANNEL = 'subagents:rpc:spawn';
+const STOP_CHANNEL = 'subagents:rpc:stop';
+const COMPLETED_EVENT = 'subagents:completed';
+const FAILED_EVENT = 'subagents:failed';
+const READY_EVENT = 'subagents:ready';
+const NB_REQUEST_CHANNEL = 'subagents:rpc:v1:request';
+const NB_COMPLETE_EVENT = 'subagent:async-complete';
+const NB_REPLY_PREFIX = 'subagents:rpc:v1:reply:';
 
-test("registerBridge announces readiness and answers v2 ping", async () => {
+test('registerBridge announces readiness and answers v2 ping', async () => {
   const bus = new FakeEventBus();
   registerBridge({ events: bus });
 
   assert.equal(bus.count(READY_EVENT), 1);
   assert.deepEqual(bus.lastPayload(READY_EVENT), {});
 
-  const reply = once(bus, replyChannel(PING_CHANNEL, "ping-1"));
-  bus.emit(PING_CHANNEL, { requestId: "ping-1" });
+  const reply = once(bus, replyChannel(PING_CHANNEL, 'ping-1'));
+  bus.emit(PING_CHANNEL, { requestId: 'ping-1' });
 
   assert.deepEqual(await reply, { success: true, data: { version: 2 } });
 });
 
-test("spawn waits for an authoritative Pi session identity", async () => {
+test('spawn waits for an authoritative Pi session identity', async () => {
   const bus = new FakeEventBus();
   const session = { id: undefined as string | undefined };
   const bridge = registerBridge(
@@ -41,28 +41,28 @@ test("spawn waits for an authoritative Pi session identity", async () => {
 
   const unavailable = once(
     bus,
-    replyChannel(SPAWN_CHANNEL, "spawn-before-session"),
+    replyChannel(SPAWN_CHANNEL, 'spawn-before-session'),
   );
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-before-session",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'spawn-before-session',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   });
   assert.deepEqual(await unavailable, {
     success: false,
-    error: "Pi session identity is not initialized",
+    error: 'Pi session identity is not initialized',
   });
   assert.equal(bus.count(NB_REQUEST_CHANNEL), 0);
 
-  session.id = "session-a";
+  session.id = 'session-a';
   const available = once(
     bus,
-    replyChannel(SPAWN_CHANNEL, "spawn-after-session"),
+    replyChannel(SPAWN_CHANNEL, 'spawn-after-session'),
   );
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-after-session",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'spawn-after-session',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   });
   const request = bus.lastPayload(NB_REQUEST_CHANNEL);
   assert.ok(isRecord(request));
@@ -70,66 +70,66 @@ test("spawn waits for an authoritative Pi session identity", async () => {
     version: 1,
     requestId: request.requestId,
     success: true,
-    data: { details: { runId: "session-ready-run" } },
+    data: { details: { runId: 'session-ready-run' } },
   });
   assert.deepEqual(await available, {
     success: true,
-    data: { id: "session-ready-run" },
+    data: { id: 'session-ready-run' },
   });
   bridge.dispose();
 });
 
-test("spawn forwards the normalized pi-tasks request and returns the launched run id", async () => {
+test('spawn forwards the normalized pi-tasks request and returns the launched run id', async () => {
   const bus = new FakeEventBus();
   registerBridge({ events: bus });
 
-  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-1"));
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, 'spawn-1'));
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-1",
-    type: "general-purpose",
-    prompt: "Do the task",
-    options: { model: "anthropic/claude-sonnet-4", maxTurns: 5 },
+    requestId: 'spawn-1',
+    type: 'general-purpose',
+    prompt: 'Do the task',
+    options: { model: 'anthropic/claude-sonnet-4', maxTurns: 5 },
   });
 
   const request = bus.lastPayload(NB_REQUEST_CHANNEL);
   assert.ok(isRecord(request));
   assert.equal(request.version, 1);
-  assert.equal(request.method, "spawn");
+  assert.equal(request.method, 'spawn');
   assert.deepEqual(request.params, {
     workflowScript:
       'return runs.run("main", {"agent":"delegate","task":"Do the task","control":{"enabled":false}})',
     async: true,
-    context: "fresh",
+    context: 'fresh',
     acceptance: {
-      level: "none",
+      level: 'none',
       reason:
-        "pi-tasks bridge manages task lifecycle and result propagation; do not require pi-subagents acceptance reports.",
+        'pi-tasks bridge manages task lifecycle and result propagation; do not require pi-subagents acceptance reports.',
     },
     control: { enabled: false },
-    model: "anthropic/claude-sonnet-4",
+    model: 'anthropic/claude-sonnet-4',
     turnBudget: { maxTurns: 5 },
   });
 
   bus.emit(nbReplyChannel(String(request.requestId)), {
     version: 1,
     requestId: request.requestId,
-    method: "spawn",
+    method: 'spawn',
     success: true,
-    data: { text: "started", details: { runId: "run-1", asyncId: "run-1" } },
+    data: { text: 'started', details: { runId: 'run-1', asyncId: 'run-1' } },
   });
 
-  assert.deepEqual(await reply, { success: true, data: { id: "run-1" } });
+  assert.deepEqual(await reply, { success: true, data: { id: 'run-1' } });
 });
 
-test("spawn defaults to a twelve-turn budget", async () => {
+test('spawn defaults to a twelve-turn budget', async () => {
   const bus = new FakeEventBus();
   registerBridge({ events: bus });
 
-  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-default-turns"));
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, 'spawn-default-turns'));
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-default-turns",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'spawn-default-turns',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   });
 
   const request = bus.lastPayload(NB_REQUEST_CHANNEL);
@@ -141,20 +141,20 @@ test("spawn defaults to a twelve-turn budget", async () => {
     version: 1,
     requestId: request.requestId,
     success: true,
-    data: { details: { runId: "default-turns" } },
+    data: { details: { runId: 'default-turns' } },
   });
   assert.deepEqual(await reply, {
     success: true,
-    data: { id: "default-turns" },
+    data: { id: 'default-turns' },
   });
 });
 
-test("spawn supports documented aliases, keeps custom agent names unchanged, and disables pi-subagents acceptance/control gates", async () => {
+test('spawn supports documented aliases, keeps custom agent names unchanged, and disables pi-subagents acceptance/control gates', async () => {
   const cases = [
-    { type: "general-purpose", expectedAgent: "delegate" },
-    { type: "Explore", expectedAgent: "scout" },
-    { type: "explore", expectedAgent: "scout" },
-    { type: "my-agent", expectedAgent: "my-agent" },
+    { type: 'general-purpose', expectedAgent: 'delegate' },
+    { type: 'Explore', expectedAgent: 'scout' },
+    { type: 'explore', expectedAgent: 'scout' },
+    { type: 'my-agent', expectedAgent: 'my-agent' },
   ] as const;
 
   for (const { type, expectedAgent } of cases) {
@@ -165,7 +165,7 @@ test("spawn supports documented aliases, keeps custom agent names unchanged, and
     bus.emit(SPAWN_CHANNEL, {
       requestId: `spawn-${type}`,
       type,
-      prompt: "Do the task",
+      prompt: 'Do the task',
     });
 
     const request = bus.lastPayload(NB_REQUEST_CHANNEL);
@@ -175,13 +175,13 @@ test("spawn supports documented aliases, keeps custom agent names unchanged, and
       request.params.workflowScript,
       `return runs.run("main", {"agent":"${expectedAgent}","task":"Do the task","control":{"enabled":false}})`,
     );
-    assert.equal(Object.hasOwn(request.params, "agent"), false);
-    assert.equal(Object.hasOwn(request.params, "task"), false);
-    assert.equal(Object.hasOwn(request.params, "clarify"), false);
+    assert.equal(Object.hasOwn(request.params, 'agent'), false);
+    assert.equal(Object.hasOwn(request.params, 'task'), false);
+    assert.equal(Object.hasOwn(request.params, 'clarify'), false);
     assert.deepEqual(request.params.acceptance, {
-      level: "none",
+      level: 'none',
       reason:
-        "pi-tasks bridge manages task lifecycle and result propagation; do not require pi-subagents acceptance reports.",
+        'pi-tasks bridge manages task lifecycle and result propagation; do not require pi-subagents acceptance reports.',
     });
     assert.deepEqual(request.params.control, { enabled: false });
 
@@ -199,39 +199,39 @@ test("spawn supports documented aliases, keeps custom agent names unchanged, and
   }
 });
 
-test("spawn rejects missing required pi-tasks fields", async () => {
+test('spawn rejects missing required pi-tasks fields', async () => {
   const bus = new FakeEventBus();
   registerBridge({ events: bus });
 
-  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-invalid"));
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, 'spawn-invalid'));
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-invalid",
-    type: "general-purpose",
+    requestId: 'spawn-invalid',
+    type: 'general-purpose',
   });
 
   assert.deepEqual(await reply, {
     success: false,
-    error: "spawn requires string type and prompt",
+    error: 'spawn requires string type and prompt',
   });
   assert.equal(bus.count(NB_REQUEST_CHANNEL), 0);
 });
 
-test("spawn accepts fallback run ids and surfaces reply-shape errors", async () => {
+test('spawn accepts fallback run ids and surfaces reply-shape errors', async () => {
   const successCases = [
     {
-      label: "details.asyncId",
-      data: { details: { asyncId: "async-only" } },
-      expectedId: "async-only",
+      label: 'details.asyncId',
+      data: { details: { asyncId: 'async-only' } },
+      expectedId: 'async-only',
     },
     {
-      label: "top-level runId",
-      data: { runId: "top-run" },
-      expectedId: "top-run",
+      label: 'top-level runId',
+      data: { runId: 'top-run' },
+      expectedId: 'top-run',
     },
     {
-      label: "top-level asyncId",
-      data: { asyncId: "top-async" },
-      expectedId: "top-async",
+      label: 'top-level asyncId',
+      data: { asyncId: 'top-async' },
+      expectedId: 'top-async',
     },
   ] as const;
 
@@ -245,8 +245,8 @@ test("spawn accepts fallback run ids and surfaces reply-shape errors", async () 
     );
     bus.emit(SPAWN_CHANNEL, {
       requestId: `spawn-${successCase.label}`,
-      type: "general-purpose",
-      prompt: "Do the task",
+      type: 'general-purpose',
+      prompt: 'Do the task',
     });
 
     const request = bus.lastPayload(NB_REQUEST_CHANNEL);
@@ -255,7 +255,7 @@ test("spawn accepts fallback run ids and surfaces reply-shape errors", async () 
     bus.emit(nbReplyChannel(String(request.requestId)), {
       version: 1,
       requestId: request.requestId,
-      method: "spawn",
+      method: 'spawn',
       success: true,
       data: successCase.data,
     });
@@ -268,29 +268,29 @@ test("spawn accepts fallback run ids and surfaces reply-shape errors", async () 
 
   const failureCases = [
     {
-      label: "malformed-reply",
-      payload: { requestId: "req", method: "spawn" },
-      expectedError: "Malformed nicobailon RPC reply.",
+      label: 'malformed-reply',
+      payload: { requestId: 'req', method: 'spawn' },
+      expectedError: 'Malformed nicobailon RPC reply.',
     },
     {
-      label: "missing-run-id",
+      label: 'missing-run-id',
       payload: {
         version: 1,
-        requestId: "req",
+        requestId: 'req',
         success: true,
         data: { details: {} },
       },
-      expectedError: "nicobailon spawn reply did not include a run id",
+      expectedError: 'nicobailon spawn reply did not include a run id',
     },
     {
-      label: "remote-error-without-message",
+      label: 'remote-error-without-message',
       payload: {
         version: 1,
-        requestId: "req",
+        requestId: 'req',
         success: false,
-        error: { code: "bad" },
+        error: { code: 'bad' },
       },
-      expectedError: "nicobailon RPC error",
+      expectedError: 'nicobailon RPC error',
     },
   ] as const;
 
@@ -304,8 +304,8 @@ test("spawn accepts fallback run ids and surfaces reply-shape errors", async () 
     );
     bus.emit(SPAWN_CHANNEL, {
       requestId: `spawn-${failureCase.label}`,
-      type: "general-purpose",
-      prompt: "Do the task",
+      type: 'general-purpose',
+      prompt: 'Do the task',
     });
 
     const request = bus.lastPayload(NB_REQUEST_CHANNEL);
@@ -320,15 +320,15 @@ test("spawn accepts fallback run ids and surfaces reply-shape errors", async () 
   }
 });
 
-test("duplicate spawn requests start one run and replay its response", async () => {
+test('duplicate spawn requests start one run and replay its response', async () => {
   const bus = new FakeEventBus();
   registerBridge({ events: bus });
 
-  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-duplicate"));
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, 'spawn-duplicate'));
   const request = {
-    requestId: "spawn-duplicate",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'spawn-duplicate',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   };
   bus.emit(SPAWN_CHANNEL, request);
   bus.emit(SPAWN_CHANNEL, request);
@@ -340,25 +340,25 @@ test("duplicate spawn requests start one run and replay its response", async () 
     version: 1,
     requestId: spawned.requestId,
     success: true,
-    data: { details: { runId: "deduped-run" } },
+    data: { details: { runId: 'deduped-run' } },
   });
 
-  assert.deepEqual(await reply, { success: true, data: { id: "deduped-run" } });
+  assert.deepEqual(await reply, { success: true, data: { id: 'deduped-run' } });
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(bus.count(replyChannel(SPAWN_CHANNEL, "spawn-duplicate")), 2);
+  assert.equal(bus.count(replyChannel(SPAWN_CHANNEL, 'spawn-duplicate')), 2);
 });
 
-test("in-memory legacy replay rejects request and session mismatches", async () => {
+test('in-memory legacy replay rejects request and session mismatches', async () => {
   const bus = new FakeEventBus();
-  const session = { id: "session-a" };
+  const session = { id: 'session-a' };
   const bridge = registerBridge(
     { events: bus },
     { getSessionId: () => session.id },
   );
   const request = {
-    requestId: "in-memory-identity",
-    type: "general-purpose",
-    prompt: "Original task",
+    requestId: 'in-memory-identity',
+    type: 'general-purpose',
+    prompt: 'Original task',
   };
   bus.emit(SPAWN_CHANNEL, request);
   const upstream = bus.lastPayload(NB_REQUEST_CHANNEL);
@@ -368,14 +368,14 @@ test("in-memory legacy replay rejects request and session mismatches", async () 
     bus,
     replyChannel(SPAWN_CHANNEL, request.requestId),
   );
-  bus.emit(SPAWN_CHANNEL, { ...request, prompt: "Different task" });
+  bus.emit(SPAWN_CHANNEL, { ...request, prompt: 'Different task' });
   assert.deepEqual(await payloadConflict, {
     success: false,
-    error: "spawn requestId was already used by another request",
+    error: 'spawn requestId was already used by another request',
   });
   assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
 
-  session.id = "session-b";
+  session.id = 'session-b';
   const sessionConflict = once(
     bus,
     replyChannel(SPAWN_CHANNEL, request.requestId),
@@ -383,7 +383,7 @@ test("in-memory legacy replay rejects request and session mismatches", async () 
   bus.emit(SPAWN_CHANNEL, request);
   assert.deepEqual(await sessionConflict, {
     success: false,
-    error: "spawn requestId was already used by another request",
+    error: 'spawn requestId was already used by another request',
   });
   assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
 
@@ -391,7 +391,7 @@ test("in-memory legacy replay rejects request and session mismatches", async () 
     version: 1,
     requestId: upstream.requestId,
     success: true,
-    data: { details: { runId: "in-memory-run" } },
+    data: { details: { runId: 'in-memory-run' } },
   });
   await waitFor(
     () => bus.count(replyChannel(SPAWN_CHANNEL, request.requestId)) === 3,
@@ -399,25 +399,25 @@ test("in-memory legacy replay rejects request and session mismatches", async () 
   bridge.dispose();
 });
 
-test("durable legacy request identity prevents redispatch after reply-cache expiry", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-legacy-"));
-  const journalPath = join(root, "operations.sqlite");
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+test('durable legacy request identity prevents redispatch after reply-cache expiry', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-subagents-bridge-legacy-'));
+  const journalPath = join(root, 'operations.sqlite');
+  onTestFinished(() => rmSync(root, { recursive: true, force: true }));
   const bus = new FakeEventBus();
   const bridge = registerBridge(
     { events: bus },
     {
       planExecJournalPath: journalPath,
       spawnReplyCacheTtlMs: 1,
-      getSessionId: () => "session-a",
+      getSessionId: () => 'session-a',
     },
   );
-  t.after(() => bridge.dispose());
+  onTestFinished(() => bridge.dispose());
 
   const request = {
-    requestId: "durable-legacy-request",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'durable-legacy-request',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   };
   const firstReply = once(bus, replyChannel(SPAWN_CHANNEL, request.requestId));
   bus.emit(SPAWN_CHANNEL, request);
@@ -427,11 +427,11 @@ test("durable legacy request identity prevents redispatch after reply-cache expi
     version: 1,
     requestId: spawned.requestId,
     success: true,
-    data: { details: { runId: "durable-legacy-run" } },
+    data: { details: { runId: 'durable-legacy-run' } },
   });
   assert.deepEqual(await firstReply, {
     success: true,
-    data: { id: "durable-legacy-run" },
+    data: { id: 'durable-legacy-run' },
   });
 
   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -439,34 +439,34 @@ test("durable legacy request identity prevents redispatch after reply-cache expi
   bus.emit(SPAWN_CHANNEL, request);
   assert.deepEqual(await replay, {
     success: true,
-    data: { id: "durable-legacy-run" },
+    data: { id: 'durable-legacy-run' },
   });
   assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
 
   await new Promise((resolve) => setTimeout(resolve, 5));
   const conflict = once(bus, replyChannel(SPAWN_CHANNEL, request.requestId));
-  bus.emit(SPAWN_CHANNEL, { ...request, prompt: "Different task" });
+  bus.emit(SPAWN_CHANNEL, { ...request, prompt: 'Different task' });
   assert.deepEqual(await conflict, {
     success: false,
-    error: "spawn requestId was already used by another request",
+    error: 'spawn requestId was already used by another request',
   });
   assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
 });
 
-test("legacy binding persistence is retried after a transient failure", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-binding-"));
-  const journal = new OperationJournal(join(root, "operations.sqlite"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+test('legacy binding persistence is retried after a transient failure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-subagents-bridge-binding-'));
+  const journal = new OperationJournal(join(root, 'operations.sqlite'));
+  onTestFinished(() => rmSync(root, { recursive: true, force: true }));
   const bind = journal.bindLegacySpawn.bind(journal);
   let attempts = 0;
   journal.bindLegacySpawn = (...args) => {
     attempts += 1;
-    if (attempts === 1) throw new Error("transient binding failure");
+    if (attempts === 1) throw new Error('transient binding failure');
     return bind(...args);
   };
   const originalError = console.error;
   console.error = () => undefined;
-  t.after(() => {
+  onTestFinished(() => {
     console.error = originalError;
   });
 
@@ -475,43 +475,43 @@ test("legacy binding persistence is retried after a transient failure", async (t
     { events: bus },
     {
       operationJournal: journal,
-      getSessionId: () => "session-a",
+      getSessionId: () => 'session-a',
       acceptedRunReconcileIntervalMs: 5,
       spawnReplyCacheTtlMs: 1,
     },
   );
-  t.after(() => bridge.dispose());
-  await spawnOwnedRun(bus, "binding-retry-run");
+  onTestFinished(() => bridge.dispose());
+  await spawnOwnedRun(bus, 'binding-retry-run');
   await waitFor(() => attempts >= 2);
   await new Promise((resolve) => setTimeout(resolve, 5));
 
   const replay = once(
     bus,
-    replyChannel(SPAWN_CHANNEL, "spawn-binding-retry-run"),
+    replyChannel(SPAWN_CHANNEL, 'spawn-binding-retry-run'),
   );
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-binding-retry-run",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'spawn-binding-retry-run',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   });
   assert.deepEqual(await replay, {
     success: true,
-    data: { id: "binding-retry-run" },
+    data: { id: 'binding-retry-run' },
   });
   assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
 });
 
-test("bridge registration is idempotent and cannot duplicate spawn handlers", async () => {
+test('bridge registration is idempotent and cannot duplicate spawn handlers', async () => {
   const bus = new FakeEventBus();
   const firstBridge = registerBridge({ events: bus });
   const secondBridge = registerBridge({ events: bus });
   assert.equal(secondBridge, firstBridge);
 
-  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-single-handler"));
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, 'spawn-single-handler'));
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-single-handler",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'spawn-single-handler',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   });
 
   assert.equal(bus.count(NB_REQUEST_CHANNEL), 1);
@@ -521,43 +521,43 @@ test("bridge registration is idempotent and cannot duplicate spawn handlers", as
     version: 1,
     requestId: request.requestId,
     success: true,
-    data: { details: { runId: "single-handler-run" } },
+    data: { details: { runId: 'single-handler-run' } },
   });
   assert.deepEqual(await reply, {
     success: true,
-    data: { id: "single-handler-run" },
+    data: { id: 'single-handler-run' },
   });
 });
 
-test("bridge limits active runs to two and permits retry after capacity frees", async () => {
+test('bridge limits active runs to two and permits retry after capacity frees', async () => {
   const bus = new FakeEventBus();
   registerBridge({ events: bus });
-  await spawnOwnedRun(bus, "capacity-one");
-  await spawnOwnedRun(bus, "capacity-two");
+  await spawnOwnedRun(bus, 'capacity-one');
+  await spawnOwnedRun(bus, 'capacity-two');
 
   const requestsBefore = bus.count(NB_REQUEST_CHANNEL);
   const spawnRequest = {
-    requestId: "capacity-three",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'capacity-three',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   };
-  const rejected = once(bus, replyChannel(SPAWN_CHANNEL, "capacity-three"));
+  const rejected = once(bus, replyChannel(SPAWN_CHANNEL, 'capacity-three'));
   bus.emit(SPAWN_CHANNEL, spawnRequest);
 
   assert.deepEqual(await rejected, {
     success: false,
-    error: "bridge capacity reached: at most 2 active runs",
+    error: 'bridge capacity reached: at most 2 active runs',
   });
   assert.equal(bus.count(NB_REQUEST_CHANNEL), requestsBefore);
 
   bus.emit(NB_COMPLETE_EVENT, {
-    runId: "capacity-one",
+    runId: 'capacity-one',
     success: true,
-    state: "complete",
-    summary: "done",
+    state: 'complete',
+    summary: 'done',
   });
 
-  const retried = once(bus, replyChannel(SPAWN_CHANNEL, "capacity-three"));
+  const retried = once(bus, replyChannel(SPAWN_CHANNEL, 'capacity-three'));
   bus.emit(SPAWN_CHANNEL, spawnRequest);
   assert.equal(bus.count(NB_REQUEST_CHANNEL), requestsBefore + 1);
   const request = bus.lastPayload(NB_REQUEST_CHANNEL);
@@ -566,23 +566,23 @@ test("bridge limits active runs to two and permits retry after capacity frees", 
     version: 1,
     requestId: request.requestId,
     success: true,
-    data: { details: { runId: "capacity-three" } },
+    data: { details: { runId: 'capacity-three' } },
   });
   assert.deepEqual(await retried, {
     success: true,
-    data: { id: "capacity-three" },
+    data: { id: 'capacity-three' },
   });
 });
 
-test("spawn timeout uses the configured timeout and cleans up the listener", async () => {
+test('spawn timeout uses the configured timeout and cleans up the listener', async () => {
   const bus = new FakeEventBus();
   registerBridge({ events: bus }, { spawnTimeoutMs: 1 });
 
-  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-timeout"), 250);
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, 'spawn-timeout'), 250);
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-timeout",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'spawn-timeout',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   });
 
   const request = bus.lastPayload(NB_REQUEST_CHANNEL);
@@ -596,16 +596,16 @@ test("spawn timeout uses the configured timeout and cleans up the listener", asy
   assert.equal(bus.listenerCount(nbReplyChannel(String(request.requestId))), 0);
 });
 
-test("stop replies success, dedupes owned runs, and ignores unknown runs", async () => {
+test('stop replies success, dedupes owned runs, and ignores unknown runs', async () => {
   const bus = new FakeEventBus();
   registerBridge({ events: bus });
-  await spawnOwnedRun(bus, "run-stop");
+  await spawnOwnedRun(bus, 'run-stop');
 
   const requestsBeforeStop = bus.count(NB_REQUEST_CHANNEL);
   for (const requestShape of [
-    { requestId: "stop-agentId", agentId: "run-stop" },
-    { requestId: "stop-id", id: "run-stop" },
-    { requestId: "stop-runId", runId: "run-stop" },
+    { requestId: 'stop-agentId', agentId: 'run-stop' },
+    { requestId: 'stop-id', id: 'run-stop' },
+    { requestId: 'stop-runId', runId: 'run-stop' },
   ]) {
     const reply = once(
       bus,
@@ -618,72 +618,72 @@ test("stop replies success, dedupes owned runs, and ignores unknown runs", async
   assert.equal(bus.count(NB_REQUEST_CHANNEL), requestsBeforeStop + 1);
   const stopRequest = bus.lastPayload(NB_REQUEST_CHANNEL);
   assert.ok(isRecord(stopRequest));
-  assert.equal(stopRequest.method, "stop");
-  assert.deepEqual(stopRequest.params, { id: "run-stop" });
+  assert.equal(stopRequest.method, 'stop');
+  assert.deepEqual(stopRequest.params, { id: 'run-stop' });
 
   const before = bus.count(NB_REQUEST_CHANNEL);
-  const reply = once(bus, replyChannel(STOP_CHANNEL, "stop-unknown"));
-  bus.emit(STOP_CHANNEL, { requestId: "stop-unknown", agentId: "not-owned" });
+  const reply = once(bus, replyChannel(STOP_CHANNEL, 'stop-unknown'));
+  bus.emit(STOP_CHANNEL, { requestId: 'stop-unknown', agentId: 'not-owned' });
 
   assert.deepEqual(await reply, { success: true, data: undefined });
   assert.equal(bus.count(NB_REQUEST_CHANNEL), before);
 });
 
-test("completion events use the documented result and error fallbacks", async () => {
+test('completion events use the documented result and error fallbacks', async () => {
   const completedCases = [
     {
-      label: "summary",
+      label: 'summary',
       payload: {
-        runId: "run-summary",
+        runId: 'run-summary',
         success: true,
-        state: "complete",
-        summary: "summary text",
-        output: "output text",
-        results: [{ output: "child output" }],
+        state: 'complete',
+        summary: 'summary text',
+        output: 'output text',
+        results: [{ output: 'child output' }],
       },
-      expected: { id: "run-summary", result: "summary text" },
+      expected: { id: 'run-summary', result: 'summary text' },
     },
     {
-      label: "workflow child output",
+      label: 'workflow child output',
       payload: {
-        runId: "run-workflow",
-        mode: "workflow",
+        runId: 'run-workflow',
+        mode: 'workflow',
         success: true,
-        state: "complete",
-        summary: "Workflow completed successfully (1 child).",
-        output: "Workflow completed successfully (1 child).",
-        results: [{ output: "child output" }],
+        state: 'complete',
+        summary: 'Workflow completed successfully (1 child).',
+        output: 'Workflow completed successfully (1 child).',
+        results: [{ output: 'child output' }],
       },
-      expected: { id: "run-workflow", result: "child output" },
+      expected: { id: 'run-workflow', result: 'child output' },
     },
     {
-      label: "top-level output",
+      label: 'top-level output',
       payload: {
-        runId: "run-output",
+        runId: 'run-output',
         success: true,
-        state: "complete",
-        output: "output text",
+        state: 'complete',
+        output: 'output text',
       },
-      expected: { id: "run-output", result: "output text" },
+      expected: { id: 'run-output', result: 'output text' },
     },
     {
-      label: "child outputs",
+      label: 'child outputs',
       payload: {
-        runId: "run-children",
+        runId: 'run-children',
         success: true,
-        state: "complete",
-        results: [{ output: "child one" }, { error: "child two" }],
+        state: 'complete',
+        results: [{ output: 'child one' }, { error: 'child two' }],
       },
-      expected: { id: "run-children", result: "child one\n\nchild two" },
+      expected: { id: 'run-children', result: 'child one\n\nchild two' },
     },
     {
-      label: "no result text",
+      label: 'no result text',
       payload: {
-        runId: "run-empty",
+        runId: 'run-empty',
         success: true,
-        state: "complete",
+        state: 'complete',
       },
-      expected: { id: "run-empty" },
+      expected: { id: 'run-empty' },
     },
   ] as const;
 
@@ -700,48 +700,48 @@ test("completion events use the documented result and error fallbacks", async ()
 
   const failedCases = [
     {
-      label: "explicit error",
+      label: 'explicit error',
       payload: {
-        runId: "run-failed",
+        runId: 'run-failed',
         success: false,
-        state: "failed",
-        error: "failed error",
+        state: 'failed',
+        error: 'failed error',
       },
-      expected: { id: "run-failed", error: "failed error", status: "failed" },
+      expected: { id: 'run-failed', error: 'failed error', status: 'failed' },
     },
     {
-      label: "aborted child error fallback",
+      label: 'aborted child error fallback',
       payload: {
-        runId: "run-aborted",
+        runId: 'run-aborted',
         success: false,
-        state: "aborted",
-        results: [{ error: "child failure" }],
+        state: 'aborted',
+        results: [{ error: 'child failure' }],
       },
-      expected: { id: "run-aborted", error: "child failure", status: "failed" },
+      expected: { id: 'run-aborted', error: 'child failure', status: 'failed' },
     },
     {
-      label: "partial output is retained with failure",
+      label: 'partial output is retained with failure',
       payload: {
-        runId: "run-partial-failure",
+        runId: 'run-partial-failure',
         success: false,
-        state: "failed",
-        error: "validation failed",
-        results: [{ output: "useful partial result" }],
+        state: 'failed',
+        error: 'validation failed',
+        results: [{ output: 'useful partial result' }],
       },
       expected: {
-        id: "run-partial-failure",
-        error: "validation failed\n\nPartial output:\nuseful partial result",
-        status: "failed",
+        id: 'run-partial-failure',
+        error: 'validation failed\n\nPartial output:\nuseful partial result',
+        status: 'failed',
       },
     },
     {
-      label: "generic failure fallback",
+      label: 'generic failure fallback',
       payload: {
-        runId: "run-generic",
+        runId: 'run-generic',
         success: false,
         results: [{}],
       },
-      expected: { id: "run-generic", error: "Agent failed", status: "failed" },
+      expected: { id: 'run-generic', error: 'Agent failed', status: 'failed' },
     },
   ] as const;
 
@@ -758,46 +758,46 @@ test("completion events use the documented result and error fallbacks", async ()
 
   const stoppedCases = [
     {
-      label: "paused child output",
+      label: 'paused child output',
       payload: {
-        runId: "run-paused",
+        runId: 'run-paused',
         success: false,
-        state: "paused",
-        summary: "Paused after interrupt. Waiting for explicit next action.",
-        results: [{ output: "partial output", success: false }],
+        state: 'paused',
+        summary: 'Paused after interrupt. Waiting for explicit next action.',
+        results: [{ output: 'partial output', success: false }],
       },
       expected: {
-        id: "run-paused",
-        result: "partial output",
-        status: "stopped",
+        id: 'run-paused',
+        result: 'partial output',
+        status: 'stopped',
       },
     },
     {
-      label: "stopped top-level output fallback",
+      label: 'stopped top-level output fallback',
       payload: {
-        runId: "run-stopped",
+        runId: 'run-stopped',
         success: true,
-        state: "stopped",
-        output: "partial top-level output",
+        state: 'stopped',
+        output: 'partial top-level output',
       },
       expected: {
-        id: "run-stopped",
-        result: "partial top-level output",
-        status: "stopped",
+        id: 'run-stopped',
+        result: 'partial top-level output',
+        status: 'stopped',
       },
     },
     {
-      label: "stopped summary fallback",
+      label: 'stopped summary fallback',
       payload: {
-        runId: "run-stopped-summary",
+        runId: 'run-stopped-summary',
         success: true,
-        state: "stopped",
-        summary: "stopped summary",
+        state: 'stopped',
+        summary: 'stopped summary',
       },
       expected: {
-        id: "run-stopped-summary",
-        result: "stopped summary",
-        status: "stopped",
+        id: 'run-stopped-summary',
+        result: 'stopped summary',
+        status: 'stopped',
       },
     },
   ] as const;
@@ -814,38 +814,38 @@ test("completion events use the documented result and error fallbacks", async ()
   }
 });
 
-test("status polling emits completion when async-complete never arrives", async (t) => {
+test('status polling emits completion when async-complete never arrives', async () => {
   const bus = new FakeEventBus();
   const bridge = registerBridge(
     { events: bus },
     { completionPollIntervalMs: 1 },
   );
-  t.after(() => bridge.dispose());
+  onTestFinished(() => bridge.dispose());
 
-  const tempDir = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-status-"));
-  t.after(() => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'pi-subagents-bridge-status-'));
+  onTestFinished(() => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  const resultPath = join(tempDir, "run-polled.json");
+  const resultPath = join(tempDir, 'run-polled.json');
   writeFileSync(
     resultPath,
     JSON.stringify({
-      runId: "run-polled",
+      runId: 'run-polled',
       success: true,
-      state: "complete",
-      summary: "polled output",
+      state: 'complete',
+      summary: 'polled output',
     }),
-    "utf8",
+    'utf8',
   );
 
   const statusSeen = new Promise<void>((resolve) => {
     bus.on(NB_REQUEST_CHANNEL, (payload) => {
-      if (!isRecord(payload) || payload.method !== "status") return;
+      if (!isRecord(payload) || payload.method !== 'status') return;
       bus.emit(nbReplyChannel(String(payload.requestId)), {
         version: 1,
         requestId: payload.requestId,
-        method: "status",
+        method: 'status',
         success: true,
         data: {
           text: `Run: run-polled\nState: complete\nResult: ${resultPath}`,
@@ -855,12 +855,12 @@ test("status polling emits completion when async-complete never arrives", async 
     });
   });
 
-  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-polled"));
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, 'spawn-polled'));
   const completed = once(bus, COMPLETED_EVENT, 250);
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-polled",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'spawn-polled',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   });
 
   const request = bus.lastPayload(NB_REQUEST_CHANNEL);
@@ -868,50 +868,50 @@ test("status polling emits completion when async-complete never arrives", async 
   bus.emit(nbReplyChannel(String(request.requestId)), {
     version: 1,
     requestId: request.requestId,
-    method: "spawn",
+    method: 'spawn',
     success: true,
-    data: { details: { runId: "run-polled" } },
+    data: { details: { runId: 'run-polled' } },
   });
 
-  assert.deepEqual(await reply, { success: true, data: { id: "run-polled" } });
+  assert.deepEqual(await reply, { success: true, data: { id: 'run-polled' } });
   await statusSeen;
   assert.deepEqual(await completed, {
-    id: "run-polled",
-    result: "polled output",
+    id: 'run-polled',
+    result: 'polled output',
   });
 });
 
-test("status polling waits for a terminal result file before completing", async (t) => {
+test('status polling waits for a terminal result file before completing', async () => {
   const bus = new FakeEventBus();
   const bridge = registerBridge(
     { events: bus },
     { completionPollIntervalMs: 1, terminalResultGraceMs: 100 },
   );
-  t.after(() => bridge.dispose());
+  onTestFinished(() => bridge.dispose());
 
-  const tempDir = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-retry-"));
-  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
-  const resultPath = join(tempDir, "late-result.json");
+  const tempDir = mkdtempSync(join(tmpdir(), 'pi-subagents-bridge-retry-'));
+  onTestFinished(() => rmSync(tempDir, { recursive: true, force: true }));
+  const resultPath = join(tempDir, 'late-result.json');
   let statusChecks = 0;
   bus.on(NB_REQUEST_CHANNEL, (payload) => {
-    if (!isRecord(payload) || payload.method !== "status") return;
+    if (!isRecord(payload) || payload.method !== 'status') return;
     statusChecks += 1;
     if (statusChecks === 2) {
       writeFileSync(
         resultPath,
         JSON.stringify({
-          runId: "run-late-result",
+          runId: 'run-late-result',
           success: true,
-          state: "complete",
-          summary: "late output",
+          state: 'complete',
+          summary: 'late output',
         }),
-        "utf8",
+        'utf8',
       );
     }
     bus.emit(nbReplyChannel(String(payload.requestId)), {
       version: 1,
       requestId: payload.requestId,
-      method: "status",
+      method: 'status',
       success: true,
       data: {
         text: `Run: run-late-result\nState: complete\nResult: ${resultPath}`,
@@ -919,12 +919,12 @@ test("status polling waits for a terminal result file before completing", async 
     });
   });
 
-  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-late-result"));
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, 'spawn-late-result'));
   const completed = once(bus, COMPLETED_EVENT, 250);
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-late-result",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'spawn-late-result',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   });
   const request = bus.lastPayload(NB_REQUEST_CHANNEL);
   assert.ok(isRecord(request));
@@ -932,37 +932,37 @@ test("status polling waits for a terminal result file before completing", async 
     version: 1,
     requestId: request.requestId,
     success: true,
-    data: { details: { runId: "run-late-result" } },
+    data: { details: { runId: 'run-late-result' } },
   });
 
   assert.deepEqual(await reply, {
     success: true,
-    data: { id: "run-late-result" },
+    data: { id: 'run-late-result' },
   });
   assert.deepEqual(await completed, {
-    id: "run-late-result",
-    result: "late output",
+    id: 'run-late-result',
+    result: 'late output',
   });
   assert.equal(statusChecks, 2);
 });
 
-test("status polling reports a missing terminal result after its grace period", async (t) => {
+test('status polling reports a missing terminal result after its grace period', async () => {
   const bus = new FakeEventBus();
   const bridge = registerBridge(
     { events: bus },
     { completionPollIntervalMs: 1, terminalResultGraceMs: 1 },
   );
-  t.after(() => bridge.dispose());
+  onTestFinished(() => bridge.dispose());
 
-  const resultPath = join(tmpdir(), "pi-subagents-bridge-missing-result.json");
+  const resultPath = join(tmpdir(), 'pi-subagents-bridge-missing-result.json');
   rmSync(resultPath, { force: true });
-  t.after(() => rmSync(resultPath, { force: true }));
+  onTestFinished(() => rmSync(resultPath, { force: true }));
   bus.on(NB_REQUEST_CHANNEL, (payload) => {
-    if (!isRecord(payload) || payload.method !== "status") return;
+    if (!isRecord(payload) || payload.method !== 'status') return;
     bus.emit(nbReplyChannel(String(payload.requestId)), {
       version: 1,
       requestId: payload.requestId,
-      method: "status",
+      method: 'status',
       success: true,
       data: {
         text: `Run: run-missing-result\nState: complete\nResult: ${resultPath}`,
@@ -970,12 +970,12 @@ test("status polling reports a missing terminal result after its grace period", 
     });
   });
 
-  const reply = once(bus, replyChannel(SPAWN_CHANNEL, "spawn-missing-result"));
+  const reply = once(bus, replyChannel(SPAWN_CHANNEL, 'spawn-missing-result'));
   const completed = once(bus, COMPLETED_EVENT, 250);
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-missing-result",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'spawn-missing-result',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   });
   const request = bus.lastPayload(NB_REQUEST_CHANNEL);
   assert.ok(isRecord(request));
@@ -983,70 +983,70 @@ test("status polling reports a missing terminal result after its grace period", 
     version: 1,
     requestId: request.requestId,
     success: true,
-    data: { details: { runId: "run-missing-result" } },
+    data: { details: { runId: 'run-missing-result' } },
   });
 
   assert.deepEqual(await reply, {
     success: true,
-    data: { id: "run-missing-result" },
+    data: { id: 'run-missing-result' },
   });
   assert.deepEqual(await completed, {
-    id: "run-missing-result",
-    result: "Bridge warning: result payload is not readable yet after 1ms.",
+    id: 'run-missing-result',
+    result: 'Bridge warning: result payload is not readable yet after 1ms.',
   });
 });
 
-test("completion handling supports runId fallbacks, ignores unrelated events, and dedupes repeats", async () => {
+test('completion handling supports runId fallbacks, ignores unrelated events, and dedupes repeats', async () => {
   const bus = new FakeEventBus();
   registerBridge({ events: bus });
-  await spawnOwnedRun(bus, "run-fallback");
+  await spawnOwnedRun(bus, 'run-fallback');
 
   bus.emit(NB_COMPLETE_EVENT, {
-    id: "not-owned",
+    id: 'not-owned',
     success: true,
-    state: "complete",
-    summary: "ignored",
+    state: 'complete',
+    summary: 'ignored',
   });
   assert.equal(bus.count(COMPLETED_EVENT), 0);
   assert.equal(bus.count(FAILED_EVENT), 0);
 
   bus.emit(NB_COMPLETE_EVENT, {
-    asyncId: "run-fallback",
+    asyncId: 'run-fallback',
     success: true,
-    state: "complete",
-    summary: "first",
+    state: 'complete',
+    summary: 'first',
   });
   bus.emit(NB_COMPLETE_EVENT, {
-    runId: "run-fallback",
+    runId: 'run-fallback',
     success: true,
-    state: "complete",
-    summary: "second",
+    state: 'complete',
+    summary: 'second',
   });
 
   assert.equal(bus.count(COMPLETED_EVENT), 1);
   assert.deepEqual(bus.lastPayload(COMPLETED_EVENT), {
-    id: "run-fallback",
-    result: "first",
+    id: 'run-fallback',
+    result: 'first',
   });
 });
 
-test("re-register keeps active run ownership for stop and completion", async () => {
+test('re-register keeps active run ownership for stop and completion', async () => {
   const bus = new FakeEventBus();
   const firstBridge = registerBridge({ events: bus });
-  await spawnOwnedRun(bus, "run-stop-after-reregister");
-  await spawnOwnedRun(bus, "run-complete-after-reregister");
+  await spawnOwnedRun(bus, 'run-stop-after-reregister');
+  await spawnOwnedRun(bus, 'run-complete-after-reregister');
 
   firstBridge.dispose();
   registerBridge({ events: bus });
 
   const stopReply = once(
     bus,
-    replyChannel(STOP_CHANNEL, "stop-after-reregister"),
+    replyChannel(STOP_CHANNEL, 'stop-after-reregister'),
   );
   const requestsBeforeStop = bus.count(NB_REQUEST_CHANNEL);
   bus.emit(STOP_CHANNEL, {
-    requestId: "stop-after-reregister",
-    agentId: "run-stop-after-reregister",
+    requestId: 'stop-after-reregister',
+    agentId: 'run-stop-after-reregister',
   });
 
   assert.deepEqual(await stopReply, { success: true, data: undefined });
@@ -1054,31 +1054,31 @@ test("re-register keeps active run ownership for stop and completion", async () 
   const stopRequest = bus.lastPayload(NB_REQUEST_CHANNEL);
   assert.ok(isRecord(stopRequest));
   assert.equal(stopRequest.version, 1);
-  assert.equal(stopRequest.method, "stop");
-  assert.deepEqual(stopRequest.params, { id: "run-stop-after-reregister" });
+  assert.equal(stopRequest.method, 'stop');
+  assert.deepEqual(stopRequest.params, { id: 'run-stop-after-reregister' });
 
   const completed = once(bus, COMPLETED_EVENT);
   bus.emit(NB_COMPLETE_EVENT, {
-    runId: "run-complete-after-reregister",
+    runId: 'run-complete-after-reregister',
     success: true,
-    state: "complete",
-    summary: "done after re-register",
+    state: 'complete',
+    summary: 'done after re-register',
   });
 
   assert.deepEqual(await completed, {
-    id: "run-complete-after-reregister",
-    result: "done after re-register",
+    id: 'run-complete-after-reregister',
+    result: 'done after re-register',
   });
 });
 
-test("dispose cancels in-flight spawn work and ignores late replies", async () => {
+test('dispose cancels in-flight spawn work and ignores late replies', async () => {
   const bus = new FakeEventBus();
   const bridge = registerBridge({ events: bus }, { spawnTimeoutMs: 100 });
 
   bus.emit(SPAWN_CHANNEL, {
-    requestId: "spawn-disposed",
-    type: "general-purpose",
-    prompt: "Do the task",
+    requestId: 'spawn-disposed',
+    type: 'general-purpose',
+    prompt: 'Do the task',
   });
 
   const request = bus.lastPayload(NB_REQUEST_CHANNEL);
@@ -1093,24 +1093,24 @@ test("dispose cancels in-flight spawn work and ignores late replies", async () =
     version: 1,
     requestId: request.requestId,
     success: true,
-    data: { details: { runId: "late-run" } },
+    data: { details: { runId: 'late-run' } },
   });
 
   await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.equal(bus.count(replyChannel(SPAWN_CHANNEL, "spawn-disposed")), 0);
+  assert.equal(bus.count(replyChannel(SPAWN_CHANNEL, 'spawn-disposed')), 0);
 });
 
-test("accepted legacy runs survive a full bridge restart until completion delivery", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-runs-"));
-  const journalPath = join(root, "bridge-journal.json");
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+test('accepted legacy runs survive a full bridge restart until completion delivery', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-subagents-bridge-runs-'));
+  const journalPath = join(root, 'bridge-journal.json');
+  onTestFinished(() => rmSync(root, { recursive: true, force: true }));
 
   const firstBus = new FakeEventBus();
   const first = registerBridge(
     { events: firstBus },
     { planExecJournalPath: journalPath, completionPollIntervalMs: 1_000 },
   );
-  await spawnOwnedRun(firstBus, "run-after-restart");
+  await spawnOwnedRun(firstBus, 'run-after-restart');
   first.dispose();
 
   const secondBus = new FakeEventBus();
@@ -1120,14 +1120,14 @@ test("accepted legacy runs survive a full bridge restart until completion delive
   );
   const completed = once(secondBus, COMPLETED_EVENT);
   secondBus.emit(NB_COMPLETE_EVENT, {
-    runId: "run-after-restart",
+    runId: 'run-after-restart',
     success: true,
-    state: "complete",
-    summary: "recovered",
+    state: 'complete',
+    summary: 'recovered',
   });
   assert.deepEqual(await completed, {
-    id: "run-after-restart",
-    result: "recovered",
+    id: 'run-after-restart',
+    result: 'recovered',
   });
   second.dispose();
 
@@ -1137,38 +1137,38 @@ test("accepted legacy runs survive a full bridge restart until completion delive
     { planExecJournalPath: journalPath, completionPollIntervalMs: 1_000 },
   );
   thirdBus.emit(NB_COMPLETE_EVENT, {
-    runId: "run-after-restart",
+    runId: 'run-after-restart',
     success: true,
-    state: "complete",
-    summary: "duplicate",
+    state: 'complete',
+    summary: 'duplicate',
   });
   assert.equal(thirdBus.count(COMPLETED_EVENT), 0);
   third.dispose();
 });
 
-test("a foreign Pi session cannot consume another session's accepted completion", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-session-"));
-  const journalPath = join(root, "operations.sqlite");
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+test("a foreign Pi session cannot consume another session's accepted completion", async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-subagents-bridge-session-'));
+  const journalPath = join(root, 'operations.sqlite');
+  onTestFinished(() => rmSync(root, { recursive: true, force: true }));
 
   const originBus = new FakeEventBus();
   const origin = registerBridge(
     { events: originBus },
-    { planExecJournalPath: journalPath, getSessionId: () => "session-a" },
+    { planExecJournalPath: journalPath, getSessionId: () => 'session-a' },
   );
-  await spawnOwnedRun(originBus, "session-owned-run");
+  await spawnOwnedRun(originBus, 'session-owned-run');
   origin.dispose();
 
   const foreignBus = new FakeEventBus();
   const foreign = registerBridge(
     { events: foreignBus },
-    { planExecJournalPath: journalPath, getSessionId: () => "session-b" },
+    { planExecJournalPath: journalPath, getSessionId: () => 'session-b' },
   );
   foreignBus.emit(NB_COMPLETE_EVENT, {
-    runId: "session-owned-run",
+    runId: 'session-owned-run',
     success: true,
-    state: "complete",
-    summary: "wrong session",
+    state: 'complete',
+    summary: 'wrong session',
   });
   assert.equal(foreignBus.count(COMPLETED_EVENT), 0);
   foreign.dispose();
@@ -1176,35 +1176,36 @@ test("a foreign Pi session cannot consume another session's accepted completion"
   const resumedBus = new FakeEventBus();
   const resumed = registerBridge(
     { events: resumedBus },
-    { planExecJournalPath: journalPath, getSessionId: () => "session-a" },
+    { planExecJournalPath: journalPath, getSessionId: () => 'session-a' },
   );
   const completed = once(resumedBus, COMPLETED_EVENT);
   resumedBus.emit(NB_COMPLETE_EVENT, {
-    runId: "session-owned-run",
+    runId: 'session-owned-run',
     success: true,
-    state: "complete",
-    summary: "right session",
+    state: 'complete',
+    summary: 'right session',
   });
   assert.deepEqual(await completed, {
-    id: "session-owned-run",
-    result: "right session",
+    id: 'session-owned-run',
+    result: 'right session',
   });
   resumed.dispose();
 });
 
-test("accepted-run reconciliation claims a run after its owner exits", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-takeover-"));
-  const journalPath = join(root, "operations.sqlite");
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+test('accepted-run reconciliation claims a run after its owner exits', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-subagents-bridge-takeover-'));
+  const journalPath = join(root, 'operations.sqlite');
+  onTestFinished(() => rmSync(root, { recursive: true, force: true }));
 
-  const moduleUrl = new URL("../src/operation-journal.ts", import.meta.url).href;
+  const moduleUrl = new URL('../src/operation-journal.ts', import.meta.url)
+    .href;
   const owner = spawn(
     process.execPath,
     [
-      "--import",
-      "jiti/register",
-      "--input-type=module",
-      "--eval",
+      '--import',
+      'jiti/register',
+      '--input-type=module',
+      '--eval',
       `
         import journalModule from ${JSON.stringify(moduleUrl)};
         const journal = new journalModule.OperationJournal(${JSON.stringify(journalPath)});
@@ -1217,9 +1218,11 @@ test("accepted-run reconciliation claims a run after its owner exits", async (t)
         setInterval(() => {}, 1_000);
       `,
     ],
-    { stdio: ["ignore", "pipe", "inherit"] },
+    { stdio: ['ignore', 'pipe', 'inherit'] },
   );
-  t.after(() => owner.kill());
+  onTestFinished(() => {
+    owner.kill();
+  });
   await waitForChildReady(owner);
 
   const bus = new FakeEventBus();
@@ -1227,48 +1230,48 @@ test("accepted-run reconciliation claims a run after its owner exits", async (t)
     { events: bus },
     {
       planExecJournalPath: journalPath,
-      getSessionId: () => "session-a",
+      getSessionId: () => 'session-a',
       acceptedRunReconcileIntervalMs: 5,
       completionPollIntervalMs: 1_000,
     },
   );
-  t.after(() => bridge.dispose());
+  onTestFinished(() => bridge.dispose());
   const completed = once(bus, COMPLETED_EVENT, 1_000);
   owner.kill();
   await waitForChildExit(owner);
 
   const completionTimer = setInterval(() => {
     bus.emit(NB_COMPLETE_EVENT, {
-      runId: "takeover-after-exit",
+      runId: 'takeover-after-exit',
       success: true,
-      state: "complete",
-      summary: "taken over",
+      state: 'complete',
+      summary: 'taken over',
     });
   }, 5);
   try {
     assert.deepEqual(await completed, {
-      id: "takeover-after-exit",
-      result: "taken over",
+      id: 'takeover-after-exit',
+      result: 'taken over',
     });
   } finally {
     clearInterval(completionTimer);
   }
 });
 
-test("accepted-run reconciliation retries after a transient journal failure", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-retry-"));
-  const journal = new OperationJournal(join(root, "operations.sqlite"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+test('accepted-run reconciliation retries after a transient journal failure', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-subagents-bridge-retry-'));
+  const journal = new OperationJournal(join(root, 'operations.sqlite'));
+  onTestFinished(() => rmSync(root, { recursive: true, force: true }));
   journal.acceptRun(
-    "retry-claimed-run",
-    { pid: 2_147_483_647, instanceId: "exited-owner" },
-    "session-a",
+    'retry-claimed-run',
+    { pid: 2_147_483_647, instanceId: 'exited-owner' },
+    'session-a',
   );
   const claim = journal.claimAcceptedRuns.bind(journal);
   let attempts = 0;
   journal.claimAcceptedRuns = (...args) => {
     attempts += 1;
-    if (attempts === 1) throw new Error("transient claim failure");
+    if (attempts === 1) throw new Error('transient claim failure');
     return claim(...args);
   };
 
@@ -1277,36 +1280,36 @@ test("accepted-run reconciliation retries after a transient journal failure", as
     { events: bus },
     {
       operationJournal: journal,
-      getSessionId: () => "session-a",
+      getSessionId: () => 'session-a',
       acceptedRunReconcileIntervalMs: 5,
       completionPollIntervalMs: 1_000,
     },
   );
-  t.after(() => bridge.dispose());
+  onTestFinished(() => bridge.dispose());
   await waitFor(() => attempts >= 2);
 
   const completed = once(bus, COMPLETED_EVENT);
   bus.emit(NB_COMPLETE_EVENT, {
-    runId: "retry-claimed-run",
+    runId: 'retry-claimed-run',
     success: true,
-    state: "complete",
-    summary: "claimed after retry",
+    state: 'complete',
+    summary: 'claimed after retry',
   });
   assert.deepEqual(await completed, {
-    id: "retry-claimed-run",
-    result: "claimed after retry",
+    id: 'retry-claimed-run',
+    result: 'claimed after retry',
   });
 });
 
-test("volatile accepted ownership is retried and survives restart", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "pi-subagents-bridge-volatile-"));
-  const journal = new OperationJournal(join(root, "operations.sqlite"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+test('volatile accepted ownership is retried and survives restart', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-subagents-bridge-volatile-'));
+  const journal = new OperationJournal(join(root, 'operations.sqlite'));
+  onTestFinished(() => rmSync(root, { recursive: true, force: true }));
   const accept = journal.acceptRun.bind(journal);
   let attempts = 0;
   journal.acceptRun = (...args) => {
     attempts += 1;
-    if (attempts === 1) throw new Error("transient accept failure");
+    if (attempts === 1) throw new Error('transient accept failure');
     return accept(...args);
   };
 
@@ -1315,17 +1318,17 @@ test("volatile accepted ownership is retried and survives restart", async (t) =>
     { events: firstBus },
     {
       operationJournal: journal,
-      getSessionId: () => "session-a",
+      getSessionId: () => 'session-a',
       acceptedRunReconcileIntervalMs: 5,
       completionPollIntervalMs: 1_000,
     },
   );
   const originalError = console.error;
   console.error = () => undefined;
-  t.after(() => {
+  onTestFinished(() => {
     console.error = originalError;
   });
-  await spawnOwnedRun(firstBus, "volatile-retry-run");
+  await spawnOwnedRun(firstBus, 'volatile-retry-run');
   await waitFor(() => attempts >= 2);
   first.dispose();
 
@@ -1334,29 +1337,29 @@ test("volatile accepted ownership is retried and survives restart", async (t) =>
     { events: secondBus },
     {
       operationJournal: journal,
-      getSessionId: () => "session-a",
+      getSessionId: () => 'session-a',
       acceptedRunReconcileIntervalMs: 5,
       completionPollIntervalMs: 1_000,
     },
   );
   const completed = once(secondBus, COMPLETED_EVENT);
   secondBus.emit(NB_COMPLETE_EVENT, {
-    runId: "volatile-retry-run",
+    runId: 'volatile-retry-run',
     success: true,
-    state: "complete",
-    summary: "recovered",
+    state: 'complete',
+    summary: 'recovered',
   });
   assert.deepEqual(await completed, {
-    id: "volatile-retry-run",
-    result: "recovered",
+    id: 'volatile-retry-run',
+    result: 'recovered',
   });
   second.dispose();
 });
 
-test("dispose unsubscribes handlers and ignores later events until re-registered", async () => {
+test('dispose unsubscribes handlers and ignores later events until re-registered', async () => {
   const bus = new FakeEventBus();
   const bridge = registerBridge({ events: bus });
-  await spawnOwnedRun(bus, "run-dispose");
+  await spawnOwnedRun(bus, 'run-dispose');
 
   const listenerCountsBefore = [
     PING_CHANNEL,
@@ -1377,10 +1380,10 @@ test("dispose unsubscribes handlers and ignores later events until re-registered
   assert.deepEqual(listenerCountsAfter, [0, 0, 0, 0]);
 
   bus.emit(NB_COMPLETE_EVENT, {
-    runId: "run-dispose",
+    runId: 'run-dispose',
     success: true,
-    state: "complete",
-    summary: "should not emit",
+    state: 'complete',
+    summary: 'should not emit',
   });
   assert.equal(bus.count(COMPLETED_EVENT), 0);
 });
@@ -1389,15 +1392,15 @@ async function spawnOwnedRun(bus: FakeEventBus, runId: string): Promise<void> {
   const reply = once(bus, replyChannel(SPAWN_CHANNEL, `spawn-${runId}`));
   bus.emit(SPAWN_CHANNEL, {
     requestId: `spawn-${runId}`,
-    type: "general-purpose",
-    prompt: "Do the task",
+    type: 'general-purpose',
+    prompt: 'Do the task',
   });
   const request = bus.lastPayload(NB_REQUEST_CHANNEL);
   assert.ok(isRecord(request));
   bus.emit(nbReplyChannel(String(request.requestId)), {
     version: 1,
     requestId: request.requestId,
-    method: "spawn",
+    method: 'spawn',
     success: true,
     data: { details: { runId } },
   });
@@ -1481,9 +1484,9 @@ async function waitForChildReady(
     timer.unref();
     const cleanup = (): void => {
       clearTimeout(timer);
-      child.stdout.off("data", onData);
-      child.off("error", onError);
-      child.off("exit", onExit);
+      child.stdout.off('data', onData);
+      child.off('error', onError);
+      child.off('exit', onExit);
     };
     const finish = (error?: Error): void => {
       if (settled) return;
@@ -1497,7 +1500,7 @@ async function waitForChildReady(
       }
     };
     const onData = (chunk: Buffer | string): void => {
-      if (String(chunk).includes("ready")) finish();
+      if (String(chunk).includes('ready')) finish();
     };
     const onError = (error: Error): void => finish(error);
     const onExit = (code: number | null, signal: string | null): void =>
@@ -1506,10 +1509,11 @@ async function waitForChildReady(
           `child exited before ready (code=${String(code)}, signal=${String(signal)})`,
         ),
       );
-    child.stdout.on("data", onData);
-    child.once("error", onError);
-    child.once("exit", onExit);
-    if (child.exitCode !== null || child.signalCode !== null) onExit(child.exitCode, child.signalCode);
+    child.stdout.on('data', onData);
+    child.once('error', onError);
+    child.once('exit', onExit);
+    if (child.exitCode !== null || child.signalCode !== null)
+      onExit(child.exitCode, child.signalCode);
   });
 }
 
@@ -1526,8 +1530,8 @@ async function waitForChildExit(
     timer.unref();
     const cleanup = (): void => {
       clearTimeout(timer);
-      child.off("error", onError);
-      child.off("exit", onExit);
+      child.off('error', onError);
+      child.off('exit', onExit);
     };
     const onError = (error: Error): void => {
       cleanup();
@@ -1537,8 +1541,8 @@ async function waitForChildExit(
       cleanup();
       resolve();
     };
-    child.once("error", onError);
-    child.once("exit", onExit);
+    child.once('error', onError);
+    child.once('exit', onExit);
   });
 }
 
@@ -1548,11 +1552,12 @@ async function waitFor(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error("condition was not met in time");
+    if (Date.now() >= deadline)
+      throw new Error('condition was not met in time');
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

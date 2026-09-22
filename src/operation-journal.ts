@@ -1,14 +1,17 @@
-import fs from "node:fs";
-import path from "node:path";
-import { parseExecutionLifetime, type ExecutionLifetime } from "./execution-lifetime.js";
-import { DatabaseSync } from "node:sqlite";
+import fs from 'node:fs';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import {
+  type ExecutionLifetime,
+  parseExecutionLifetime,
+} from './execution-lifetime.js';
 
 const JOURNAL_VERSION = 5;
 // Schemas 0-5 are known; legacy versions migrate below to the current schema.
 const COMPATIBLE_JOURNAL_VERSIONS = [0, 1, 2, 3, 4, JOURNAL_VERSION];
 const BUSY_TIMEOUT_MS = 2_000;
 
-export type OperationBinding = "dispatching" | "bound" | "unknown";
+export type OperationBinding = 'dispatching' | 'bound' | 'unknown';
 
 export interface AcceptedRunOwner {
   pid: number;
@@ -90,16 +93,28 @@ interface AcceptedRunRow {
 }
 
 function operationRecord(row: OperationRow): OperationJournalRecord {
-  const executionLifetime = row.execution_lifetime ? parseExecutionLifetime(JSON.parse(row.execution_lifetime)) : undefined;
-  if (row.execution_lifetime && !executionLifetime) throw new Error("Invalid persisted execution lifetime");
-  const nativeParams: unknown = row.native_params ? JSON.parse(row.native_params) : undefined;
-  if (nativeParams !== undefined && (typeof nativeParams !== "object" || nativeParams === null || Array.isArray(nativeParams))) {
-    throw new Error("Invalid persisted native launch parameters");
+  const executionLifetime = row.execution_lifetime
+    ? parseExecutionLifetime(JSON.parse(row.execution_lifetime))
+    : undefined;
+  if (row.execution_lifetime && !executionLifetime)
+    throw new Error('Invalid persisted execution lifetime');
+  const nativeParams: unknown = row.native_params
+    ? JSON.parse(row.native_params)
+    : undefined;
+  if (
+    nativeParams !== undefined &&
+    (typeof nativeParams !== 'object' ||
+      nativeParams === null ||
+      Array.isArray(nativeParams))
+  ) {
+    throw new Error('Invalid persisted native launch parameters');
   }
   return {
     ...(row.native_correlated ? { nativeCorrelated: true } : {}),
     ...(row.cancel_requested ? { cancelRequested: true } : {}),
-    ...(nativeParams ? { nativeParams: nativeParams as Record<string, unknown> } : {}),
+    ...(nativeParams
+      ? { nativeParams: nativeParams as Record<string, unknown> }
+      : {}),
     operationId: row.operation_id,
     ...(executionLifetime ? { executionLifetime } : {}),
     requestDigest: row.request_digest,
@@ -133,10 +148,10 @@ function isProcessAlive(pid: number): boolean {
     return true;
   } catch (error: unknown) {
     return !(
-      typeof error === "object" &&
+      typeof error === 'object' &&
       error !== null &&
-      "code" in error &&
-      error.code === "ESRCH"
+      'code' in error &&
+      error.code === 'ESRCH'
     );
   }
 }
@@ -160,15 +175,18 @@ export class OperationJournal {
 
   constructor(filePath: string, now: () => number = Date.now) {
     if (!filePath.trim()) {
-      throw new Error("Operation journal path cannot be empty");
+      throw new Error('Operation journal path cannot be empty');
     }
     this.filePath = path.resolve(filePath);
     this.#now = now;
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
     this.#db = new DatabaseSync(this.filePath);
     this.#db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
-    const version = this.#db.prepare("PRAGMA user_version").get()?.user_version;
-    if (typeof version !== "number" || !COMPATIBLE_JOURNAL_VERSIONS.includes(version)) {
+    const version = this.#db.prepare('PRAGMA user_version').get()?.user_version;
+    if (
+      typeof version !== 'number' ||
+      !COMPATIBLE_JOURNAL_VERSIONS.includes(version)
+    ) {
       this.#db.close();
       throw new Error(
         `Unsupported operation journal version '${String(version)}' at '${this.filePath}'. Update the pi-subagents-bridge extension to a version that supports this journal.`,
@@ -218,7 +236,12 @@ export class OperationJournal {
     `);
     if (version === 0) {
       this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
-    } else if (version === 1 || version === 2 || version === 3 || version === 4) {
+    } else if (
+      version === 1 ||
+      version === 2 ||
+      version === 3 ||
+      version === 4
+    ) {
       this.#transaction(() => {
         if (version === 1) {
           this.#db.exec(`
@@ -229,9 +252,11 @@ export class OperationJournal {
           `);
         }
         if (version !== 4) {
-          this.#db.exec("ALTER TABLE operations ADD COLUMN execution_lifetime TEXT; ALTER TABLE operations ADD COLUMN native_correlated INTEGER NOT NULL DEFAULT 0; ALTER TABLE operations ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0");
+          this.#db.exec(
+            'ALTER TABLE operations ADD COLUMN execution_lifetime TEXT; ALTER TABLE operations ADD COLUMN native_correlated INTEGER NOT NULL DEFAULT 0; ALTER TABLE operations ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0',
+          );
         }
-        this.#db.exec("ALTER TABLE operations ADD COLUMN native_params TEXT");
+        this.#db.exec('ALTER TABLE operations ADD COLUMN native_params TEXT');
         this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
       });
     }
@@ -301,7 +326,12 @@ export class OperationJournal {
     });
   }
 
-  acceptRun(runId: string, owner: AcceptedRunOwner, sessionId: string, asyncDir?: string): boolean {
+  acceptRun(
+    runId: string,
+    owner: AcceptedRunOwner,
+    sessionId: string,
+    asyncDir?: string,
+  ): boolean {
     return this.#transaction(() => {
       const now = this.#now();
       const inserted = this.#db
@@ -311,19 +341,36 @@ export class OperationJournal {
               owner_instance_id, owner_heartbeat_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(runId, asyncDir ?? null, now, sessionId, owner.pid, owner.instanceId, now);
+        .run(
+          runId,
+          asyncDir ?? null,
+          now,
+          sessionId,
+          owner.pid,
+          owner.instanceId,
+          now,
+        );
       if (inserted.changes === 1) return true;
       const existing = this.#db
         .prepare(
           `SELECT session_id, owner_instance_id FROM accepted_runs
             WHERE run_id = ?`,
         )
-        .get(runId) as { session_id: string; owner_instance_id: string } | undefined;
-      return existing?.session_id === sessionId && existing.owner_instance_id === owner.instanceId;
+        .get(runId) as
+        | { session_id: string; owner_instance_id: string }
+        | undefined;
+      return (
+        existing?.session_id === sessionId &&
+        existing.owner_instance_id === owner.instanceId
+      );
     });
   }
 
-  renewAcceptedRun(runId: string, ownerInstanceId: string, sessionId: string): boolean {
+  renewAcceptedRun(
+    runId: string,
+    ownerInstanceId: string,
+    sessionId: string,
+  ): boolean {
     return (
       this.#db
         .prepare(
@@ -334,7 +381,11 @@ export class OperationJournal {
     );
   }
 
-  ownsAcceptedRun(runId: string, ownerInstanceId: string, sessionId: string): boolean {
+  ownsAcceptedRun(
+    runId: string,
+    ownerInstanceId: string,
+    sessionId: string,
+  ): boolean {
     return Boolean(
       this.#db
         .prepare(
@@ -398,7 +449,7 @@ export class OperationJournal {
     runId: string,
   ): LegacySpawnJournalRecord {
     return this.#updateLegacySpawn(requestId, requestDigest, sessionId, {
-      binding: "bound",
+      binding: 'bound',
       runId,
     });
   }
@@ -410,7 +461,7 @@ export class OperationJournal {
     error: string,
   ): LegacySpawnJournalRecord {
     return this.#updateLegacySpawn(requestId, requestDigest, sessionId, {
-      binding: "unknown",
+      binding: 'unknown',
       error,
     });
   }
@@ -445,7 +496,16 @@ export class OperationJournal {
              (operation_id, request_digest, owner_run_id, execution_lifetime, native_correlated, native_params, binding, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, 'dispatching', ?, ?)`,
         )
-        .run(operationId, requestDigest, ownerRunId ?? null, executionLifetime ? JSON.stringify(executionLifetime) : null, executionLifetime ? 1 : 0, nativeParams ? JSON.stringify(nativeParams) : null, now, now);
+        .run(
+          operationId,
+          requestDigest,
+          ownerRunId ?? null,
+          executionLifetime ? JSON.stringify(executionLifetime) : null,
+          executionLifetime ? 1 : 0,
+          nativeParams ? JSON.stringify(nativeParams) : null,
+          now,
+          now,
+        );
       const record = this.get(operationId);
       if (!record) {
         throw new Error(`Operation journal failed to create '${operationId}'`);
@@ -454,33 +514,51 @@ export class OperationJournal {
     });
   }
 
-  requestNativeCancel(operationId: string, requestDigest: string, ownerRunId?: string): OperationJournalRecord {
+  requestNativeCancel(
+    operationId: string,
+    requestDigest: string,
+    ownerRunId?: string,
+  ): OperationJournalRecord {
     return this.#transaction(() => {
       const existing = this.get(operationId);
-      if (existing && (existing.requestDigest !== requestDigest || existing.ownerRunId !== ownerRunId)) {
-        throw new Error("operation owner does not match the durable operation");
+      if (
+        existing &&
+        (existing.requestDigest !== requestDigest ||
+          existing.ownerRunId !== ownerRunId)
+      ) {
+        throw new Error('operation owner does not match the durable operation');
       }
       if (existing && !existing.nativeCorrelated) {
-        throw new Error("legacy launch cannot be fenced by operation identity; reconcile and stop its existing child");
+        throw new Error(
+          'legacy launch cannot be fenced by operation identity; reconcile and stop its existing child',
+        );
       }
       if (!existing) {
         const now = this.#now();
-        this.#db.prepare(`INSERT INTO operations
+        this.#db
+          .prepare(`INSERT INTO operations
           (operation_id, request_digest, owner_run_id, native_correlated, cancel_requested, binding, created_at, updated_at)
           VALUES (?, ?, ?, 1, 1, 'dispatching', ?, ?)`)
           .run(operationId, requestDigest, ownerRunId ?? null, now, now);
       } else {
-        this.#db.prepare("UPDATE operations SET cancel_requested = 1 WHERE operation_id = ?").run(operationId);
+        this.#db
+          .prepare(
+            'UPDATE operations SET cancel_requested = 1 WHERE operation_id = ?',
+          )
+          .run(operationId);
       }
       const record = this.get(operationId);
-      if (!record) throw new Error("Native cancellation intent could not be persisted");
+      if (!record)
+        throw new Error('Native cancellation intent could not be persisted');
       return record;
     });
   }
 
   getByRunId(runId: string): OperationJournalRecord | undefined {
-    const rows = this.#db.prepare("SELECT operation_id FROM operations WHERE run_id = ? LIMIT 2").all(runId) as unknown as { operation_id: string }[];
-    if (rows.length > 1) throw new Error("Native runId mapping is ambiguous");
+    const rows = this.#db
+      .prepare('SELECT operation_id FROM operations WHERE run_id = ? LIMIT 2')
+      .all(runId) as unknown as { operation_id: string }[];
+    if (rows.length > 1) throw new Error('Native runId mapping is ambiguous');
     return rows[0] ? this.get(rows[0].operation_id) : undefined;
   }
 
@@ -491,15 +569,19 @@ export class OperationJournal {
     asyncDir?: string,
   ): OperationJournalRecord {
     return this.#update(operationId, requestDigest, {
-      binding: "bound",
+      binding: 'bound',
       runId,
       ...(asyncDir ? { asyncDir } : {}),
     });
   }
 
-  markUnknown(operationId: string, requestDigest: string, error: string): OperationJournalRecord {
+  markUnknown(
+    operationId: string,
+    requestDigest: string,
+    error: string,
+  ): OperationJournalRecord {
     return this.#update(operationId, requestDigest, {
-      binding: "unknown",
+      binding: 'unknown',
       error,
     });
   }
@@ -508,18 +590,27 @@ export class OperationJournal {
     requestId: string,
     requestDigest: string,
     sessionId: string,
-    update: { binding: "bound"; runId: string } | { binding: "unknown"; error: string },
+    update:
+      | { binding: 'bound'; runId: string }
+      | { binding: 'unknown'; error: string },
   ): LegacySpawnJournalRecord {
     return this.#transaction(() => {
       const current = this.getLegacySpawn(requestId);
       if (!current) {
-        throw new Error(`Legacy spawn journal has no record for '${requestId}'`);
+        throw new Error(
+          `Legacy spawn journal has no record for '${requestId}'`,
+        );
       }
-      if (current.requestDigest !== requestDigest || current.sessionId !== sessionId) {
-        throw new Error(`Legacy spawn '${requestId}' was already used by another request`);
+      if (
+        current.requestDigest !== requestDigest ||
+        current.sessionId !== sessionId
+      ) {
+        throw new Error(
+          `Legacy spawn '${requestId}' was already used by another request`,
+        );
       }
       const updatedAt = this.#now();
-      if (update.binding === "bound") {
+      if (update.binding === 'bound') {
         this.#db
           .prepare(
             `UPDATE legacy_spawns
@@ -548,8 +639,8 @@ export class OperationJournal {
     operationId: string,
     requestDigest: string,
     update:
-      | { binding: "bound"; runId: string; asyncDir?: string }
-      | { binding: "unknown"; error: string },
+      | { binding: 'bound'; runId: string; asyncDir?: string }
+      | { binding: 'unknown'; error: string },
   ): OperationJournalRecord {
     return this.#transaction(() => {
       const current = this.get(operationId);
@@ -562,7 +653,7 @@ export class OperationJournal {
         );
       }
       const updatedAt = this.#now();
-      if (update.binding === "bound") {
+      if (update.binding === 'bound') {
         this.#db
           .prepare(
             `UPDATE operations
@@ -588,14 +679,14 @@ export class OperationJournal {
   }
 
   #transaction<T>(action: () => T): T {
-    this.#db.exec("BEGIN IMMEDIATE");
+    this.#db.exec('BEGIN IMMEDIATE');
     try {
       const result = action();
-      this.#db.exec("COMMIT");
+      this.#db.exec('COMMIT');
       return result;
     } catch (error: unknown) {
       try {
-        this.#db.exec("ROLLBACK");
+        this.#db.exec('ROLLBACK');
       } catch {
         // Preserve the operation error. SQLite will release locks on process exit.
       }

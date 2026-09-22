@@ -1,10 +1,10 @@
-import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import test from "node:test";
-import { promisify } from "node:util";
+import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+import { onTestFinished, test } from 'vitest';
 
 const execFileAsync = promisify(execFile);
 
@@ -28,53 +28,53 @@ interface PackageManifest {
   publishConfig?: { access?: string };
 }
 
-test("npm pack includes only the runtime extension package", async (t) => {
-  const packDir = await mkdtemp(join(tmpdir(), "pi-subagents-bridge-pack-"));
-  t.after(async () => {
+test('npm pack includes only the runtime extension package', async () => {
+  const packDir = await mkdtemp(join(tmpdir(), 'pi-subagents-bridge-pack-'));
+  onTestFinished(async () => {
     await rm(packDir, { recursive: true, force: true });
   });
 
   const { stdout } = await execFileAsync(
-    "npm",
-    ["pack", "--json", "--pack-destination", packDir],
+    'npm',
+    ['pack', '--json', '--pack-destination', packDir],
     { maxBuffer: 1024 * 1024 },
   );
   const result = parsePackResult(stdout);
-  const manifest = parsePackageManifest(await readFile("package.json", "utf8"));
+  const manifest = parsePackageManifest(await readFile('package.json', 'utf8'));
   const files = new Set(result.files.map((file) => file.path));
 
   assert.equal(result.name, manifest.name);
   assert.equal(result.version, manifest.version);
   assert.equal(
     result.filename,
-    `${manifest.name.replaceAll("/", "-")}-${manifest.version}.tgz`.replace(
+    `${manifest.name.replaceAll('/', '-')}-${manifest.version}.tgz`.replace(
       /^@/,
-      "",
+      '',
     ),
   );
   assert.deepEqual([...files].sort(), [
-    "LICENSE",
-    "README.md",
-    "package.json",
-    "src/execution-lifetime.ts",
-    "src/index.ts",
-    "src/native-proof.ts",
-    "src/operation-journal.ts",
-    "src/plan-exec-rpc.ts",
-    "src/workflow-spawn.ts",
+    'LICENSE',
+    'README.md',
+    'package.json',
+    'src/execution-lifetime.ts',
+    'src/index.ts',
+    'src/native-proof.ts',
+    'src/operation-journal.ts',
+    'src/plan-exec-rpc.ts',
+    'src/workflow-spawn.ts',
   ]);
 
   assert.deepEqual(manifest.files, [
-    "src/index.ts",
-    "src/operation-journal.ts",
-    "src/plan-exec-rpc.ts",
-    "src/workflow-spawn.ts",
-    "src/execution-lifetime.ts",
-    "src/native-proof.ts",
+    'src/index.ts',
+    'src/operation-journal.ts',
+    'src/plan-exec-rpc.ts',
+    'src/workflow-spawn.ts',
+    'src/execution-lifetime.ts',
+    'src/native-proof.ts',
   ]);
-  assert.deepEqual(manifest.pi.extensions, ["./src/index.ts"]);
-  assert.match(manifest.pi.image ?? "", /^https:\/\//);
-  assert.equal(manifest.publishConfig?.access, "public");
+  assert.deepEqual(manifest.pi.extensions, ['./src/index.ts']);
+  assert.match(manifest.pi.image ?? '', /^https:\/\//);
+  assert.equal(manifest.publishConfig?.access, 'public');
 });
 
 function parsePackageManifest(raw: string): PackageManifest {
@@ -99,35 +99,35 @@ function parsePackResult(stdout: string): PackResult {
 function isPackResult(value: unknown): value is PackResult {
   return (
     isRecord(value) &&
-    typeof value.filename === "string" &&
-    typeof value.name === "string" &&
-    typeof value.version === "string" &&
-    typeof value.size === "number" &&
+    typeof value.filename === 'string' &&
+    typeof value.name === 'string' &&
+    typeof value.version === 'string' &&
+    typeof value.size === 'number' &&
     Array.isArray(value.files) &&
-    value.files.every((file) => isRecord(file) && typeof file.path === "string")
+    value.files.every((file) => isRecord(file) && typeof file.path === 'string')
   );
 }
 
 function isPackageManifest(value: unknown): value is PackageManifest {
   return (
     isRecord(value) &&
-    typeof value.name === "string" &&
-    typeof value.version === "string" &&
+    typeof value.name === 'string' &&
+    typeof value.version === 'string' &&
     isRecord(value.pi) &&
     (value.files === undefined ||
       (Array.isArray(value.files) &&
-        value.files.every((item) => typeof item === "string"))) &&
+        value.files.every((item) => typeof item === 'string'))) &&
     (value.pi.extensions === undefined ||
       (Array.isArray(value.pi.extensions) &&
-        value.pi.extensions.every((item) => typeof item === "string"))) &&
-    (value.pi.image === undefined || typeof value.pi.image === "string") &&
+        value.pi.extensions.every((item) => typeof item === 'string'))) &&
+    (value.pi.image === undefined || typeof value.pi.image === 'string') &&
     (value.publishConfig === undefined ||
       (isRecord(value.publishConfig) &&
         (value.publishConfig.access === undefined ||
-          typeof value.publishConfig.access === "string")))
+          typeof value.publishConfig.access === 'string')))
   );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

@@ -1,10 +1,10 @@
-import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { DatabaseSync } from "node:sqlite";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import test from "node:test";
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { onTestFinished, test } from 'vitest';
 
 function seedV5Journal(journalPath: string): void {
   fs.mkdirSync(path.dirname(journalPath), { recursive: true });
@@ -40,41 +40,46 @@ function seedV5Journal(journalPath: string): void {
   db.close();
 }
 
-test("Pi loads the bridge extension with a v5 journal", (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-bridge-startup-"));
-  const home = path.join(root, "home");
-  const agentDir = path.join(root, "agent");
-  const cwd = path.join(root, "cwd");
-  const journalPath = path.join(home, ".pi", "pi-subagents-bridge", "plan-exec-operations.sqlite");
+test('Pi loads the bridge extension with a v5 journal', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-bridge-startup-'));
+  const home = path.join(root, 'home');
+  const agentDir = path.join(root, 'agent');
+  const cwd = path.join(root, 'cwd');
+  const journalPath = path.join(
+    home,
+    '.pi',
+    'pi-subagents-bridge',
+    'plan-exec-operations.sqlite',
+  );
   fs.mkdirSync(home, { recursive: true });
   fs.mkdirSync(agentDir, { recursive: true });
   fs.mkdirSync(cwd, { recursive: true });
   seedV5Journal(journalPath);
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
 
   const result = spawnSync(
     process.execPath,
     [
-      path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
-      "--mode",
-      "rpc",
-      "--extension",
-      path.resolve("src/index.ts"),
-      "--no-extensions",
-      "--no-skills",
-      "--no-prompt-templates",
-      "--no-themes",
-      "--no-context-files",
-      "--no-session",
+      path.resolve('node_modules/@earendil-works/pi-coding-agent/dist/cli.js'),
+      '--mode',
+      'rpc',
+      '--extension',
+      path.resolve('src/index.ts'),
+      '--no-extensions',
+      '--no-skills',
+      '--no-prompt-templates',
+      '--no-themes',
+      '--no-context-files',
+      '--no-session',
     ],
     {
       cwd,
-      encoding: "utf8",
+      encoding: 'utf8',
       env: {
         ...process.env,
         HOME: home,
         PI_CODING_AGENT_DIR: agentDir,
-        PI_OFFLINE: "1",
+        PI_OFFLINE: '1',
       },
       input: '{"id":"startup-state","type":"get_state"}\n',
       timeout: 15_000,
@@ -88,12 +93,12 @@ test("Pi loads the bridge extension with a v5 journal", (t) => {
     /Failed to load extension|Unsupported operation journal version/,
   );
   const response = result.stdout
-    .split("\n")
+    .split('\n')
     .filter((line) => line.trim())
     .map((line) => JSON.parse(line) as Record<string, unknown>)
-    .find((line) => line.id === "startup-state");
+    .find((line) => line.id === 'startup-state');
   assert.ok(response);
-  assert.equal(response.type, "response");
-  assert.equal(response.command, "get_state");
+  assert.equal(response.type, 'response');
+  assert.equal(response.command, 'get_state');
   assert.equal(response.success, true);
 });
