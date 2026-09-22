@@ -857,15 +857,17 @@ export function registerPlanExecRpc(
 
   let proofUnsubscribe: Unsubscribe | undefined;
   const subscribeToTerminalProofs = (
-    capabilities: Record<string, unknown> | undefined,
+    upstream: Record<string, unknown> | undefined,
   ): void => {
     if (proofUnsubscribe) return;
-    const capabilityEvents =
-      isRecord(capabilities) && isRecord(capabilities.events)
-        ? capabilities.events
+    const eventRecord = isRecord(upstream?.events)
+      ? upstream.events
+      : isRecord(upstream?.capabilities) &&
+          isRecord(upstream.capabilities.events)
+        ? upstream.capabilities.events
         : undefined;
-    const event = capabilityEvents
-      ? nonEmptyString(capabilityEvents.processTerminal)
+    const event = eventRecord
+      ? nonEmptyString(eventRecord.processTerminal)
       : undefined;
     if (!event) return;
     const unsubscribe = events.on(event, (raw: unknown) => {
@@ -889,7 +891,7 @@ export function registerPlanExecRpc(
         'pi-subagents runtime does not support detached async spawn with stop control',
       );
     }
-    subscribeToTerminalProofs(upstream.capabilities);
+    subscribeToTerminalProofs(upstream);
   };
 
   const startNativeOperation = async (
@@ -1194,7 +1196,7 @@ export function registerPlanExecRpc(
             : undefined;
         const terminalCapability = capabilities?.processTerminalProof;
         const asyncRuntime = supportsAsyncRuntime(capabilities);
-        subscribeToTerminalProofs(capabilities);
+        subscribeToTerminalProofs(isRecord(upstream) ? upstream : undefined);
         return {
           success: true,
           data: {

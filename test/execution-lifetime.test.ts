@@ -25,6 +25,10 @@ const capabilities = {
   asyncSpawn: true,
   stop: true,
   processTerminalProof: { version: 1, lifecycleArtifactVersion: 1 },
+};
+// The released runtime returns `events` next to `capabilities`, not inside it.
+const pingData = {
+  capabilities,
   events: { processTerminal: 'subagent:process-terminal' },
 };
 
@@ -120,7 +124,7 @@ test('a bounded lifetime is forwarded as timeoutMs and echoed without provider a
   const { body } = spawnBody('operation-bounded', params);
   let spawned: Record<string, unknown> | undefined;
   const h = harness(journalPath, (method, input) => {
-    if (method === 'ping') return { capabilities };
+    if (method === 'ping') return pingData;
     if (method === 'spawn') {
       spawned = input;
       return { details: { runId: 'run-1', asyncDir: '/tmp/async-1' } };
@@ -154,7 +158,7 @@ test('an unbounded lifetime forwards no timeout', async () => {
   const { body } = spawnBody('operation-unbounded', params);
   let spawned: Record<string, unknown> | undefined;
   const h = harness(journalPath, (method, input) => {
-    if (method === 'ping') return { capabilities };
+    if (method === 'ping') return pingData;
     if (method === 'spawn') {
       spawned = input;
       return { details: { runId: 'run-2' } };
@@ -181,7 +185,7 @@ test('a lost spawn reply is never redispatched', async () => {
   });
   let spawns = 0;
   const h = harness(journalPath, (method) => {
-    if (method === 'ping') return { capabilities };
+    if (method === 'ping') return pingData;
     if (method === 'spawn') {
       spawns += 1;
       return undefined;
@@ -208,7 +212,7 @@ test('cancel before dispatch reports a never-started fence without calling upstr
   });
   let stops = 0;
   const h = harness(journalPath, (method) => {
-    if (method === 'ping') return { capabilities };
+    if (method === 'ping') return pingData;
     if (method === 'spawn') return undefined;
     if (method === 'stop') {
       stops += 1;
@@ -244,7 +248,7 @@ test('a bound operation survives restart and exposes the upstream terminal proof
     executionLifetime: { mode: 'bounded', timeoutMs: 9_000 },
   });
   const first = harness(journalPath, (method) => {
-    if (method === 'ping') return { capabilities };
+    if (method === 'ping') return pingData;
     if (method === 'spawn') return { details: { runId: 'run-restart' } };
     throw new Error(`unexpected upstream method ${method}`);
   });
@@ -254,7 +258,7 @@ test('a bound operation survives restart and exposes the upstream terminal proof
 
   let spawns = 0;
   const second = harness(journalPath, (method) => {
-    if (method === 'ping') return { capabilities };
+    if (method === 'ping') return pingData;
     spawns += 1;
     throw new Error(`unexpected upstream method ${method}`);
   });
