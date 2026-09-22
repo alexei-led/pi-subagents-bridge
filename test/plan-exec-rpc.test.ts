@@ -1292,17 +1292,23 @@ test('plan-exec v2 synthesizes a workflow terminal proof from closed child dispa
     data: { runId: 'parent-run', asyncDir: '/tmp/parent-run', requestDigest },
   });
 
-  const requestStatus = async (requestId: string): Promise<unknown> => {
+  const requestStatus = async (
+    requestId: string,
+    asyncDir = '/tmp/parent-run',
+  ): Promise<unknown> => {
     const status = once(bus, v2ReplyEvent(requestId));
     bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
       version: 2,
       requestId,
       method: 'status',
-      params: { runId: 'parent-run', asyncDir: '/tmp/parent-run' },
+      params: { runId: 'parent-run', asyncDir },
     });
     return status;
   };
-  const replyParent = (): void => {
+  const replyParent = (
+    overrides: Record<string, unknown> = {},
+    childRunId = 'child-run',
+  ): void => {
     const request = bus.last(SUBAGENTS_REQUEST_EVENT);
     assert.ok(isRecord(request));
     replyUpstream(bus, request, 'status', {
@@ -1315,21 +1321,28 @@ test('plan-exec v2 synthesizes a workflow terminal proof from closed child dispa
           inventoryComplete: true,
           workflowState: 'completed',
           children: [
-            { childId: 'main', state: 'completed', runId: 'child-run' },
+            { childId: 'main', state: 'completed', runId: childRunId },
           ],
+          ...overrides,
         },
       },
     });
   };
+  const workflowProofOf = async (
+    requestId: string,
+    overrides: Record<string, unknown> = {},
+    childRunId = 'child-run',
+    asyncDir = '/tmp/parent-run',
+  ): Promise<unknown> => {
+    const pending = requestStatus(requestId, asyncDir);
+    replyParent(overrides, childRunId);
+    const reply = await pending;
+    assert.ok(isRecord(reply) && reply.success === true);
+    return (reply.data as Record<string, unknown>).workflowTerminalProof;
+  };
 
   // Without the child's writer-exit proof there is no terminal evidence yet.
-  const pending = requestStatus('wf-status-pending');
-  replyParent();
-  const pendingData = await pending;
-  assert.ok(isRecord(pendingData) && pendingData.success === true);
-  const pendingBody = pendingData.data as Record<string, unknown>;
-  assert.equal(pendingBody.state, 'complete');
-  assert.equal('workflowTerminalProof' in pendingBody, false);
+  assert.equal(await workflowProofOf('wf-status-pending'), undefined);
 
   const childProof = {
     version: 1,
@@ -1341,20 +1354,54 @@ test('plan-exec v2 synthesizes a workflow terminal proof from closed child dispa
   };
   bus.emit('subagent:process-terminal', childProof);
 
-  const proven = requestStatus('wf-status-proven');
-  replyParent();
-  const provenData = await proven;
-  assert.ok(isRecord(provenData) && provenData.success === true);
+  const expectedProof = {
+    version: 1,
+    kind: 'workflow',
+    state: 'observed',
+    runId: 'parent-run',
+    dispatchClosed: true,
+    observedAt: 4321,
+    children: [childProof],
+  };
+  assert.deepEqual(await workflowProofOf('wf-status-proven'), expectedProof);
+
+  // Dispatch closure and terminal workflow state are both required.
+  assert.equal(
+    await workflowProofOf('wf-status-open', { inventoryComplete: false }),
+    undefined,
+  );
+  assert.equal(
+    await workflowProofOf('wf-status-running', { workflowState: 'running' }),
+    undefined,
+  );
   assert.deepEqual(
-    (provenData.data as Record<string, unknown>).workflowTerminalProof,
+    await workflowProofOf('wf-status-stopped', { workflowState: 'stopped' }),
+    expectedProof,
+  );
+
+  // A malformed cached event never becomes an observed child proof.
+  bus.emit('subagent:process-terminal', {
+    ...childProof,
+    state: 'pending',
+  });
+  assert.equal(await workflowProofOf('wf-status-malformed'), undefined);
+  bus.emit('subagent:process-terminal', childProof);
+
+  // The child's own terminal record is the fallback when the cache missed it.
+  const diskRoot = path.join(root, 'async-subagent-runs');
+  const diskParent = path.join(diskRoot, 'disk-parent-run');
+  const diskChild = path.join(diskRoot, 'disk-child-run');
+  fs.mkdirSync(diskChild, { recursive: true });
+  fs.writeFileSync(
+    path.join(diskChild, 'process-terminal.json'),
+    JSON.stringify({ ...childProof, runId: 'disk-child-run' }),
+  );
+  assert.deepEqual(
+    await workflowProofOf('wf-status-disk', {}, 'disk-child-run', diskParent),
     {
-      version: 1,
-      kind: 'workflow',
-      state: 'observed',
-      runId: 'parent-run',
-      dispatchClosed: true,
+      ...expectedProof,
       observedAt: 4321,
-      children: [childProof],
+      children: [{ ...childProof, runId: 'disk-child-run' }],
     },
   );
 });

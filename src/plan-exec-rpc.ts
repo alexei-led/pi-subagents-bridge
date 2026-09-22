@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   type ExecutionLifetime,
@@ -234,7 +235,12 @@ function normalizeNativeOperation(
   }
   if ('workflowTerminalProof' in data) {
     const proof = runId
-      ? extractWorkflowTerminal(upstream, runId, terminalProofs)
+      ? extractWorkflowTerminal(
+          upstream,
+          runId,
+          terminalProofs,
+          nonEmptyString(upstream.asyncDir),
+        )
       : undefined;
     if (proof) data.workflowTerminalProof = proof;
     else delete data.workflowTerminalProof;
@@ -577,7 +583,7 @@ function normalizeObservation(
     ? extractProcessTerminal(upstream, request.runId)
     : undefined;
   const workflowTerminalProof = includeProcessTerminal
-    ? extractWorkflowTerminal(upstream, request.runId, terminalProofs)
+    ? extractWorkflowTerminal(upstream, request.runId, terminalProofs, asyncDir)
     : undefined;
   return {
     runId: request.runId,
@@ -602,6 +608,7 @@ function extractWorkflowTerminal(
   upstream: unknown,
   runId: string,
   terminalProofs?: Map<string, Record<string, unknown>>,
+  asyncDir?: string,
 ): Record<string, unknown> | undefined {
   if (!isRecord(upstream)) return undefined;
   const details = isRecord(upstream.details) ? upstream.details : undefined;
@@ -642,13 +649,41 @@ function extractWorkflowTerminal(
     upstream.workflowChildren ??
     details?.workflowChildren ??
     lifecycle?.workflowChildren;
-  return workflowProofFromChildren(childrenSummary, runId, terminalProofs);
+  return workflowProofFromChildren(
+    childrenSummary,
+    runId,
+    terminalProofs,
+    asyncDir,
+  );
+}
+
+/** Cached writer-exit proof first, then the child's own terminal record. */
+function childTerminalProof(
+  terminalProofs: Map<string, Record<string, unknown>> | undefined,
+  asyncDir: string | undefined,
+  childRunId: string,
+): Record<string, unknown> | undefined {
+  const cached = terminalProofs?.get(childRunId);
+  if (cached) return attestUpstreamTerminalProof(cached, childRunId);
+  if (!asyncDir) return undefined;
+  try {
+    const raw: unknown = JSON.parse(
+      readFileSync(
+        path.join(path.dirname(asyncDir), childRunId, 'process-terminal.json'),
+        'utf8',
+      ),
+    );
+    return attestUpstreamTerminalProof(raw, childRunId);
+  } catch {
+    return undefined;
+  }
 }
 
 function workflowProofFromChildren(
   value: unknown,
   runId: string,
   terminalProofs: Map<string, Record<string, unknown>> | undefined,
+  asyncDir: string | undefined,
 ): Record<string, unknown> | undefined {
   if (
     !terminalProofs ||
@@ -664,7 +699,7 @@ function workflowProofFromChildren(
   if (
     workflowState !== 'completed' &&
     workflowState !== 'failed' &&
-    workflowState !== 'cancelled'
+    workflowState !== 'stopped'
   )
     return undefined;
   const children: Record<string, unknown>[] = [];
@@ -673,14 +708,10 @@ function workflowProofFromChildren(
     if (!isRecord(child)) return undefined;
     const childRunId = child.runId;
     if (typeof childRunId !== 'string' || !childRunId.trim()) return undefined;
-    const childProof = terminalProofs.get(childRunId);
+    const childProof = childTerminalProof(terminalProofs, asyncDir, childRunId);
     if (!childProof) return undefined;
     const childObservedAt = childProof.observedAt;
-    if (
-      typeof childObservedAt !== 'number' ||
-      !Number.isFinite(childObservedAt)
-    )
-      return undefined;
+    if (typeof childObservedAt !== 'number') return undefined;
     observedAt = Math.max(observedAt, childObservedAt);
     children.push(childProof);
   }
