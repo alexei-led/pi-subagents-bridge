@@ -199,15 +199,11 @@ operation, request digest, diagnostic ID, and tool-call ID, with
 An enqueue receipt does not confirm a repair. Cancellation fences late guidance;
 this method does not start or revive a worker.
 
-To test the full Bridge → native owned async child path against a modified
-native source checkout, install that checkout's development dependencies and run
-`PI_SUBAGENTS_SOURCE=/path/to/pi-subagents npm run test:native`. This uses native
-test fixtures and keeps artifacts under `.native-test-*` in this checkout.
-The native source must match the immutable dependency pin and have no tracked
-modifications. During coordinated local development only,
-`PI_NATIVE_CONTRACT_DEVELOPMENT=1` allows testing an uncommitted native checkout.
-Set `PI_PLAN_EXEC_SOURCE=/path/to/pi-plan-exec` as well to verify the real client's
-capability negotiation and rejection of a weaker provider before any spawn.
+The bridge is validated against the released pi-subagents runtime by the
+Vitest suite in this repository. The installed end-to-end path (controller,
+Bridge, native RPC, owned workers, checks, review, promotion, archive) is
+exercised from pi-plan-exec with `npm run test:runtime-smoke`; that smoke run
+covers the real client's capability negotiation as well.
 
 The journal defaults to `~/.pi/pi-subagents-bridge/plan-exec-operations.sqlite`. SQLite transactions provide crash recovery and cross-process serialization without a stale application lock. Version 1 clients retain their existing response shape and also benefit from durable bound-operation lookup. Operation identity rows are retained as idempotency records; automatic pruning could make an old operation ID dispatch again. Remove the database only after all referenced plan runs are permanently retired and duplicate-launch protection is no longer needed. Existing v1 accepted-run rows migrate fail-closed with no session identity; they require explicit manual recovery rather than unsafe cross-session delivery.
 

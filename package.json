@@ -35,7 +35,6 @@
   },
   "scripts": {
     "tsc": "tsc --noEmit",
-    "build": "tsc",
     "test": "vitest run --pool=threads",
     "check": "biome check --error-on-warnings . && npm run tsc",
     "lint": "biome lint --error-on-warnings .",
