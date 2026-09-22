@@ -31,7 +31,7 @@ function harness(journalPath: string, native: (method: string, params: Record<st
     emit(event: string, value: unknown) { emitter.emit(event, value); },
   };
   emitter.on("subagents:rpc:v1:request", (raw: { requestId: string; method: string; params: Record<string, unknown> }) => {
-    const data = native(raw.method, raw.params ?? {});
+    const data = native(raw.method, raw.params);
     if (data !== undefined) queueMicrotask(() => bus.emit(`subagents:rpc:v1:reply:${raw.requestId}`, { version: 1, requestId: raw.requestId, method: raw.method, success: true, data }));
   });
   const rpc = registerPlanExecRpc(bus, { journalPath, timeoutMs: 20 });
@@ -75,10 +75,11 @@ test("a bounded lifetime is forwarded as timeoutMs and echoed without provider a
   const data = reply.data as Record<string, unknown>;
   assert.equal(data.runId, "run-1");
   assert.deepEqual(data.effectiveExecutionLifetime, { mode: "bounded", timeoutMs: 5_000 });
-  assert.equal(spawned?.timeoutMs, 5_000);
-  assert.equal(spawned?.executionLifetime, undefined);
-  assert.equal(spawned?.executionOwnership, undefined);
-  assert.match(String(spawned?.workflowScript), /runs\.run/);
+  assert.ok(spawned);
+  assert.equal(spawned.timeoutMs, 5_000);
+  assert.equal(spawned.executionLifetime, undefined);
+  assert.equal(spawned.executionOwnership, undefined);
+  assert.match(String(spawned.workflowScript), /runs\.run/);
 });
 
 test("an unbounded lifetime forwards no timeout", async (t) => {
@@ -114,7 +115,8 @@ test("a lost spawn reply is never redispatched", async (t) => {
   assert.equal(first.success, false);
   const second = await h.request("spawn", body);
   assert.equal(second.success, false);
-  assert.match(String((second.error as Record<string, unknown>)?.message ?? ""), /unknown/i);
+  const secondError = second.error as { message?: string } | undefined;
+  assert.match(secondError?.message ?? "", /unknown/i);
   assert.equal(spawns, 1);
 });
 
@@ -180,7 +182,7 @@ test("a bound operation survives restart and exposes the upstream terminal proof
   });
   const withProof = await second.request("operation", lookupBody);
   const proof = (withProof.data as Record<string, unknown>).processTerminalProof as Record<string, unknown>;
-  assert.equal(proof?.runId, "run-restart");
-  assert.equal(proof?.state, "observed");
+  assert.equal(proof.runId, "run-restart");
+  assert.equal(proof.state, "observed");
   assert.equal(spawns, 0);
 });

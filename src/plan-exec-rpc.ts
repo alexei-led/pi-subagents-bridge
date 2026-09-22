@@ -173,7 +173,7 @@ function extractSpawnAsyncDir(reply: unknown): string | undefined {
 }
 
 function supportsAsyncRuntime(capabilities: Record<string, unknown> | undefined): boolean {
-  return capabilities?.asyncSpawn === true && capabilities?.stop === true;
+  return capabilities?.asyncSpawn === true && capabilities.stop === true;
 }
 
 function supportsDiagnosticGuidance(capabilities: Record<string, unknown> | undefined): boolean {
