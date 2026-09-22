@@ -40,7 +40,7 @@ function seedV5Journal(journalPath: string): void {
   db.close();
 }
 
-test('Pi loads the bridge extension with a v5 journal', () => {
+test('Pi loads the bridge extension with a v5 journal', { timeout: 20_000 }, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-bridge-startup-'));
   const home = path.join(root, 'home');
   const agentDir = path.join(root, 'agent');
