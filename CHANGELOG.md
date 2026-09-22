@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2 - 2026-09-22
+
+- Add explicit execution-lifetime contracts to plan-exec RPC and owned native dispatch, including bounded or unbounded selection and a verified effective lifetime on every reply.
+- Add durable native operation recovery: journal schema 5, persisted native params, owner-bound lookups, cold-client cancellation, no-start admission fences, and dispatch arbitration.
+- Route owned native launches with journal-bound kernel proofs and keep terminal evidence consistent across recovery.
+- Keep accepted-run ownership with a live owner PID; an expired heartbeat alone no longer transfers ownership.
+- Preserve the caller workspace unless the caller explicitly requests an isolation override.
+- Validate against Pi 0.87.0 and the npm 12 root Git dependency policy.
+
 ## 0.3.1 - 2026-09-22
 
 - Validate against Pi 0.87.0.
