@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 - 2026-09-22
+
+- Accept the released pi-subagents runtime: detached async spawn, stop control, writer-exit terminal proofs, and deadlines.
+- Replace the kernel/lifetime capability contract with bridge-supervised lifetimes: a bounded lifetime is forwarded as the upstream timeout, and the bridge owns the durable operation identity, lookup, and cancellation fence.
+- Capture upstream process-terminal events and expose them with operation lookups, so recovery confirms terminal state after a bridge restart.
+- Keep the durable operation journal for lost-reply recovery and binding retries.
+
 ## 0.3.2 - 2026-09-22
 
 - Add explicit execution-lifetime contracts to plan-exec RPC and owned native dispatch, including bounded or unbounded selection and a verified effective lifetime on every reply.
