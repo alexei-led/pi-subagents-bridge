@@ -3,6 +3,8 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 const JOURNAL_VERSION = 3;
+// The autonomous runtime's v4/v5 schemas only add optional operation fields.
+const COMPATIBLE_JOURNAL_VERSIONS = [0, 1, 2, JOURNAL_VERSION, 4, 5];
 const BUSY_TIMEOUT_MS = 2_000;
 
 export type OperationBinding = "dispatching" | "bound" | "unknown";
@@ -92,9 +94,7 @@ function operationRecord(row: OperationRow): OperationJournalRecord {
   };
 }
 
-function legacySpawnRecord(
-  row: LegacySpawnRow,
-): LegacySpawnJournalRecord {
+function legacySpawnRecord(row: LegacySpawnRow): LegacySpawnJournalRecord {
   return {
     requestId: row.request_id,
     requestDigest: row.request_digest,
@@ -147,8 +147,15 @@ export class OperationJournal {
     this.#now = now;
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
     this.#db = new DatabaseSync(this.filePath);
+    this.#db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    const version = this.#db.prepare("PRAGMA user_version").get()?.user_version;
+    if (typeof version !== "number" || !COMPATIBLE_JOURNAL_VERSIONS.includes(version)) {
+      this.#db.close();
+      throw new Error(
+        `Unsupported operation journal version '${String(version)}' at '${this.filePath}'. Update the pi-subagents-bridge extension to a version that supports this journal.`,
+      );
+    }
     this.#db.exec(`
-      PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS};
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = FULL;
       CREATE TABLE IF NOT EXISTS operations (
@@ -186,17 +193,11 @@ export class OperationJournal {
         owner_heartbeat_at INTEGER NOT NULL
       ) STRICT;
     `);
-    const version = this.#db.prepare("PRAGMA user_version").get() as
-      | { user_version?: unknown }
-      | undefined;
-    if (version?.user_version === 0) {
+    if (version === 0) {
       this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
-    } else if (
-      version?.user_version === 1 ||
-      version?.user_version === 2
-    ) {
+    } else if (version === 1 || version === 2) {
       this.#transaction(() => {
-        if (version.user_version === 1) {
+        if (version === 1) {
           this.#db.exec(`
             ALTER TABLE accepted_runs
               ADD COLUMN session_id TEXT NOT NULL DEFAULT '';
@@ -206,11 +207,6 @@ export class OperationJournal {
         }
         this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
       });
-    } else if (version?.user_version !== JOURNAL_VERSION) {
-      this.#db.close();
-      throw new Error(
-        `Unsupported operation journal version '${String(version?.user_version)}'`,
-      );
     }
     fs.chmodSync(this.filePath, 0o600);
   }
@@ -241,15 +237,10 @@ export class OperationJournal {
                 WHERE run_id = ? AND session_id = ? AND owner_instance_id = ?`,
             )
             .run(now, row.run_id, sessionId, owner.instanceId);
-          claimed.push(
-            acceptedRunRecord({ ...row, owner_heartbeat_at: now }),
-          );
+          claimed.push(acceptedRunRecord({ ...row, owner_heartbeat_at: now }));
           continue;
         }
-        if (
-          isProcessAlive(row.owner_pid) &&
-          row.owner_heartbeat_at >= staleBefore
-        ) {
+        if (isProcessAlive(row.owner_pid) && row.owner_heartbeat_at >= staleBefore) {
           continue;
         }
         const result = this.#db
@@ -284,12 +275,7 @@ export class OperationJournal {
     });
   }
 
-  acceptRun(
-    runId: string,
-    owner: AcceptedRunOwner,
-    sessionId: string,
-    asyncDir?: string,
-  ): boolean {
+  acceptRun(runId: string, owner: AcceptedRunOwner, sessionId: string, asyncDir?: string): boolean {
     return this.#transaction(() => {
       const now = this.#now();
       const inserted = this.#db
@@ -299,36 +285,19 @@ export class OperationJournal {
               owner_instance_id, owner_heartbeat_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(
-          runId,
-          asyncDir ?? null,
-          now,
-          sessionId,
-          owner.pid,
-          owner.instanceId,
-          now,
-        );
+        .run(runId, asyncDir ?? null, now, sessionId, owner.pid, owner.instanceId, now);
       if (inserted.changes === 1) return true;
       const existing = this.#db
         .prepare(
           `SELECT session_id, owner_instance_id FROM accepted_runs
             WHERE run_id = ?`,
         )
-        .get(runId) as
-        | { session_id: string; owner_instance_id: string }
-        | undefined;
-      return (
-        existing?.session_id === sessionId &&
-        existing.owner_instance_id === owner.instanceId
-      );
+        .get(runId) as { session_id: string; owner_instance_id: string } | undefined;
+      return existing?.session_id === sessionId && existing.owner_instance_id === owner.instanceId;
     });
   }
 
-  renewAcceptedRun(
-    runId: string,
-    ownerInstanceId: string,
-    sessionId: string,
-  ): boolean {
+  renewAcceptedRun(runId: string, ownerInstanceId: string, sessionId: string): boolean {
     return (
       this.#db
         .prepare(
@@ -339,11 +308,7 @@ export class OperationJournal {
     );
   }
 
-  ownsAcceptedRun(
-    runId: string,
-    ownerInstanceId: string,
-    sessionId: string,
-  ): boolean {
+  ownsAcceptedRun(runId: string, ownerInstanceId: string, sessionId: string): boolean {
     return Boolean(
       this.#db
         .prepare(
@@ -354,11 +319,7 @@ export class OperationJournal {
     );
   }
 
-  completeRun(
-    runId: string,
-    ownerInstanceId: string,
-    sessionId: string,
-  ): void {
+  completeRun(runId: string, ownerInstanceId: string, sessionId: string): void {
     this.#db
       .prepare(
         `DELETE FROM accepted_runs
@@ -478,11 +439,7 @@ export class OperationJournal {
     });
   }
 
-  markUnknown(
-    operationId: string,
-    requestDigest: string,
-    error: string,
-  ): OperationJournalRecord {
+  markUnknown(operationId: string, requestDigest: string, error: string): OperationJournalRecord {
     return this.#update(operationId, requestDigest, {
       binding: "unknown",
       error,
@@ -493,22 +450,15 @@ export class OperationJournal {
     requestId: string,
     requestDigest: string,
     sessionId: string,
-    update:
-      | { binding: "bound"; runId: string }
-      | { binding: "unknown"; error: string },
+    update: { binding: "bound"; runId: string } | { binding: "unknown"; error: string },
   ): LegacySpawnJournalRecord {
     return this.#transaction(() => {
       const current = this.getLegacySpawn(requestId);
       if (!current) {
         throw new Error(`Legacy spawn journal has no record for '${requestId}'`);
       }
-      if (
-        current.requestDigest !== requestDigest ||
-        current.sessionId !== sessionId
-      ) {
-        throw new Error(
-          `Legacy spawn '${requestId}' was already used by another request`,
-        );
+      if (current.requestDigest !== requestDigest || current.sessionId !== sessionId) {
+        throw new Error(`Legacy spawn '${requestId}' was already used by another request`);
       }
       const updatedAt = this.#now();
       if (update.binding === "bound") {

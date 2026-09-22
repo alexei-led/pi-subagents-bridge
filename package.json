@@ -1,32 +1,36 @@
 {
   "name": "@alexeiled/pi-subagents-bridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Protocol adapter that lets @tintinweb/pi-tasks TaskExecute spawn nicobailon/pi-subagents.",
-  "type": "module",
-  "main": "./src/index.ts",
-  "exports": "./src/index.ts",
-  "license": "MIT",
-  "publishConfig": {
-    "access": "public"
-  },
-  "engines": {
-    "node": ">=22.19.0"
-  },
-  "packageManager": "npm@11.18.0",
   "keywords": [
-    "pi-package",
+    "bridge",
     "pi-extension",
+    "pi-package",
     "pi-subagents",
     "pi-tasks",
-    "bridge",
     "rpc"
   ],
+  "homepage": "https://github.com/alexei-led/pi-subagents-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/alexei-led/pi-subagents-bridge/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alexei-led/pi-subagents-bridge.git"
+  },
   "files": [
     "src/index.ts",
     "src/operation-journal.ts",
     "src/plan-exec-rpc.ts",
     "src/workflow-spawn.ts"
   ],
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": "./src/index.ts",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "lint": "eslint . --cache --cache-strategy content",
     "check": "tsc --noEmit",
@@ -35,17 +39,8 @@
     "publish:dry": "npm publish --dry-run",
     "test:all": "npm run lint && npm run check && npm test && npm run pack:dry"
   },
-  "pi": {
-    "extensions": [
-      "./src/index.ts"
-    ],
-    "image": "https://raw.githubusercontent.com/alexei-led/pi-subagents-bridge/main/assets/bridge.svg"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.84.4"
-  },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@earendil-works/pi-coding-agent": ">=0.84.4",
     "@eslint/js": "^10.0.1",
     "@tintinweb/pi-tasks": "0.9.0",
     "@types/node": "^24.10.0",
@@ -56,12 +51,17 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.1"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/alexei-led/pi-subagents-bridge.git"
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.4"
   },
-  "homepage": "https://github.com/alexei-led/pi-subagents-bridge#readme",
-  "bugs": {
-    "url": "https://github.com/alexei-led/pi-subagents-bridge/issues"
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "npm@11.18.0",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "image": "https://raw.githubusercontent.com/alexei-led/pi-subagents-bridge/main/assets/bridge.svg"
   }
 }

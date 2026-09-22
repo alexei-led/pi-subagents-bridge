@@ -1,12 +1,16 @@
 # Changelog
 
+## 0.3.1 - 2026-09-22
+
+- Validate against Pi 0.87.0.
+- Open known schema-4/5 operation journals without changing their version or extra fields.
+- Reject unknown journal versions before database changes and include recovery guidance.
+
 ## 0.3.0 - 2026-08-30
 
 - Add resilient v2 plan-exec RPC integration, session-fenced legacy run recovery, SQLite durability, replay identity checks, and retryable persistence.
 - Add durable launch bindings, native terminal proof, capability negotiation, and fail-closed unknown-launch recovery.
 - Retry transient accepted-run and known-run binding persistence failures.
-
-## Unreleased
 
 ## 0.2.3 - 2026-08-08
 

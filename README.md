@@ -66,7 +66,14 @@ pi install npm:@alexeiled/pi-subagents-bridge
 Requirements:
 
 - Node `>= 22.19.0`
-- Pi with extension loading enabled
+- Pi `>= 0.84.4` with extension loading enabled; tested with Pi `0.87.0`
+
+The bridge uses Pi's public extension event API. Future Pi releases still need
+validation if that API or the upstream subagent protocol changes.
+
+The operation journal supports schema versions 1–5. Versions 4 and 5 retain their
+version and extra fields when opened by this bridge. Unknown versions are rejected
+before database changes; update the bridge instead of deleting or resetting the journal.
 
 ## Usage
 
