@@ -605,6 +605,23 @@ function normalizeObservation(
   };
 }
 
+function closedWorkflowLacksNativeProof(
+  upstream: unknown,
+  runId: string,
+): boolean {
+  if (!isRecord(upstream) || !isRecord(upstream.details)) return false;
+  const children = upstream.details.workflowChildren;
+  return (
+    isRecord(children) &&
+    children.workflowRunId === runId &&
+    children.inventoryComplete === true &&
+    (children.workflowState === 'completed' ||
+      children.workflowState === 'failed' ||
+      children.workflowState === 'stopped') &&
+    !('workflowTerminalProof' in upstream.details)
+  );
+}
+
 function extractWorkflowTerminal(
   upstream: unknown,
   runId: string,
@@ -1648,6 +1665,15 @@ export function registerPlanExecRpc(
           options.timeoutMs,
           controller.signal,
         );
+        if (
+          protocolVersion === 2 &&
+          closedWorkflowLacksNativeProof(upstream, request.runId)
+        ) {
+          return failure(
+            'upstream_error',
+            'Closed workflow has no native terminal proof. Install or reload pi-subagents >=0.71.0, then check its targeted status.',
+          );
+        }
         const observed = normalizeObservation(
           request,
           upstream,

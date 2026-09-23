@@ -1330,7 +1330,7 @@ test('plan-exec v2 prefers validated native process proofs over cached events', 
   });
   const requestStatus = async (
     requestId: string,
-    proof: Record<string, unknown>,
+    proof?: Record<string, unknown>,
   ): Promise<Record<string, unknown>> => {
     const status = once(bus, v2ReplyEvent(requestId));
     bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
@@ -1343,7 +1343,9 @@ test('plan-exec v2 prefers validated native process proofs over cached events', 
     assert.ok(isRecord(request));
     replyUpstream(bus, request, 'status', {
       text: 'Run: parent-run\nState: complete',
-      details: { lifecycleStatus: { processTerminal: proof } },
+      ...(proof
+        ? { details: { lifecycleStatus: { processTerminal: proof } } }
+        : {}),
     });
     const reply = await status;
     assert.ok(isRecord(reply) && isRecord(reply.data));
@@ -1364,12 +1366,8 @@ test('plan-exec v2 prefers validated native process proofs over cached events', 
     state: 'unknown',
     reason: 'observer-unavailable',
   });
-  const laterNativeProof = processProof(4000);
-  const withUnknownEvent = await requestStatus(
-    'proof-unknown-event-ignored',
-    laterNativeProof,
-  );
-  assert.deepEqual(withUnknownEvent.processTerminalProof, laterNativeProof);
+  const withUnknownEvent = await requestStatus('proof-unknown-event-ignored');
+  assert.deepEqual(withUnknownEvent.processTerminalProof, cachedProof);
 });
 
 test('plan-exec v2 rejects observed process proofs without a matching runner instance', async () => {
@@ -1450,7 +1448,7 @@ test('plan-exec v2 fails closed for absent, pending, unknown, and malformed work
     journalPath: path.join(root, 'operations.json'),
   });
   onTestFinished(() => rpc.dispose());
-  await bindV2Run(bus, 'parent-run');
+  await bindV2Run(bus, 'parent-run', true);
 
   const observedChild = {
     version: 1,
@@ -1501,8 +1499,43 @@ test('plan-exec v2 fails closed for absent, pending, unknown, and malformed work
     },
   });
   const missingReply = await missing;
-  assert.ok(isRecord(missingReply) && isRecord(missingReply.data));
-  assert.equal('workflowTerminalProof' in missingReply.data, false);
+  assert.ok(isRecord(missingReply));
+  assert.equal(missingReply.success, false);
+  assert.ok(isRecord(missingReply.error));
+  assert.match(String(missingReply.error.message), /pi-subagents.*0\.71\.0/);
+
+  const pendingStatus = once(bus, v2ReplyEvent('wf-status-pending-child'));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: 'wf-status-pending-child',
+    method: 'status',
+    params: { runId: 'parent-run', asyncDir: '/tmp/parent-run' },
+  });
+  const pendingRequest = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(pendingRequest));
+  replyUpstream(bus, pendingRequest, 'status', {
+    details: {
+      workflowChildren: {
+        version: 1,
+        workflowRunId: 'parent-run',
+        inventoryComplete: true,
+        workflowState: 'completed',
+        children: [{ childId: 'main', state: 'completed', runId: 'child-run' }],
+      },
+      workflowTerminalProof: {
+        version: 1,
+        kind: 'workflow',
+        state: 'pending',
+        runId: 'parent-run',
+        dispatchClosed: true,
+        reason: 'Child process proof is pending.',
+      },
+    },
+  });
+  const pendingReply = await pendingStatus;
+  assert.ok(isRecord(pendingReply) && pendingReply.success === true);
+  assert.ok(isRecord(pendingReply.data));
+  assert.equal('workflowTerminalProof' in pendingReply.data, false);
 
   const invalidProofs: Array<[string, Record<string, unknown>]> = [
     ['wf-status-unclosed', { ...observedProof, dispatchClosed: false }],
@@ -1560,7 +1593,11 @@ test('plan-exec v2 fails closed for absent, pending, unknown, and malformed work
   }
 });
 
-async function bindV2Run(bus: FakeEventBus, runId: string): Promise<void> {
+async function bindV2Run(
+  bus: FakeEventBus,
+  runId: string,
+  native = false,
+): Promise<void> {
   const ping = once(bus, v2ReplyEvent(`${runId}-ping`));
   bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
     version: 2,
@@ -1569,14 +1606,16 @@ async function bindV2Run(bus: FakeEventBus, runId: string): Promise<void> {
   });
   const pingRequest = bus.last(SUBAGENTS_REQUEST_EVENT);
   assert.ok(isRecord(pingRequest));
-  replyUpstream(bus, pingRequest, 'ping', {
+  const upstreamPing = {
     version: 1,
     capabilities: {
       asyncSpawn: true,
+      stop: true,
       processTerminalProof: { version: 1, lifecycleArtifactVersion: 3 },
     },
     events: { processTerminal: 'subagent:process-terminal' },
-  });
+  };
+  replyUpstream(bus, pingRequest, 'ping', upstreamPing);
   await ping;
 
   const operationId = `${runId}-operation`;
@@ -1584,6 +1623,7 @@ async function bindV2Run(bus: FakeEventBus, runId: string): Promise<void> {
     agent: 'worker',
     task: 'Observe the workflow terminal proof.',
     mission: false,
+    ...(native ? { executionLifetime: { mode: 'unbounded' } } : {}),
   };
   const requestDigest = digest({ params });
   const spawned = once(bus, v2ReplyEvent(`${runId}-spawn`));
@@ -1600,12 +1640,24 @@ async function bindV2Run(bus: FakeEventBus, runId: string): Promise<void> {
     },
     params,
   });
-  const spawnRequest = bus.last(SUBAGENTS_REQUEST_EVENT);
+  let spawnRequest: unknown;
+  if (native) {
+    const nativePingRequest = bus.last(SUBAGENTS_REQUEST_EVENT);
+    assert.ok(isRecord(nativePingRequest));
+    assert.equal(nativePingRequest.method, 'ping');
+    const nextRequest = once(bus, SUBAGENTS_REQUEST_EVENT);
+    replyUpstream(bus, nativePingRequest, 'ping', upstreamPing);
+    spawnRequest = await nextRequest;
+  } else {
+    spawnRequest = bus.last(SUBAGENTS_REQUEST_EVENT);
+  }
   assert.ok(isRecord(spawnRequest));
+  assert.equal(spawnRequest.method, 'spawn');
   replyUpstream(bus, spawnRequest, 'spawn', {
     details: { runId, asyncDir: `/tmp/${runId}` },
   });
-  await spawned;
+  const spawnReply = await spawned;
+  assert.ok(isRecord(spawnReply) && spawnReply.success === true);
 }
 
 function replyUpstream(
