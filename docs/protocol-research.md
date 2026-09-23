@@ -5,9 +5,9 @@ Update it incrementally when either upstream package changes.
 
 ## Scope and versions checked
 
-- Pi extension API contract tested with `@earendil-works/pi-coding-agent 0.84.4`.
+- Pi extension API contract tested with `@earendil-works/pi-coding-agent 0.87.0`; minimum supported Pi version is `0.86.1`.
 - `pi-subagents` supported runtime contract: `0.71.0`.
-- The bridge v2 capability probe is required because package versions alone do not prove the loaded extension contract.
+- The bridge v2 capability probe checks async spawn and process-terminal support; upstream ping does not attest workflow-proof availability or the version of the active Pi extension.
 - Packed files matched installed files for:
   - `src/extension/rpc.ts`
   - `src/runs/background/result-watcher.ts`
@@ -51,7 +51,7 @@ Bridge decisions:
 - A journal record is persisted before native dispatch. `dispatching` records that cannot be proven bound are `unknown` and never retried automatically.
 - Version 2 ping negotiates native `pi-subagents` capabilities. `processTerminalProof: { version: 1 }` is advertised only when upstream advertises version 1.
 - Targeted status and adopt validate native `details.lifecycleStatus.processTerminal` proofs. `observed` proofs require a finite `observedAt` and an `instances` runner record whose `processInstanceId` matches `runnerProcessInstanceId`; pending, unknown, and not-started states may be forwarded diagnostically but are not observed writer-exit evidence. Only validated observed `subagent:process-terminal` events enter the cache, and a valid native status proof takes precedence over that cache.
-- In `0.71.0`, targeted status returns native `details.workflowTerminalProof` for workflows (`runs/background/run-status.js` calls `readWorkflowTerminalProof` from `runs/background/workflow-terminal-proof.js`). The native ping advertises `processTerminalProof` but no separate workflow-proof capability; workflow proof is an optional targeted-status detail. The bridge forwards only a version 1 proof matching the requested run, with `state: "observed"`, `dispatchClosed: true`, a finite `observedAt`, and children whose native process-terminal states are `observed` or `not-started`. Pending, unknown, malformed, or missing workflow proofs are omitted. `workflowChildren` summaries and child `process-terminal.json` files are not completion evidence and are never used to synthesize a workflow proof.
+- In `0.71.0`, targeted status returns native `details.workflowTerminalProof` for workflows (`runs/background/run-status.js` calls `readWorkflowTerminalProof` from `runs/background/workflow-terminal-proof.js`). The native ping advertises `processTerminalProof` but no separate workflow-proof capability; workflow proof is an optional targeted-status detail. The bridge forwards only a version 1 proof matching the requested run, with `state: "observed"`, `dispatchClosed: true`, a finite `observedAt`, and children whose native process-terminal states are `observed` or `not-started`. Pending, unknown, or malformed proofs are not completion evidence. If a closed terminal `workflowChildren` inventory has no proof field at all, targeted v2 status returns an upgrade/reload diagnostic instead of assuming exit. `workflowChildren` summaries and child `process-terminal.json` files are never used to synthesize a workflow proof.
 - Owner and digest mismatches fail before native dispatch. Operation lookup is durable and never starts a child.
 
 ## pi-subagents v1 RPC contract
