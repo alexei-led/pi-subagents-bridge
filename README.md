@@ -66,7 +66,8 @@ pi install npm:@alexeiled/pi-subagents-bridge
 Requirements:
 
 - Node `>= 22.19.0`
-- Pi `>= 0.84.4` with extension loading enabled; tested with Pi `0.87.0`
+- Pi `>= 0.86.1` with extension loading enabled; tested with Pi `0.87.0`
+- `pi-subagents >= 0.71.0` for native workflow and process-terminal proofs
 
 The bridge uses Pi's public extension event API. Future Pi releases still need
 validation if that API or the upstream subagent protocol changes.
@@ -162,9 +163,11 @@ takes the same `operationId` and owner, installs a native cancellation fence, an
 can return `cancelled` without a run ID when dispatch was prevented. A cancellation
 request or RPC timeout does not prove that a running child exited. Reconcile the
 native `processTerminalProof` (also exposed as `processTerminal`) and lifecycle
-observations before starting replacement work. A workflow uses the separate
-`workflowTerminalProof`: dispatch must be closed and every child must have its
-own observed process-terminal proof. The workflow's hosting Pi process can remain
+observations before starting replacement work. Pending or unknown process-terminal
+states are diagnostic only and do not confirm exit. A workflow uses the native
+`workflowTerminalProof`: dispatch must be closed, and each child must be observed
+or explicitly marked not-started. Pending, unknown, malformed, or absent workflow
+proofs do not establish completion. The workflow's hosting Pi process can remain
 alive.
 
 Explicit launches also require `processTreeOwnership` to advertise

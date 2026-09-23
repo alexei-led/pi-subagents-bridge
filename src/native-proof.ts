@@ -29,8 +29,9 @@ export function nativeOperationIdentity(operation: OperationJournalRecord): {
 
 /**
  * The released pi-subagents runtime publishes a writer-exit terminal proof for
- * a run. Accept it when it is a versioned observation of that run; the bridge
- * owns the caller identity, and the provider owns the process evidence.
+ * a run. Accept it only when the observation includes its matching runner
+ * instance; the bridge owns the caller identity, and the provider owns the rest
+ * of the process evidence.
  */
 export function attestUpstreamTerminalProof(
   proof: unknown,
@@ -48,8 +49,13 @@ export function attestUpstreamTerminalProof(
     !Number.isFinite(proof.observedAt)
   )
     return undefined;
-  if (!text(proof.runnerProcessInstanceId)) return undefined;
-  if (!Array.isArray(proof.instances) && !record(proof.writers))
+  if (!text(proof.runnerProcessInstanceId) || !Array.isArray(proof.instances))
     return undefined;
-  return proof;
+  const runner = proof.instances.find(
+    (instance) =>
+      record(instance) &&
+      instance.kind === 'runner' &&
+      instance.processInstanceId === proof.runnerProcessInstanceId,
+  );
+  return runner ? proof : undefined;
 }

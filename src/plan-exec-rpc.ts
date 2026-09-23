@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   type ExecutionLifetime,
@@ -211,7 +210,6 @@ function supportsDiagnosticGuidance(
 function normalizeNativeOperation(
   operation: OperationJournalRecord,
   upstream: unknown,
-  terminalProofs?: Map<string, Record<string, unknown>>,
 ): Record<string, unknown> {
   if (!isRecord(upstream))
     throw new Error('pi-subagents operation reply is not an object');
@@ -234,14 +232,7 @@ function normalizeNativeOperation(
     else delete data.processTerminalProof;
   }
   if ('workflowTerminalProof' in data) {
-    const proof = runId
-      ? extractWorkflowTerminal(
-          upstream,
-          runId,
-          terminalProofs,
-          nonEmptyString(upstream.asyncDir),
-        )
-      : undefined;
+    const proof = runId ? extractWorkflowTerminal(upstream, runId) : undefined;
     if (proof) data.workflowTerminalProof = proof;
     else delete data.workflowTerminalProof;
   }
@@ -555,9 +546,7 @@ function extractProcessTerminal(
   }
   if (
     state === 'observed' &&
-    (typeof proof.observedAt !== 'number' ||
-      !Number.isFinite(proof.observedAt) ||
-      !Array.isArray(proof.instances))
+    !attestUpstreamTerminalProof(proof, expectedRunId)
   ) {
     return undefined;
   }
@@ -570,7 +559,6 @@ function normalizeObservation(
   upstream: unknown,
   observed = false,
   includeProcessTerminal = false,
-  terminalProofs?: Map<string, Record<string, unknown>>,
 ): Observation {
   const text = isRecord(upstream) ? nonEmptyString(upstream.text) : undefined;
   const state = text
@@ -583,8 +571,25 @@ function normalizeObservation(
     ? extractProcessTerminal(upstream, request.runId)
     : undefined;
   const workflowTerminalProof = includeProcessTerminal
-    ? extractWorkflowTerminal(upstream, request.runId, terminalProofs, asyncDir)
+    ? extractWorkflowTerminal(upstream, request.runId)
     : undefined;
+  const upstreamLifecycleStatus =
+    isRecord(upstream) &&
+    isRecord(upstream.details) &&
+    isRecord(upstream.details.lifecycleStatus)
+      ? upstream.details.lifecycleStatus
+      : undefined;
+  const lifecycleStatus = upstreamLifecycleStatus
+    ? { ...upstreamLifecycleStatus }
+    : undefined;
+  if (
+    includeProcessTerminal &&
+    lifecycleStatus &&
+    'processTerminal' in lifecycleStatus
+  ) {
+    if (processTerminal) lifecycleStatus.processTerminal = processTerminal;
+    else delete lifecycleStatus.processTerminal;
+  }
   return {
     runId: request.runId,
     ...(observed ? { observed: true } : {}),
@@ -596,134 +601,42 @@ function normalizeObservation(
       ? { processTerminal, processTerminalProof: processTerminal }
       : {}),
     ...(workflowTerminalProof ? { workflowTerminalProof } : {}),
-    ...(isRecord(upstream) &&
-    isRecord(upstream.details) &&
-    isRecord(upstream.details.lifecycleStatus)
-      ? { lifecycleStatus: upstream.details.lifecycleStatus }
-      : {}),
+    ...(lifecycleStatus ? { lifecycleStatus } : {}),
   };
 }
 
 function extractWorkflowTerminal(
   upstream: unknown,
   runId: string,
-  terminalProofs?: Map<string, Record<string, unknown>>,
-  asyncDir?: string,
 ): Record<string, unknown> | undefined {
-  if (!isRecord(upstream)) return undefined;
-  const details = isRecord(upstream.details) ? upstream.details : undefined;
-  const lifecycle = isRecord(details?.lifecycleStatus)
-    ? details.lifecycleStatus
-    : undefined;
-  const proof =
-    upstream.workflowTerminalProof ??
-    details?.workflowTerminalProof ??
-    lifecycle?.workflowTerminalProof;
+  if (!isRecord(upstream) || !isRecord(upstream.details)) return undefined;
+  const proof = upstream.details.workflowTerminalProof;
   if (
-    isRecord(proof) &&
-    proof.version === 1 &&
-    proof.kind === 'workflow' &&
-    proof.runId === runId
+    !isRecord(proof) ||
+    proof.version !== 1 ||
+    proof.kind !== 'workflow' ||
+    proof.state !== 'observed' ||
+    proof.runId !== runId ||
+    proof.dispatchClosed !== true ||
+    typeof proof.observedAt !== 'number' ||
+    !Number.isFinite(proof.observedAt) ||
+    !Array.isArray(proof.children)
   ) {
-    if (
-      proof.state === 'observed' &&
-      proof.dispatchClosed === true &&
-      typeof proof.observedAt === 'number' &&
-      Number.isFinite(proof.observedAt) &&
-      Array.isArray(proof.children) &&
-      proof.children.every(
-        (child: unknown) =>
-          isRecord(child) &&
-          typeof child.runId === 'string' &&
-          extractProcessTerminal({ processTerminalProof: child }, child.runId)
-            ?.state === 'observed',
-      )
-    )
-      return proof;
-    if (proof.state === 'pending' || proof.state === 'unknown') return proof;
     return undefined;
   }
-  // A persistent workflow host publishes no exit of its own; a closed child
-  // inventory plus every child's writer-exit proof is the terminal evidence.
-  const childrenSummary =
-    upstream.workflowChildren ??
-    details?.workflowChildren ??
-    lifecycle?.workflowChildren;
-  return workflowProofFromChildren(
-    childrenSummary,
-    runId,
-    terminalProofs,
-    asyncDir,
-  );
-}
-
-/** Cached writer-exit proof first, then the child's own terminal record. */
-function childTerminalProof(
-  terminalProofs: Map<string, Record<string, unknown>> | undefined,
-  asyncDir: string | undefined,
-  childRunId: string,
-): Record<string, unknown> | undefined {
-  const cached = terminalProofs?.get(childRunId);
-  if (cached) return attestUpstreamTerminalProof(cached, childRunId);
-  if (!asyncDir) return undefined;
-  try {
-    const raw: unknown = JSON.parse(
-      readFileSync(
-        path.join(path.dirname(asyncDir), childRunId, 'process-terminal.json'),
-        'utf8',
-      ),
+  const validChildren = proof.children.every((child: unknown) => {
+    if (!isRecord(child)) return false;
+    const childRunId = nonEmptyString(child.runId);
+    if (!childRunId || child.runId !== childRunId) return false;
+    const childProof = extractProcessTerminal(
+      { processTerminalProof: child },
+      childRunId,
     );
-    return attestUpstreamTerminalProof(raw, childRunId);
-  } catch {
-    return undefined;
-  }
-}
-
-function workflowProofFromChildren(
-  value: unknown,
-  runId: string,
-  terminalProofs: Map<string, Record<string, unknown>> | undefined,
-  asyncDir: string | undefined,
-): Record<string, unknown> | undefined {
-  if (
-    !terminalProofs ||
-    !isRecord(value) ||
-    value.version !== 1 ||
-    value.workflowRunId !== runId ||
-    value.inventoryComplete !== true ||
-    !Array.isArray(value.children) ||
-    value.children.length === 0
-  )
-    return undefined;
-  const workflowState = value.workflowState;
-  if (
-    workflowState !== 'completed' &&
-    workflowState !== 'failed' &&
-    workflowState !== 'stopped'
-  )
-    return undefined;
-  const children: Record<string, unknown>[] = [];
-  let observedAt = 0;
-  for (const child of value.children) {
-    if (!isRecord(child)) return undefined;
-    const childRunId = child.runId;
-    if (typeof childRunId !== 'string' || !childRunId.trim()) return undefined;
-    const childProof = childTerminalProof(terminalProofs, asyncDir, childRunId);
-    if (!childProof) return undefined;
-    const childObservedAt = childProof.observedAt;
-    if (typeof childObservedAt !== 'number') return undefined;
-    observedAt = Math.max(observedAt, childObservedAt);
-    children.push(childProof);
-  }
-  return {
-    version: 1,
-    kind: 'workflow',
-    state: 'observed',
-    runId,
-    dispatchClosed: true,
-    observedAt,
-    children,
-  };
+    return (
+      childProof?.state === 'observed' || childProof?.state === 'not-started'
+    );
+  });
+  return validChildren ? proof : undefined;
 }
 
 function normalizeStop(request: RunRequest, upstream: unknown): StopResult {
@@ -967,9 +880,11 @@ export function registerPlanExecRpc(
       if (!isRecord(raw)) return;
       const runId = nonEmptyString(raw.runId);
       if (!runId) return;
+      const proof = attestUpstreamTerminalProof(raw, runId);
+      if (!proof) return;
       if (state.terminalProofs.size >= MAX_COMPLETED_OPERATION_HISTORY)
         state.terminalProofs.clear();
-      state.terminalProofs.set(runId, raw);
+      state.terminalProofs.set(runId, proof);
     });
     if (typeof unsubscribe === 'function') proofUnsubscribe = unsubscribe;
   };
@@ -1034,11 +949,7 @@ export function registerPlanExecRpc(
         );
       }
       const upstream = await nativeRequest('spawn', request.params);
-      const reply = normalizeNativeOperation(
-        claim.record,
-        upstream,
-        state.terminalProofs,
-      );
+      const reply = normalizeNativeOperation(claim.record, upstream);
       const runId = extractSpawnRunId(reply);
       if (!runId)
         throw new Error(
@@ -1469,11 +1380,7 @@ export function registerPlanExecRpc(
         ) {
           throw new Error('Malformed native diagnostic guidance receipt');
         }
-        const data = normalizeNativeOperation(
-          operation,
-          reply,
-          state.terminalProofs,
-        );
+        const data = normalizeNativeOperation(operation, reply);
         return {
           success: true,
           data: {
@@ -1746,9 +1653,10 @@ export function registerPlanExecRpc(
           upstream,
           method === 'adopt',
           protocolVersion === 2,
-          state.terminalProofs,
         );
-        const proof = state.terminalProofs.get(request.runId);
+        const proof =
+          observed.processTerminalProof ??
+          state.terminalProofs.get(request.runId);
         if (proof && observed.state) {
           return {
             success: true,
@@ -1776,9 +1684,10 @@ export function registerPlanExecRpc(
         upstream,
         method === 'adopt',
         protocolVersion === 2,
-        state.terminalProofs,
       );
-      const proof = state.terminalProofs.get(request.runId);
+      const proof =
+        observed.processTerminalProof ??
+        state.terminalProofs.get(request.runId);
       return {
         success: true,
         data:

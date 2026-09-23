@@ -286,7 +286,15 @@ test('a bound operation survives restart and exposes the upstream terminal proof
     runId: 'run-restart',
     runnerProcessInstanceId: 'runner-1',
     observedAt: Date.now(),
-    writers: {},
+    instances: [
+      {
+        processInstanceId: 'runner-1',
+        kind: 'runner',
+        closeObservedAt: Date.now(),
+        exitCode: 0,
+        signal: null,
+      },
+    ],
   });
   const withProof = await second.request('operation', lookupBody);
   const proof = (withProof.data as Record<string, unknown>)
