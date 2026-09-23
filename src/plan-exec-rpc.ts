@@ -605,6 +605,9 @@ function normalizeObservation(
   };
 }
 
+const WORKFLOW_PROOF_UNAVAILABLE_MESSAGE =
+  'Closed workflow has no native terminal proof in this status snapshot. Check pi-subagents >=0.71.0 and durable async status/proof artifacts; reload the active extension if needed.';
+
 function closedWorkflowLacksNativeProof(
   upstream: unknown,
   runId: string,
@@ -1669,10 +1672,7 @@ export function registerPlanExecRpc(
           protocolVersion === 2 &&
           closedWorkflowLacksNativeProof(upstream, request.runId)
         ) {
-          return failure(
-            'upstream_error',
-            'Closed workflow has no native terminal proof. Install or reload pi-subagents >=0.71.0, then check its targeted status.',
-          );
+          return failure('upstream_error', WORKFLOW_PROOF_UNAVAILABLE_MESSAGE);
         }
         const observed = normalizeObservation(
           request,
@@ -1705,6 +1705,12 @@ export function registerPlanExecRpc(
         options.timeoutMs,
         controller.signal,
       );
+      if (
+        protocolVersion === 2 &&
+        closedWorkflowLacksNativeProof(upstream, request.runId)
+      ) {
+        return failure('upstream_error', WORKFLOW_PROOF_UNAVAILABLE_MESSAGE);
+      }
       const observed = normalizeObservation(
         request,
         upstream,
