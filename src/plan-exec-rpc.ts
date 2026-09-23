@@ -1651,50 +1651,12 @@ export function registerPlanExecRpc(
       }
 
       // pi-subagents exposes terminal result metadata through its status RPC.
-      if (operation?.nativeCorrelated) {
-        if (operation.cancelRequested)
-          state.journal?.requestNativeCancel(
-            operation.operationId,
-            operation.requestDigest,
-            operation.ownerRunId,
-          );
-        const upstream = await requestSubagents(
-          events,
-          'status',
-          {
-            id: request.runId,
-            ...(request.asyncDir ? { dir: request.asyncDir } : {}),
-          },
-          options.timeoutMs,
-          controller.signal,
+      if (operation?.nativeCorrelated && operation.cancelRequested)
+        state.journal?.requestNativeCancel(
+          operation.operationId,
+          operation.requestDigest,
+          operation.ownerRunId,
         );
-        if (
-          protocolVersion === 2 &&
-          closedWorkflowLacksNativeProof(upstream, request.runId)
-        ) {
-          return failure('upstream_error', WORKFLOW_PROOF_UNAVAILABLE_MESSAGE);
-        }
-        const observed = normalizeObservation(
-          request,
-          upstream,
-          method === 'adopt',
-          protocolVersion === 2,
-        );
-        const proof =
-          observed.processTerminalProof ??
-          state.terminalProofs.get(request.runId);
-        if (proof && observed.state) {
-          return {
-            success: true,
-            data: {
-              ...observed,
-              processTerminal: proof,
-              processTerminalProof: proof,
-            },
-          };
-        }
-        return { success: true, data: observed };
-      }
       const upstream = await requestSubagents(
         events,
         'status',
