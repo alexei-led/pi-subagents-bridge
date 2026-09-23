@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 - 2026-09-23
 
 - Forward validated native workflow terminal proofs from pi-subagents 0.71.0 instead of synthesizing proofs from child inventories or disk records; accept observed and not-started workflow children.
 - Validate observed process-terminal proofs against a matching runner instance, reject invalid event-cache entries, and prefer native status proofs over cached events.
