@@ -70,8 +70,9 @@ Requirements:
 - `pi-subagents >= 0.71.0` for native workflow and process-terminal proofs
 
 The npm peer requirement does not verify which Pi extension is active. If a
-closed workflow status has no native proof field, the bridge reports an
-upgrade/reload error instead of claiming that the worker exited.
+closed workflow status has no native proof field, the bridge reports an error
+to check the active runtime and durable async status/proof artifacts instead of
+claiming that the worker exited.
 
 The bridge uses Pi's public extension event API. Future Pi releases still need
 validation if that API or the upstream subagent protocol changes.

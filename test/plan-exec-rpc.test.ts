@@ -1504,6 +1504,33 @@ test('plan-exec v2 fails closed for absent, pending, unknown, and malformed work
   assert.ok(isRecord(missingReply.error));
   assert.match(String(missingReply.error.message), /pi-subagents.*0\.71\.0/);
 
+  await bindV2Run(bus, 'default-workflow');
+  const defaultStatus = once(bus, v2ReplyEvent('wf-status-default-missing'));
+  bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
+    version: 2,
+    requestId: 'wf-status-default-missing',
+    method: 'status',
+    params: { runId: 'default-workflow', asyncDir: '/tmp/default-workflow' },
+  });
+  const defaultRequest = bus.last(SUBAGENTS_REQUEST_EVENT);
+  assert.ok(isRecord(defaultRequest));
+  replyUpstream(bus, defaultRequest, 'status', {
+    details: {
+      workflowChildren: {
+        version: 1,
+        workflowRunId: 'default-workflow',
+        inventoryComplete: true,
+        workflowState: 'completed',
+        children: [{ childId: 'main', state: 'completed', runId: 'child-run' }],
+      },
+    },
+  });
+  const defaultReply = await defaultStatus;
+  assert.ok(isRecord(defaultReply));
+  assert.equal(defaultReply.success, false);
+  assert.ok(isRecord(defaultReply.error));
+  assert.match(String(defaultReply.error.message), /workflow.*proof/i);
+
   const pendingStatus = once(bus, v2ReplyEvent('wf-status-pending-child'));
   bus.emit(PLAN_EXEC_V2_REQUEST_EVENT, {
     version: 2,
