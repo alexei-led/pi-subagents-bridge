@@ -66,7 +66,7 @@ pi install npm:@alexeiled/pi-subagents-bridge
 Requirements:
 
 - Node `>= 22.19.0`
-- Pi `>= 0.86.1` with extension loading enabled; tested with Pi `0.87.0`
+- Pi `^1.0.2` with extension loading enabled; tested with Pi `1.0.2`
 - `pi-subagents >= 0.71.0` for native workflow and process-terminal proofs
 
 The npm peer requirement does not verify which Pi extension is active. If a

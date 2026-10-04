@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1 - 2026-10-04
+
+- Validate against Pi 1.0.2, including isolated RPC startup with a version-5 operation journal. Bound the host peer contract and development dependency to `^1.0.2`; RPC, cancellation, and durable journal behavior are unchanged.
+- Upgrade Pi to 1.0.2 or later in the 1.x series before installing this release, then reload Pi. Older hosts are no longer supported.
+
 ## 0.5.0 - 2026-09-23
 
 - Forward validated native workflow terminal proofs from pi-subagents 0.71.0 instead of synthesizing proofs from child inventories or disk records; accept observed and not-started workflow children.
