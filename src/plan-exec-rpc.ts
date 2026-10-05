@@ -60,6 +60,7 @@ type Failure = {
   error: {
     code: 'invalid_request' | 'upstream_error' | 'operation_capacity';
     message: string;
+    upstreamCode?: string;
   };
 };
 type Reply<T> = { success: true; data: T } | Failure;
@@ -159,8 +160,24 @@ function upstreamReplyEvent(requestId: string): string {
 function failure(
   code: 'invalid_request' | 'upstream_error' | 'operation_capacity',
   message: string,
+  upstreamCode?: string,
 ): Failure {
-  return { success: false, error: { code, message } };
+  return {
+    success: false,
+    error: { code, message, ...(upstreamCode ? { upstreamCode } : {}) },
+  };
+}
+
+class UpstreamRpcError extends Error {
+  constructor(
+    message: string,
+    readonly code: string | undefined,
+    readonly requestId: string,
+    readonly method: UpstreamMethod,
+    readonly exactMethod: boolean,
+  ) {
+    super(message);
+  }
 }
 
 function isMethod(value: string): value is Method {
@@ -725,7 +742,15 @@ function requestSubagents(
         const message = isRecord(raw.error)
           ? nonEmptyString(raw.error.message)
           : nonEmptyString(raw.error);
-        rejectWith(new Error(message ?? 'pi-subagents RPC error'));
+        rejectWith(
+          new UpstreamRpcError(
+            message ?? 'pi-subagents RPC error',
+            isRecord(raw.error) ? nonEmptyString(raw.error.code) : undefined,
+            requestId,
+            method,
+            raw.method === method && message !== undefined,
+          ),
+        );
       },
     );
 
@@ -805,8 +830,11 @@ function durableSpawnReply(record: OperationJournalRecord): Reply<SpawnResult> {
   }
   return failure(
     'upstream_error',
-    record.error ??
-      'pi-subagents spawn outcome is unknown after bridge restart',
+    record.launchRejection?.message ??
+      (record.error
+        ? `pi-subagents spawn outcome is unknown: ${record.error}`
+        : 'pi-subagents spawn outcome is unknown after bridge restart'),
+    record.launchRejection?.code,
   );
 }
 
@@ -831,6 +859,15 @@ function validateOperationIdentity(
 function durableLookup(
   record: OperationJournalRecord,
 ): Record<string, unknown> {
+  if (record.launchRejection) {
+    return {
+      state: 'not_started',
+      requestDigest: record.requestDigest,
+      neverStarted: true,
+      replaySafe: false,
+      launchRejection: record.launchRejection,
+    };
+  }
   if (record.binding === 'bound' && record.runId) {
     return {
       state: 'found',
@@ -841,6 +878,7 @@ function durableLookup(
   }
   return {
     state: 'unknown',
+    text: 'No correlated prelaunch rejection or bound child is recorded. The launch may have occurred. Preserve this operation; repeated resume cannot establish absence. Recover authoritative launch evidence before retrying; do not reset the journal.',
     requestDigest: record.requestDigest,
     error:
       record.error ??
@@ -922,6 +960,52 @@ export function registerPlanExecRpc(
     subscribeToTerminalProofs(upstream);
   };
 
+  const persistSpawnFailure = (
+    request: SpawnRequest,
+    error: unknown,
+  ): Failure => {
+    const message = error instanceof Error ? error.message : String(error);
+    try {
+      if (
+        state.journal &&
+        request.ownerRunId &&
+        error instanceof UpstreamRpcError &&
+        error.method === 'spawn' &&
+        error.exactMethod &&
+        error.code === 'invalid_params'
+      ) {
+        state.journal.recordLaunchRejection({
+          version: 1,
+          source: 'subagents-rpc',
+          requestId: error.requestId,
+          method: 'spawn',
+          code: 'invalid_params',
+          message,
+          operationId: request.operationId,
+          requestDigest: request.fingerprint,
+          ownerRunId: request.ownerRunId,
+        });
+      } else {
+        state.journal?.markUnknown(
+          request.operationId,
+          request.fingerprint,
+          message,
+        );
+      }
+    } catch (journalError: unknown) {
+      return failure(
+        'upstream_error',
+        `pi-subagents spawn outcome is unknown and the operation journal could not be updated: ${journalError instanceof Error ? journalError.message : String(journalError)}`,
+        error instanceof UpstreamRpcError ? error.code : undefined,
+      );
+    }
+    return failure(
+      'upstream_error',
+      message,
+      error instanceof UpstreamRpcError ? error.code : undefined,
+    );
+  };
+
   const startNativeOperation = async (
     request: SpawnRequest,
   ): Promise<Reply<SpawnResult>> => {
@@ -931,13 +1015,19 @@ export function registerPlanExecRpc(
         'durable native spawn requires bridge v2 and a durable journal',
       );
     }
+    let dispatching = false;
     try {
       const existing = state.journal.get(request.operationId);
-      if (existing?.cancelRequested && !existing.runId) {
-        return failure(
-          'upstream_error',
-          'operation cancellation was requested before dispatch',
-        );
+      if (existing) {
+        if (
+          existing.requestDigest !== request.fingerprint ||
+          existing.ownerRunId !== request.ownerRunId
+        )
+          return failure(
+            'invalid_request',
+            'spawn operationId was already used with different parameters',
+          );
+        return durableSpawnReply(existing);
       }
       await nativeCapabilities();
       const nativeParams = {
@@ -968,6 +1058,7 @@ export function registerPlanExecRpc(
           'operation cancellation was requested before dispatch',
         );
       }
+      dispatching = true;
       const upstream = await nativeRequest('spawn', request.params);
       const reply = normalizeNativeOperation(claim.record, upstream);
       const runId = extractSpawnRunId(reply);
@@ -994,6 +1085,7 @@ export function registerPlanExecRpc(
         },
       };
     } catch (error: unknown) {
+      if (dispatching) return persistSpawnFailure(request, error);
       return failure(
         'upstream_error',
         error instanceof Error ? error.message : String(error),
@@ -1163,23 +1255,10 @@ export function registerPlanExecRpc(
             },
           };
         })
-        .catch((error: unknown): Reply<SpawnResult> => {
-          const message =
-            error instanceof Error ? error.message : String(error);
-          try {
-            state.journal?.markUnknown(
-              request.operationId,
-              request.fingerprint,
-              message,
-            );
-          } catch (journalError: unknown) {
-            return failure(
-              'upstream_error',
-              `pi-subagents spawn outcome is unknown and the operation journal could not be updated: ${journalError instanceof Error ? journalError.message : String(journalError)}`,
-            );
-          }
-          return failure('upstream_error', message);
-        })
+        .catch(
+          (error: unknown): Reply<SpawnResult> =>
+            persistSpawnFailure(request, error),
+        )
         .then((outcome) => {
           operation.outcome = outcome;
           pruneCompletedOperations(state);
@@ -1247,6 +1326,7 @@ export function registerPlanExecRpc(
                   }
                 : {}),
               durableOperationLookup: state.journal ? { version: 1 } : false,
+              ...(state.journal ? { prelaunchRejection: { version: 1 } } : {}),
               processTerminalProof:
                 isRecord(terminalCapability) && terminalCapability.version === 1
                   ? { version: 1 }
@@ -1444,6 +1524,25 @@ export function registerPlanExecRpc(
         if (invalid) return invalid;
       }
       try {
+        if (durable?.launchRejection && state.journal) {
+          const { record: cancelled } = state.journal.requestNativeCancel(
+            request.operationId,
+            request.requestDigest,
+            request.ownerRunId,
+          );
+          return {
+            success: true,
+            data: {
+              operationId: cancelled.operationId,
+              requestDigest: cancelled.requestDigest,
+              state: 'cancelled',
+              cancellationRequested: true,
+              neverStarted: true,
+              replaySafe: false,
+              launchRejection: cancelled.launchRejection,
+            },
+          };
+        }
         await nativeCapabilities();
         if (!state.journal)
           throw new Error('cancelOperation requires a durable journal');
@@ -1459,10 +1558,14 @@ export function registerPlanExecRpc(
             data: {
               operationId: cancelled.operationId,
               requestDigest: cancelled.requestDigest,
-              // Only a fence inserted before any dispatch record proves no launch.
-              state: created ? 'cancelled' : 'unknown',
+              // A rejection may have been persisted during the capability await.
+              state:
+                created || cancelled.launchRejection ? 'cancelled' : 'unknown',
               cancellationRequested: true,
-              neverStarted: created,
+              neverStarted: created || Boolean(cancelled.launchRejection),
+              ...(cancelled.launchRejection
+                ? { launchRejection: cancelled.launchRejection }
+                : {}),
               replaySafe: false,
             },
           };
@@ -1523,7 +1626,7 @@ export function registerPlanExecRpc(
       const request = validateOperationRequest(raw, protocolVersion);
       if (isFailure(request)) return request;
       const nativeRecord = state.journal?.get(request.operationId);
-      if (nativeRecord?.nativeCorrelated) {
+      if (nativeRecord?.nativeCorrelated || nativeRecord?.launchRejection) {
         const invalid = validateOperationIdentity(
           request,
           nativeRecord.requestDigest,

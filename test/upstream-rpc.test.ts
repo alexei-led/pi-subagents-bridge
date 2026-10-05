@@ -11,6 +11,7 @@ import {
 import { onTestFinished, test } from 'vitest';
 import { registerSubagentRpcBridge } from '../node_modules/pi-subagents/src/extension/rpc.js';
 import { registerBridge } from '../src/index.js';
+import { OperationJournal } from '../src/operation-journal.js';
 import { registerPlanExecRpc } from '../src/plan-exec-rpc.js';
 
 class Bus {
@@ -48,7 +49,7 @@ function upstream(bus: Bus, params: object): Promise<unknown> {
   });
 }
 
-function fixture() {
+function fixture(executionFailure?: 'throw' | 'tool-error') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-rpc-contract-'));
   onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
   const bus = new Bus();
@@ -63,6 +64,16 @@ function fixture() {
     getContext: () => ctx,
     execute: async (_id, params) => {
       executed.push({ ...params });
+      if (executionFailure === 'throw')
+        throw Object.assign(new Error('post-dispatch invalid_params'), {
+          code: 'invalid_params',
+        });
+      if (executionFailure === 'tool-error')
+        return {
+          isError: true,
+          content: [{ type: 'text', text: 'invalid_params' }],
+          details: { mode: 'workflow', results: [] },
+        };
       return {
         content: [{ type: 'text', text: 'started' }],
         details: {
@@ -88,6 +99,28 @@ test('released RPC rejects the removed public field before the executor runs', a
   assert.equal(reply.success, false);
   assert.equal(reply.error.code, 'invalid_params');
   assert.match(String(reply.error.message), /workflowScript was removed/);
+  assert.equal(executed.length, 0);
+});
+
+for (const failure of ['throw', 'tool-error'] as const) {
+  test(`released RPC classifies post-executor ${failure} as execution_failed, not invalid_params`, async () => {
+    const { bus, executed } = fixture(failure);
+    const reply = await upstream(bus, { script: 'return 1', async: true });
+    assert.ok(isRecord(reply) && isRecord(reply.error));
+    assert.equal(reply.error.code, 'execution_failed');
+    assert.equal(executed.length, 1);
+  });
+}
+
+test('released RPC schema validation rejects before executor invocation', async () => {
+  const { bus, executed } = fixture();
+  const reply = await upstream(bus, {
+    script: 'return 1',
+    async: true,
+    timeoutMs: 'invalid',
+  });
+  assert.ok(isRecord(reply) && isRecord(reply.error));
+  assert.equal(reply.error.code, 'invalid_params');
   assert.equal(executed.length, 0);
 });
 
@@ -162,7 +195,7 @@ for (const lifetime of [
     );
   });
 
-  test(`invalid_params remains unknown without unsafe replay after restart (${lifetime?.mode ?? 'legacy'})`, async () => {
+  test(`legacy invalid_params remains unknown without unsafe replay after restart (${lifetime?.mode ?? 'legacy'})`, async () => {
     const { bus, root, executed } = fixture();
     const journalPath = path.join(root, 'operations.sqlite');
     const bridge = registerPlanExecRpc(bus, { timeoutMs: 1000, journalPath });
@@ -192,6 +225,14 @@ for (const lifetime of [
         'plan-exec:bridge:v2:reply:',
         { version: 2, method, operationId, owner, params },
       );
+    // Historical journals kept only an error string, not a correlated rejection.
+    const journal = new OperationJournal(journalPath);
+    journal.begin(operationId, owner.requestDigest, owner.runId, lifetime);
+    journal.markUnknown(
+      operationId,
+      owner.requestDigest,
+      'RPC spawn workflowScriptPath was removed',
+    );
     const reply = await call(bus, 'spawn');
     assert.ok(isRecord(reply) && isRecord(reply.error));
     assert.equal(reply.success, false);
@@ -226,7 +267,7 @@ for (const lifetime of [
       assert.ok(isRecord(replay));
       assert.equal(replay.success, false);
     }
-    assert.equal(spawnRequests, 1);
+    assert.equal(spawnRequests, 0);
     assert.equal(executed.length, 0);
   });
 }

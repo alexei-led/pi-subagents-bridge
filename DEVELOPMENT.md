@@ -33,6 +33,23 @@ isolated HOME, agent, workspace, and temporary directories. It uses a local HTTP
 model fixture, not credentials or globally installed extensions, and completes
 both launch paths with native proof and replay checks.
 
+For a visible, isolated restart/recovery check in agterm, launch:
+
+```bash
+agtermctl session new --cwd "$PWD" --name "Bridge recovery test" \
+  --command "$(command -v node) $PWD/test/fixtures/agterm-smoke.mjs" --wait
+```
+
+Use the returned session ID for every terminal operation. The fixture prints its
+temporary evidence directory and opens real Pi with only local Bridge,
+pi-subagents, and two fixture command extensions. Run
+`/bridge-rejection-seed`. After the host restarts, run
+`/bridge-rejection-verify`, then `/bridge-smoke`. The final `PASS.json`
+asserts no rejection/legacy replays and exactly two fresh child model requests.
+The node driver hosts the deterministic HTTP model; its Pi child owns the TUI.
+No global package, journal, credential, or live plan is changed. Evidence stays
+in the printed temporary directory for inspection.
+
 ## Release
 
 Target package:

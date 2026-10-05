@@ -6,9 +6,9 @@ import {
   parseExecutionLifetime,
 } from './execution-lifetime.js';
 
-const JOURNAL_VERSION = 5;
-// Schemas 0-5 are known; legacy versions migrate below to the current schema.
-const COMPATIBLE_JOURNAL_VERSIONS = [0, 1, 2, 3, 4, JOURNAL_VERSION];
+const JOURNAL_VERSION = 6;
+// Legacy versions migrate without manufacturing launch evidence.
+const COMPATIBLE_JOURNAL_VERSIONS = [0, 1, 2, 3, 4, 5, JOURNAL_VERSION];
 const BUSY_TIMEOUT_MS = 2_000;
 
 export type OperationBinding = 'dispatching' | 'bound' | 'unknown';
@@ -39,7 +39,20 @@ export interface LegacySpawnJournalRecord {
   updatedAt: number;
 }
 
+export interface LaunchRejection {
+  version: 1;
+  source: 'subagents-rpc';
+  requestId: string;
+  method: 'spawn';
+  code: 'invalid_params';
+  message: string;
+  operationId: string;
+  requestDigest: string;
+  ownerRunId: string;
+}
+
 export interface OperationJournalRecord {
+  launchRejection?: LaunchRejection;
   executionLifetime?: ExecutionLifetime;
   nativeCorrelated?: boolean;
   cancelRequested?: boolean;
@@ -56,6 +69,7 @@ export interface OperationJournalRecord {
 }
 
 interface OperationRow {
+  launch_rejection: string | null;
   execution_lifetime: string | null;
   native_correlated: number;
   cancel_requested: number;
@@ -109,7 +123,13 @@ function operationRecord(row: OperationRow): OperationJournalRecord {
   ) {
     throw new Error('Invalid persisted native launch parameters');
   }
+  const rejection: unknown = row.launch_rejection
+    ? JSON.parse(row.launch_rejection)
+    : undefined;
+  if (rejection !== undefined && !validLaunchRejection(rejection, row))
+    throw new Error('Invalid persisted launch rejection evidence');
   return {
+    ...(rejection ? { launchRejection: rejection as LaunchRejection } : {}),
     ...(row.native_correlated ? { nativeCorrelated: true } : {}),
     ...(row.cancel_requested ? { cancelRequested: true } : {}),
     ...(nativeParams
@@ -126,6 +146,31 @@ function operationRecord(row: OperationRow): OperationJournalRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function validLaunchRejection(
+  value: unknown,
+  row: OperationRow,
+): value is LaunchRejection {
+  if (typeof value !== 'object' || value === null) return false;
+  const proof = value as Record<string, unknown>;
+  return (
+    proof.version === 1 &&
+    proof.source === 'subagents-rpc' &&
+    proof.method === 'spawn' &&
+    proof.code === 'invalid_params' &&
+    typeof proof.requestId === 'string' &&
+    proof.requestId.trim().length > 0 &&
+    typeof proof.message === 'string' &&
+    proof.message.trim().length > 0 &&
+    proof.operationId === row.operation_id &&
+    proof.requestDigest === row.request_digest &&
+    typeof proof.ownerRunId === 'string' &&
+    proof.ownerRunId.length > 0 &&
+    proof.ownerRunId === row.owner_run_id &&
+    row.binding === 'unknown' &&
+    row.run_id === null
+  );
 }
 
 function legacySpawnRecord(row: LegacySpawnRow): LegacySpawnJournalRecord {
@@ -203,6 +248,7 @@ export class OperationJournal {
         native_correlated INTEGER NOT NULL DEFAULT 0,
         cancel_requested INTEGER NOT NULL DEFAULT 0,
         native_params TEXT,
+        launch_rejection TEXT,
         binding TEXT NOT NULL CHECK (binding IN ('dispatching', 'bound', 'unknown')),
         run_id TEXT,
         async_dir TEXT,
@@ -257,6 +303,16 @@ export class OperationJournal {
           );
         }
         this.#db.exec('ALTER TABLE operations ADD COLUMN native_params TEXT');
+        this.#db.exec(
+          'ALTER TABLE operations ADD COLUMN launch_rejection TEXT',
+        );
+        this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
+      });
+    } else if (version === 5) {
+      this.#transaction(() => {
+        this.#db.exec(
+          'ALTER TABLE operations ADD COLUMN launch_rejection TEXT',
+        );
         this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
       });
     }
@@ -469,7 +525,7 @@ export class OperationJournal {
   get(operationId: string): OperationJournalRecord | undefined {
     const row = this.#db
       .prepare(
-        `SELECT operation_id, request_digest, owner_run_id, execution_lifetime, native_correlated, cancel_requested, native_params, binding, run_id,
+        `SELECT operation_id, request_digest, owner_run_id, execution_lifetime, native_correlated, cancel_requested, native_params, launch_rejection, binding, run_id,
                 async_dir, error, created_at, updated_at
            FROM operations
           WHERE operation_id = ?`,
@@ -528,7 +584,7 @@ export class OperationJournal {
       ) {
         throw new Error('operation owner does not match the durable operation');
       }
-      if (existing && !existing.nativeCorrelated) {
+      if (existing && !existing.nativeCorrelated && !existing.launchRejection) {
         throw new Error(
           'legacy launch cannot be fenced by operation identity; reconcile and stop its existing child',
         );
@@ -572,6 +628,35 @@ export class OperationJournal {
       binding: 'bound',
       runId,
       ...(asyncDir ? { asyncDir } : {}),
+    });
+  }
+
+  recordLaunchRejection(proof: LaunchRejection): OperationJournalRecord {
+    return this.#transaction(() => {
+      const current = this.get(proof.operationId);
+      if (
+        !current ||
+        current.requestDigest !== proof.requestDigest ||
+        current.ownerRunId !== proof.ownerRunId ||
+        current.runId ||
+        current.binding !== 'dispatching' ||
+        current.launchRejection
+      ) {
+        throw new Error('Launch rejection does not match an unbound dispatch');
+      }
+      this.#db
+        .prepare(
+          "UPDATE operations SET binding = 'unknown', error = ?, launch_rejection = ?, updated_at = ? WHERE operation_id = ?",
+        )
+        .run(
+          proof.message,
+          JSON.stringify(proof),
+          this.#now(),
+          proof.operationId,
+        );
+      const updated = this.get(proof.operationId);
+      if (!updated) throw new Error('Launch rejection could not be persisted');
+      return updated;
     });
   }
 
@@ -652,6 +737,10 @@ export class OperationJournal {
           `Operation '${operationId}' was already used with a different request digest`,
         );
       }
+      if (current.launchRejection)
+        throw new Error(
+          'A rejected operation cannot be rebound or lose its evidence',
+        );
       const updatedAt = this.#now();
       if (update.binding === 'bound') {
         this.#db

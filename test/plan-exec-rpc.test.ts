@@ -47,6 +47,7 @@ test('plan-exec v2 exposes durable lookup and native terminal proof', async () =
       capabilities: {
         workflowScriptSpawn: true,
         durableOperationLookup: { version: 1 },
+        prelaunchRejection: { version: 1 },
         processTerminalProof: { version: 1 },
       },
       methods: [
@@ -841,6 +842,7 @@ test('plan-exec recovers an unknown launch instead of reporting it absent', asyn
     data: {
       state: 'unknown',
       error: 'pi-subagents spawn RPC timed out after 5ms',
+      text: 'No correlated prelaunch rejection or bound child is recorded. The launch may have occurred. Preserve this operation; repeated resume cannot establish absence. Recover authoritative launch evidence before retrying; do not reset the journal.',
     },
   });
 });

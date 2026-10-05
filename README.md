@@ -77,9 +77,10 @@ claiming that the worker exited.
 The bridge uses Pi's public extension event API. Future Pi releases still need
 validation if that API or the upstream subagent protocol changes.
 
-The operation journal supports schema versions 1–5. Versions 4 and 5 retain their
-version and extra fields when opened by this bridge. Unknown versions are rejected
-before database changes; update the bridge instead of deleting or resetting the journal.
+The operation journal migrates schemas 1–5 to schema 6, preserving identity,
+bindings, cancellation and native fields. Migration never creates rejection
+evidence for old rows. Older Bridge releases cannot reopen schema 6; keep the
+updated Bridge installed. Unknown versions are rejected before database changes.
 
 ## Usage
 
@@ -145,7 +146,7 @@ Version 2 uses `plan-exec:bridge:v2:request` and `plan-exec:bridge:v2:reply:<req
 - `ping` verifies the live `pi-subagents` RPC before advertising `workflowScriptSpawn`, `durableOperationLookup`, and `processTerminalProof` capabilities.
 - `spawn` requires `operationId`, `cwd` when needed, `params.agent`, `params.task`, and an owner `{ kind: "pi-plan-exec", runId, key, requestDigest }`. The digest is SHA-256 over canonical `{ cwd, params }`. The bridge rejects mismatches before dispatch.
 - The durable journal is written before the native spawn is emitted. A bound operation survives a full Pi restart. A legacy dispatch with no durable native reply becomes `unknown`; the bridge never launches it again automatically.
-- `operation` never starts work. Version 2 returns `operationId`, `requestDigest`, and `absent`, `pending`, `found`, `cancelled`, or `unknown` binding state. It redelivers a durable cancellation intent when needed.
+- `operation` never starts work. Version 2 returns `operationId`, `requestDigest`, and `absent`, `pending`, `found`, `not_started`, or `unknown` binding state. Lookup is observational and never retries dispatch.
 - `status` and `adopt` include a validated native `processTerminal` value when `pi-subagents` returns one. Only an `observed` proof with the matching run ID proves process termination.
 - `result` uses the native status RPC because `pi-subagents` has no separate result RPC. `stop` delegates to the native stop RPC.
 - `adopt` is observational. It does not silently transfer session ownership. Status and stop use native run IDs; the native runtime still enforces its session restrictions.
@@ -167,9 +168,12 @@ can be recovered from the journal. A lost spawn reply without a binding remains
 `unknown`, including after restart.
 
 `cancelOperation` records cancellation intent. It reports `neverStarted: true`
-only when its atomic journal transaction creates a new fence before any dispatch
-record exists. An existing unbound operation returns `unknown` and
+when its atomic journal transaction creates a new fence before any dispatch
+record exists, or the existing operation has durable correlated rejection evidence.
+Other native-correlated unbound operations return `unknown` and
 `neverStarted: false`, including repeat cancellation of an old fence.
+Uncorrelated legacy rows without rejection evidence reject cancellation instead.
+Neither response establishes no-start.
 It is not safe to infer non-start from a missing run ID or a timeout.
 A known run is stopped through native RPC; a stop request is not exit proof.
 
@@ -197,13 +201,36 @@ It verifies lookup, replay identity, native workflow proof, and task completion.
 
 ### Upgrade and unresolved launches
 
-Update pi-subagents to the supported range before installing Bridge 0.5.2, then
-reload Pi. The fix applies to new launches; it does not rewrite old journal rows.
-A previous `invalid_params` failure still looks `unknown` if no authoritative
-binding or durable no-start evidence was stored. Do not delete the journal,
-cancel to manufacture no-start proof, or launch a replacement worker.
-Use the owning controller's diagnostic/recovery path; `/exec resume` alone may
-remain blocked until that operation is reconciled.
+Bridge 0.5.3 advertises `prelaunchRejection: { version: 1 }`. A newly observed,
+correlated `spawn` reply with `invalid_params` is persisted before lookup reports
+`state: "not_started"`, `neverStarted: true` and `replaySafe: false`.
+The `launchRejection` object contains `version: 1`, `source: "subagents-rpc"`,
+the native `requestId`, `method: "spawn"`, `code: "invalid_params"`, `message`,
+`operationId`, `requestDigest`, and `ownerRunId`. The released upstream
+validator emits this code before invoking the executor. Post-dispatch failures,
+malformed replies, missing method, and lost replies do not prove no-start.
+
+A compatible controller must verify this evidence, call `cancelOperation`,
+and persist the returned cancellation fence before allocating a new operation.
+Replaying the rejected identity never dispatches, including after restart.
+Spawn failures retain `error.code: "upstream_error"` and add `upstreamCode`
+when a structured upstream code is available.
+
+Install pi-subagents 0.76.x before updating Bridge, then reload Pi.
+Back up the journal while its owners are stopped before the schema upgrade;
+do not downgrade over schema 6. The fix applies to newly captured rejection
+evidence only. **An old unresolved launch is not repaired by this update.**
+An old error string, missing run ID, dead controller PID, clean worktree, or
+elapsed time does not prove that dispatch never happened.
+
+For an old `dispatching`/`unknown` row without proof, preserve the run, worktree,
+and journal and use the owning controller's read-only status. Repeated
+`/exec resume` cannot establish absence. Recovery needs an authoritative
+operation-bound rejection or a verified binding to the original child and its
+terminal proof. The released upstream has no operation-ID lookup, and Bridge
+has no historical evidence importer or force-clear API. If that evidence is
+unavailable, the launch remains unresolved. Do not delete/reset the journal,
+cancel to manufacture proof, recreate the run, or launch a replacement worker.
 
 The journal defaults to `~/.pi/pi-subagents-bridge/plan-exec-operations.sqlite`. SQLite transactions provide crash recovery and cross-process serialization without a stale application lock. Version 1 clients retain their existing response shape and also benefit from durable bound-operation lookup. Operation identity rows are retained as idempotency records; automatic pruning could make an old operation ID dispatch again. Remove the database only after all referenced plan runs are permanently retired and duplicate-launch protection is no longer needed. Existing v1 accepted-run rows migrate fail-closed with no session identity; they require explicit manual recovery rather than unsafe cross-session delivery.
 

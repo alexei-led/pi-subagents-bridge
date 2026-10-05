@@ -32,6 +32,7 @@ for (const version of [4, 5]) {
     db.exec(`
       UPDATE operations SET execution_lifetime = '{"mode":"unbounded"}',
         native_correlated = 1, cancel_requested = 1;
+      ALTER TABLE operations DROP COLUMN launch_rejection;
       PRAGMA user_version = ${version};
     `);
     if (version === 4) {
@@ -51,7 +52,7 @@ for (const version of [4, 5]) {
       journal.ownsAcceptedRun('accepted-run', 'instance-a', 'session-a'),
       true,
     );
-    assert.equal(db.prepare('PRAGMA user_version').get()?.user_version, 5);
+    assert.equal(db.prepare('PRAGMA user_version').get()?.user_version, 6);
     const row = db
       .prepare("SELECT * FROM operations WHERE operation_id = 'existing'")
       .get();
@@ -72,14 +73,14 @@ test('operation journal rejects unknown versions without modifying the database'
   onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
   const db = new DatabaseSync(journalPath);
   db.exec(
-    "CREATE TABLE future_data (value TEXT); INSERT INTO future_data VALUES ('preserved'); PRAGMA user_version = 6;",
+    "CREATE TABLE future_data (value TEXT); INSERT INTO future_data VALUES ('preserved'); PRAGMA user_version = 7;",
   );
   db.close();
   const before = fs.readFileSync(journalPath);
 
   assert.throws(
     () => new OperationJournal(journalPath),
-    /Unsupported operation journal version '6'.*Update.*extension/,
+    /Unsupported operation journal version '7'.*Update.*extension/,
   );
   assert.deepEqual(fs.readFileSync(journalPath), before);
   assert.equal(fs.existsSync(`${journalPath}-wal`), false);

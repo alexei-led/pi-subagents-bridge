@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.3 - 2026-10-05
+
+- Preserve structured upstream errors and durable, request-correlated prelaunch rejection evidence. Controllers can distinguish newly captured validator rejections from lost replies and fence a rejected operation before starting a new attempt.
+- Keep replay, ownership, digest and cancellation guards across restart. Rejected identities never dispatch again. Unknown launches now explain the missing proof instead of implying that repeating resume will resolve them.
+- Migrate operation journals to schema 6 without creating evidence for old rows. Existing unresolved launches remain unresolved; this release does not retroactively prove that a worker never started.
+
+### Upgrade
+
+Install pi-subagents 0.76.x, update Bridge, then reload Pi. Back up the journal while its owners are stopped before upgrading; older Bridge releases cannot reopen schema 6. Use a controller that validates the prelaunch rejection capability and identity-bound evidence. Do not reset journals or launch replacement workers for legacy unknown operations.
+
 ## 0.5.2 - 2026-10-05
 
 - Fix TaskExecute and plan-exec launches rejected with `RPC spawn workflowScript was removed`. Both paths now send inline workflow text through the public RPC `script` field; capability names, task parameters, lifetimes, and operation identity remain unchanged.
