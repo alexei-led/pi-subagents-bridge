@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.4 - 2026-10-05
+
+- Persist native RPC request IDs before dispatch. Recover the same child after reply loss or restart through exact native tool-call lookup, without launching another worker.
+- Capture completion-event bindings before native result delivery removes lookup aliases. Retry transient journal failures; reject ambiguous or contradictory bindings. Recovered bindings retain their original execution lifetime.
+- Persist cancellation fences without requiring a native ping. If native stop fails, report the committed fence and unknown worker state separately. This supports explicitly approved target quarantine, never proof that the old worker exited.
+- Test real Pi restarts with held and completed workers: one dispatch per operation and no extra workers on replay.
+
+### Upgrade and limits
+
+Reload Pi after updating. Pi and pi-subagents requirements and journal schema 6 are unchanged. Old unbound rows without a saved native request ID remain unknown. Reattachment also requires a retained native lookup or captured binding. Bridge does not relocate checkouts or automatically clear legacy uncertainty.
+
 ## 0.5.3 - 2026-10-05
 
 - Preserve structured upstream errors and durable, request-correlated prelaunch rejection evidence. Controllers can distinguish newly captured validator rejections from lost replies and fence a rejected operation before starting a new attempt.

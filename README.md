@@ -79,8 +79,8 @@ validation if that API or the upstream subagent protocol changes.
 
 The operation journal migrates schemas 1–5 to schema 6, preserving identity,
 bindings, cancellation and native fields. Migration never creates rejection
-evidence for old rows. Older Bridge releases cannot reopen schema 6; keep the
-updated Bridge installed. Unknown versions are rejected before database changes.
+evidence for old rows. Bridge 0.5.2 and earlier cannot reopen schema 6; keep a
+compatible Bridge installed. Unknown versions are rejected before database changes.
 
 ## Usage
 
