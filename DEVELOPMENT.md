@@ -50,6 +50,39 @@ The node driver hosts the deterministic HTTP model; its Pi child owns the TUI.
 No global package, journal, credential, or live plan is changed. Evidence stays
 in the printed temporary directory for inspection.
 
+### Lost native reply and full host restart
+
+`test/fixtures/lost-reply-server.mjs <empty-private-directory>` requires a
+current-user-owned, non-symlink root (mode 0700 on POSIX) and refuses non-empty
+roots before writing. Use `mktemp -d` to create it. The server creates an isolated
+HOME/agent/project/native root and starts a deterministic loopback model. Run it
+in its own agterm session. The generated `sources.json` records the exact local
+CLI, upstream extension and Bridge fixture paths.
+
+Start a separate direct Pi CLI session with the generated HOME,
+PI_CODING_AGENT_DIR, PI_SUBAGENTS_TEMP_ROOT and BRIDGE_LOST_REPLY_ROOT. Use
+`--no-extensions` and load only the local pi-subagents entry and
+`test/fixtures/lost-reply-host.ts`. The wrapper loads the actual local Bridge
+once and drops only the matching native spawn reply at the event boundary.
+Workers and native status/proof handling remain real.
+
+1. Run `/lost-seed live`. After READY, terminate only the fixture host PID printed
+   by the command; the deterministic model keeps the real detached child active.
+2. Restart the same isolated CLI and run `/lost-verify live`. It must reattach
+   the same native run and replay twice with only one dispatch, then release the
+   held model request.
+3. Run `/lost-seed complete`. Wait for READY after native completion, terminate
+   only that fixture host, restart again and run `/lost-verify complete`.
+   The durable binding must survive native result delivery, with observed native
+   workflow terminal proof and the fixture output.
+4. Inspect `verified-live.json`, `verified-complete.json`, `dispatches.jsonl`
+   and `model-calls.jsonl`: two native dispatches and two worker model requests
+   total, one per scenario. Preserve terminal/tree evidence before closing the
+   fixture sessions.
+
+Never point these fault-injection fixtures at a real run, journal or agent
+directory. They do not test or authorize termination of an unknown old worker.
+
 ## Release
 
 Target package:

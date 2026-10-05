@@ -9,6 +9,7 @@ import {
   nativeOperationIdentity,
 } from './native-proof.js';
 import {
+  AmbiguousRpcRequestError,
   OperationJournal,
   type OperationJournalRecord,
 } from './operation-journal.js';
@@ -21,6 +22,7 @@ export const PLAN_EXEC_V2_REPLY_PREFIX = 'plan-exec:bridge:v2:reply:';
 
 const SUBAGENTS_REQUEST_EVENT = 'subagents:rpc:v1:request';
 const SUBAGENTS_REPLY_PREFIX = 'subagents:rpc:v1:reply:';
+const SUBAGENTS_COMPLETE_EVENT = 'subagent:async-complete';
 const PROTOCOL_VERSION = 1;
 const MAX_COMPLETED_OPERATION_HISTORY = 128;
 const METHODS = [
@@ -128,6 +130,7 @@ interface Operation {
 }
 
 interface PlanExecState {
+  pendingCompletionBindings: Map<string, { runId: string; asyncDir?: string }>;
   operations: Map<string, Operation>;
   spawnControllers: Set<AbortController>;
   terminalProofs: Map<string, Record<string, unknown>>;
@@ -694,9 +697,8 @@ function requestSubagents(
   params: Record<string, unknown>,
   timeoutMs: number,
   signal: AbortSignal,
+  requestId: string = randomUUID(),
 ): Promise<unknown> {
-  const requestId = randomUUID();
-
   return new Promise((resolve, reject) => {
     let settled = false;
     const cleanup = (): void => {
@@ -782,6 +784,10 @@ function getPlanExecState(
 ): PlanExecState {
   const existing = planExecStates.get(events);
   if (existing) {
+    if (existing.registration && !existing.journal && (journal || journalPath))
+      throw new Error(
+        'Dispose the active bridge registration before attaching a durable journal',
+      );
     if (journal && existing.journal && existing.journal !== journal) {
       throw new Error(
         'plan-exec RPC was already registered with a different operation journal',
@@ -804,6 +810,7 @@ function getPlanExecState(
   }
 
   const created: PlanExecState = {
+    pendingCompletionBindings: new Map(),
     operations: new Map(),
     spawnControllers: new Set(),
     terminalProofs: new Map(),
@@ -825,6 +832,9 @@ function durableSpawnReply(record: OperationJournalRecord): Reply<SpawnResult> {
         runId: record.runId,
         ...(record.asyncDir ? { asyncDir: record.asyncDir } : {}),
         requestDigest: record.requestDigest,
+        ...(record.executionLifetime
+          ? { effectiveExecutionLifetime: record.executionLifetime }
+          : {}),
       },
     };
   }
@@ -872,6 +882,9 @@ function durableLookup(
     return {
       state: 'found',
       requestDigest: record.requestDigest,
+      ...(record.executionLifetime
+        ? { effectiveExecutionLifetime: record.executionLifetime }
+        : {}),
       runId: record.runId,
       ...(record.asyncDir ? { asyncDir: record.asyncDir } : {}),
     };
@@ -898,11 +911,13 @@ export function registerPlanExecRpc(
   if (state.registration) return state.registration;
 
   const transientControllers = new Set<AbortController>();
+  const nativeLaunches = new Set<string>();
   let disposed = false;
 
   const nativeRequest = async (
     method: UpstreamMethod,
     params: Record<string, unknown>,
+    requestId?: string,
   ): Promise<unknown> => {
     const controller = new AbortController();
     transientControllers.add(controller);
@@ -913,6 +928,7 @@ export function registerPlanExecRpc(
         params,
         options.timeoutMs,
         controller.signal,
+        requestId,
       );
     } finally {
       transientControllers.delete(controller);
@@ -958,6 +974,62 @@ export function registerPlanExecRpc(
       );
     }
     subscribeToTerminalProofs(upstream);
+  };
+
+  const recoverNativeBinding = async (
+    record: OperationJournalRecord,
+  ): Promise<OperationJournalRecord> => {
+    const requestId = nonEmptyString(record.nativeParams?.rpcRequestId);
+    if (
+      !state.journal ||
+      nativeLaunches.has(record.operationId) ||
+      (state.operations.has(record.operationId) &&
+        !state.operations.get(record.operationId)?.outcome) ||
+      record.runId ||
+      record.launchRejection ||
+      !requestId
+    )
+      return record;
+    try {
+      const owned = state.journal.getByRpcRequestId(requestId);
+      if (owned?.operationId !== record.operationId) return record;
+      const toolCallId = `rpc-spawn-${requestId}`;
+      const upstream = await nativeRequest('status', { id: toolCallId });
+      const text = isRecord(upstream)
+        ? nonEmptyString(upstream.text)
+        : undefined;
+      // The released executor prefixes status with target/budget/capacity.
+      // Require both target and tool-call echoes; never search arbitrary output.
+      const lines = text?.split(/\r?\n/);
+      if (
+        lines?.[0] !== `Status target: run ${toolCallId}` ||
+        !lines[1]?.startsWith('Spawn budget: ') ||
+        !lines[2]?.startsWith('Active async capacity: ')
+      )
+        return record;
+      const identity = /^Run: ([^\r\n]+)\nTool call: ([^\r\n]+)/.exec(
+        lines.slice(3).join('\n'),
+      );
+      const runId = identity?.[1]?.trim();
+      if (
+        !runId ||
+        identity?.[2]?.trim() !== toolCallId ||
+        !/^[A-Za-z0-9._-]+$/.test(runId)
+      )
+        return record;
+      const asyncDir = text
+        ? parseStatusLine(text.split('\n\n')[0] ?? '', 'Dir')
+        : undefined;
+      return state.journal.bind(
+        record.operationId,
+        record.requestDigest,
+        runId,
+        asyncDir,
+      );
+    } catch {
+      // Missing/ambiguous native state or a failed binding write never proves absence.
+      return state.journal.get(record.operationId) ?? record;
+    }
   };
 
   const persistSpawnFailure = (
@@ -1033,6 +1105,7 @@ export function registerPlanExecRpc(
       const nativeParams = {
         operationId: request.operationId,
         digest: request.fingerprint,
+        rpcRequestId: randomUUID(),
       };
       const claim = state.journal.begin(
         request.operationId,
@@ -1059,7 +1132,12 @@ export function registerPlanExecRpc(
         );
       }
       dispatching = true;
-      const upstream = await nativeRequest('spawn', request.params);
+      nativeLaunches.add(request.operationId);
+      const upstream = await nativeRequest(
+        'spawn',
+        request.params,
+        nativeParams.rpcRequestId,
+      );
       const reply = normalizeNativeOperation(claim.record, upstream);
       const runId = extractSpawnRunId(reply);
       if (!runId)
@@ -1090,11 +1168,48 @@ export function registerPlanExecRpc(
         'upstream_error',
         error instanceof Error ? error.message : String(error),
       );
+    } finally {
+      if (dispatching) nativeLaunches.delete(request.operationId);
     }
   };
 
   const reconcilePendingBindings = (): void => {
     if (!state.journal || disposed) return;
+    for (const [requestId, binding] of state.pendingCompletionBindings) {
+      try {
+        const operation = state.journal.getByRpcRequestId(requestId);
+        if (!operation) {
+          state.pendingCompletionBindings.delete(requestId);
+          continue;
+        }
+        if (
+          operation.launchRejection ||
+          (operation.runId && operation.runId !== binding.runId) ||
+          (operation.asyncDir &&
+            binding.asyncDir &&
+            operation.asyncDir !== binding.asyncDir)
+        ) {
+          state.pendingCompletionBindings.delete(requestId);
+          throw new Error(
+            'Completion contradicts the durable operation binding',
+          );
+        }
+        state.journal.bind(
+          operation.operationId,
+          operation.requestDigest,
+          binding.runId,
+          binding.asyncDir,
+        );
+        state.pendingCompletionBindings.delete(requestId);
+      } catch (error: unknown) {
+        if (error instanceof AmbiguousRpcRequestError)
+          state.pendingCompletionBindings.delete(requestId);
+        console.error(
+          `Failed to persist correlated completion '${requestId}':`,
+          error,
+        );
+      }
+    }
     for (const [operationId, operation] of state.operations) {
       const pending = operation.pendingBinding;
       if (!pending) continue;
@@ -1179,12 +1294,15 @@ export function registerPlanExecRpc(
         ),
       );
 
+    const rpcRequestId = randomUUID();
     if (state.journal) {
       try {
         const begun = state.journal.begin(
           request.operationId,
           request.fingerprint,
           request.ownerRunId,
+          undefined,
+          { rpcRequestId },
         );
         if (!begun.created) {
           return begun.record.requestDigest === request.fingerprint &&
@@ -1218,6 +1336,7 @@ export function registerPlanExecRpc(
         request.params,
         options.timeoutMs,
         controller.signal,
+        rpcRequestId,
       )
         .then((reply): Reply<SpawnResult> => {
           const runId = extractSpawnRunId(reply);
@@ -1523,6 +1642,7 @@ export function registerPlanExecRpc(
         );
         if (invalid) return invalid;
       }
+      let fencedCancellation: OperationJournalRecord | undefined;
       try {
         if (durable?.launchRejection && state.journal) {
           const { record: cancelled } = state.journal.requestNativeCancel(
@@ -1543,22 +1663,24 @@ export function registerPlanExecRpc(
             },
           };
         }
-        await nativeCapabilities();
         if (!state.journal)
           throw new Error('cancelOperation requires a durable journal');
-        const { record: cancelled, created } =
+        const { record: cancellation, created } =
           state.journal.requestNativeCancel(
             request.operationId,
             request.requestDigest,
             request.ownerRunId,
           );
+        fencedCancellation = cancellation;
+        const cancelled = await recoverNativeBinding(cancellation);
+        fencedCancellation = cancelled;
         if (!cancelled.runId) {
           return {
             success: true,
             data: {
               operationId: cancelled.operationId,
               requestDigest: cancelled.requestDigest,
-              // A rejection may have been persisted during the capability await.
+              // Another owner may have persisted rejection evidence during lookup.
               state:
                 created || cancelled.launchRejection ? 'cancelled' : 'unknown',
               cancellationRequested: true,
@@ -1589,13 +1711,29 @@ export function registerPlanExecRpc(
             neverStarted: false,
             ...(cancelled.asyncDir ? { asyncDir: cancelled.asyncDir } : {}),
             nativeState: normalizeStop(stopRequest, result).state,
+            replaySafe: false,
           },
         };
       } catch (error: unknown) {
-        return failure(
-          'upstream_error',
-          error instanceof Error ? error.message : String(error),
-        );
+        const message = error instanceof Error ? error.message : String(error);
+        if (fencedCancellation?.cancelRequested) {
+          return {
+            success: true,
+            data: {
+              operationId: fencedCancellation.operationId,
+              requestDigest: fencedCancellation.requestDigest,
+              ...(fencedCancellation.runId
+                ? { runId: fencedCancellation.runId }
+                : {}),
+              state: 'unknown',
+              cancellationRequested: true,
+              neverStarted: false,
+              replaySafe: false,
+              error: message,
+            },
+          };
+        }
+        return failure('upstream_error', message);
       }
     }
 
@@ -1625,14 +1763,24 @@ export function registerPlanExecRpc(
       }
       const request = validateOperationRequest(raw, protocolVersion);
       if (isFailure(request)) return request;
-      const nativeRecord = state.journal?.get(request.operationId);
-      if (nativeRecord?.nativeCorrelated || nativeRecord?.launchRejection) {
+      let nativeRecord = state.journal?.get(request.operationId);
+      if (
+        nativeRecord?.nativeCorrelated ||
+        nativeRecord?.launchRejection ||
+        (protocolVersion === 2 &&
+          nativeRecord?.nativeParams?.rpcRequestId &&
+          !(
+            state.operations.has(request.operationId) &&
+            !state.operations.get(request.operationId)?.outcome
+          ))
+      ) {
         const invalid = validateOperationIdentity(
           request,
           nativeRecord.requestDigest,
           nativeRecord.ownerRunId,
         );
         if (invalid) return invalid;
+        nativeRecord = await recoverNativeBinding(nativeRecord);
         const proof = nativeRecord.runId
           ? state.terminalProofs.get(nativeRecord.runId)
           : undefined;
@@ -1858,7 +2006,39 @@ export function registerPlanExecRpc(
           ),
         );
     });
+  const completionUnsubscribe = state.journal
+    ? events.on(SUBAGENTS_COMPLETE_EVENT, (raw: unknown) => {
+        if (!state.journal || !isRecord(raw)) return;
+        const toolCallId = nonEmptyString(raw.toolCallId);
+        const runId = extractSpawnRunId(raw);
+        if (!toolCallId?.startsWith('rpc-spawn-') || !runId) return;
+        const requestId = toolCallId.slice('rpc-spawn-'.length);
+        if (!requestId) return;
+        const pending = state.pendingCompletionBindings.get(requestId);
+        if (
+          pending &&
+          (pending.runId !== runId ||
+            (pending.asyncDir &&
+              raw.asyncDir &&
+              pending.asyncDir !== raw.asyncDir))
+        ) {
+          console.error(
+            'Conflicting native completion identity; preserving the first observation',
+          );
+          return;
+        }
+        // Capture before touching SQLite: even a read failure must not lose this
+        // one-shot event before native result delivery removes lookup aliases.
+        const asyncDir = extractSpawnAsyncDir(raw);
+        state.pendingCompletionBindings.set(requestId, {
+          runId,
+          ...(asyncDir ? { asyncDir } : {}),
+        });
+        reconcilePendingBindings();
+      })
+    : undefined;
   const unsubscribes = [
+    completionUnsubscribe,
     subscribe(PLAN_EXEC_REQUEST_EVENT, 1),
     subscribe(PLAN_EXEC_V2_REQUEST_EVENT, 2),
   ];

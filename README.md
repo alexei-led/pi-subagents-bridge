@@ -145,7 +145,7 @@ Version 2 uses `plan-exec:bridge:v2:request` and `plan-exec:bridge:v2:reply:<req
 
 - `ping` verifies the live `pi-subagents` RPC before advertising `workflowScriptSpawn`, `durableOperationLookup`, and `processTerminalProof` capabilities.
 - `spawn` requires `operationId`, `cwd` when needed, `params.agent`, `params.task`, and an owner `{ kind: "pi-plan-exec", runId, key, requestDigest }`. The digest is SHA-256 over canonical `{ cwd, params }`. The bridge rejects mismatches before dispatch.
-- The durable journal is written before the native spawn is emitted. A bound operation survives a full Pi restart. A legacy dispatch with no durable native reply becomes `unknown`; the bridge never launches it again automatically.
+- The durable journal, including the exact native RPC request UUID, is written before the native spawn is emitted. A bound operation survives a full Pi restart. Lost replies can be reconciled by the released native runtime's exact `rpc-spawn-<request UUID>` tool-call lookup; the echoed native identity must match before binding. The bridge never redispatches the same operation.
 - `operation` never starts work. Version 2 returns `operationId`, `requestDigest`, and `absent`, `pending`, `found`, `not_started`, or `unknown` binding state. Lookup is observational and never retries dispatch.
 - `status` and `adopt` include a validated native `processTerminal` value when `pi-subagents` returns one. Only an `observed` proof with the matching run ID proves process termination.
 - `result` uses the native status RPC because `pi-subagents` has no separate result RPC. `stop` delegates to the native stop RPC.
@@ -164,10 +164,19 @@ Explicit lifetimes do not accept caller workflow scripts.
 Ownership is bridge-supervised with best-effort escaped-descendant handling,
 not kernel containment. The bridge journal owns operation identity and replay
 protection; the released upstream RPC has no operation-ID lookup. A bound run
-can be recovered from the journal. A lost spawn reply without a binding remains
-`unknown`, including after restart.
+can be recovered from the journal. New unbound entries retain the native RPC UUID,
+so lookup can reattach the same child after a lost reply or restart **while the
+native tool-call lookup mapping is retained**. Bridge also persists exact
+`toolCallId`/run bindings from native completion events while loaded; these events
+are not themselves terminal proof. Native terminal cleanup and result delivery
+can remove the lookup mapping. If Bridge never received or recovered a binding
+before its removal, lookup stays `unknown` even when other native artifacts remain.
+An already-bound journal row does not depend on that alias. Failed, ambiguous or
+mismatched lookup never proves absence. Historical unbound entries without a
+native request UUID also remain `unknown`.
 
-`cancelOperation` records cancellation intent. It reports `neverStarted: true`
+`cancelOperation` records cancellation intent before native lookup or stop.
+The durable local fence does not require a native ping. It reports `neverStarted: true`
 when its atomic journal transaction creates a new fence before any dispatch
 record exists, or the existing operation has durable correlated rejection evidence.
 Other native-correlated unbound operations return `unknown` and
@@ -176,6 +185,11 @@ Uncorrelated legacy rows without rejection evidence reject cancellation instead.
 Neither response establishes no-start.
 It is not safe to infer non-start from a missing run ID or a timeout.
 A known run is stopped through native RPC; a stop request is not exit proof.
+Controllers that explicitly quarantine an execution target can use the identity-bound
+`cancellationRequested: true` acknowledgement as a no-redispatch fence, never as
+old-worker termination. If native stop fails after the fence commits, the reply
+keeps that acknowledgement with `state: "unknown"`, `neverStarted: false`, and
+an error diagnostic. An unknown old worker may still run in its old target.
 
 Reconcile native `processTerminalProof` (also exposed as `processTerminal`)
 before starting replacement work. A workflow uses native `workflowTerminalProof`:

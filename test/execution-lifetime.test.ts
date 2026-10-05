@@ -266,7 +266,7 @@ test('a new cancellation fence prevents dispatch but does not invent proof on re
   assert.equal((await h.request('spawn', body)).success, false);
 });
 
-test('dispatch recorded during the cancellation probe is not a never-started fence', async () => {
+test('dispatch committed by another journal before cancellation is not a never-started fence', async () => {
   const { journalPath } = temporary();
   const params = {
     agent: 'worker',
@@ -275,12 +275,11 @@ test('dispatch recorded during the cancellation probe is not a never-started fen
   };
   const { body, digest } = spawnBody('racing-operation', params);
   const other = new OperationJournal(journalPath);
-  const h = harness(journalPath, (method) => {
-    assert.equal(method, 'ping');
-    other.begin('racing-operation', digest, 'plan', { mode: 'unbounded' });
-    return pingData;
+  const h = harness(journalPath, () => {
+    assert.fail('local cancellation fence must not wait for a native probe');
   });
   onTestFinished(() => h.dispose());
+  other.begin('racing-operation', digest, 'plan', { mode: 'unbounded' });
   const reply = await h.request('cancelOperation', body);
   const data = reply.data as Record<string, unknown>;
   assert.equal(data.state, 'unknown');

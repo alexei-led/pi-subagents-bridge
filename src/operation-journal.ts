@@ -13,6 +13,13 @@ const BUSY_TIMEOUT_MS = 2_000;
 
 export type OperationBinding = 'dispatching' | 'bound' | 'unknown';
 
+export class AmbiguousRpcRequestError extends Error {
+  constructor() {
+    super('Native RPC request mapping is ambiguous');
+    this.name = 'AmbiguousRpcRequestError';
+  }
+}
+
 export interface AcceptedRunOwner {
   pid: number;
   instanceId: string;
@@ -584,7 +591,12 @@ export class OperationJournal {
       ) {
         throw new Error('operation owner does not match the durable operation');
       }
-      if (existing && !existing.nativeCorrelated && !existing.launchRejection) {
+      if (
+        existing &&
+        !existing.nativeCorrelated &&
+        !existing.launchRejection &&
+        typeof existing.nativeParams?.rpcRequestId !== 'string'
+      ) {
         throw new Error(
           'legacy launch cannot be fenced by operation identity; reconcile and stop its existing child',
         );
@@ -608,6 +620,16 @@ export class OperationJournal {
         throw new Error('Native cancellation intent could not be persisted');
       return { created: !existing, record };
     });
+  }
+
+  getByRpcRequestId(requestId: string): OperationJournalRecord | undefined {
+    const rows = this.#db
+      .prepare(
+        "SELECT operation_id FROM operations WHERE json_extract(native_params, '$.rpcRequestId') = ? LIMIT 2",
+      )
+      .all(requestId) as unknown as { operation_id: string }[];
+    if (rows.length > 1) throw new AmbiguousRpcRequestError();
+    return rows[0] ? this.get(rows[0].operation_id) : undefined;
   }
 
   getByRunId(runId: string): OperationJournalRecord | undefined {
@@ -736,6 +758,17 @@ export class OperationJournal {
         throw new Error(
           `Operation '${operationId}' was already used with a different request digest`,
         );
+      }
+      if (current.binding === 'bound') {
+        if (update.binding === 'unknown') return current;
+        if (
+          current.runId !== update.runId ||
+          (current.asyncDir &&
+            update.asyncDir &&
+            current.asyncDir !== update.asyncDir)
+        )
+          throw new Error('A bound operation cannot change native identity');
+        if (current.asyncDir || !update.asyncDir) return current;
       }
       if (current.launchRejection)
         throw new Error(
