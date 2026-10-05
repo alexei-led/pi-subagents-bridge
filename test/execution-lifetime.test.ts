@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { onTestFinished, test } from 'vitest';
+import { OperationJournal } from '../src/operation-journal.js';
 import {
   PLAN_EXEC_V2_REPLY_PREFIX,
   PLAN_EXEC_V2_REQUEST_EVENT,
@@ -145,7 +146,7 @@ test('a bounded lifetime is forwarded as timeoutMs and echoed without provider a
   assert.equal(spawned.timeoutMs, 5_000);
   assert.equal(spawned.executionLifetime, undefined);
   assert.equal(spawned.executionOwnership, undefined);
-  assert.match(String(spawned.workflowScript), /runs\.run/);
+  assert.match(String(spawned.script), /runs\.run/);
 });
 
 test('an unbounded lifetime forwards no timeout', async () => {
@@ -203,7 +204,7 @@ test('a lost spawn reply is never redispatched', async () => {
   assert.equal(spawns, 1);
 });
 
-test('cancel before dispatch reports a never-started fence without calling upstream', async () => {
+test('cancel after a lost spawn reply cannot claim the worker never started', async () => {
   const { journalPath } = temporary();
   const { body } = spawnBody('operation-cancel', {
     agent: 'worker',
@@ -235,9 +236,56 @@ test('cancel before dispatch reports a never-started fence without calling upstr
   });
   assert.equal(cancelled.success, true, JSON.stringify(cancelled));
   const data = cancelled.data as Record<string, unknown>;
+  assert.equal(data.state, 'unknown');
+  assert.equal(data.neverStarted, false);
+  assert.equal(data.cancellationRequested, true);
+  assert.equal(stops, 0);
+});
+
+test('a new cancellation fence prevents dispatch but does not invent proof on replay', async () => {
+  const { journalPath } = temporary();
+  const { body } = spawnBody('operation-before-dispatch', {
+    agent: 'worker',
+    task: 'Never launch',
+    executionLifetime: { mode: 'unbounded' },
+  });
+  const h = harness(journalPath, (method) => {
+    assert.equal(method, 'ping', 'cancellation must prevent native spawn');
+    return pingData;
+  });
+  onTestFinished(() => h.dispose());
+  const first = await h.request('cancelOperation', body);
+  const data = first.data as Record<string, unknown>;
   assert.equal(data.state, 'cancelled');
   assert.equal(data.neverStarted, true);
-  assert.equal(stops, 0);
+  assert.equal((await h.request('spawn', body)).success, false);
+  const replay = await h.request('cancelOperation', body);
+  const replayData = replay.data as Record<string, unknown>;
+  assert.equal(replayData.state, 'unknown');
+  assert.equal(replayData.neverStarted, false);
+  assert.equal((await h.request('spawn', body)).success, false);
+});
+
+test('dispatch recorded during the cancellation probe is not a never-started fence', async () => {
+  const { journalPath } = temporary();
+  const params = {
+    agent: 'worker',
+    task: 'Review',
+    executionLifetime: { mode: 'unbounded' },
+  };
+  const { body, digest } = spawnBody('racing-operation', params);
+  const other = new OperationJournal(journalPath);
+  const h = harness(journalPath, (method) => {
+    assert.equal(method, 'ping');
+    other.begin('racing-operation', digest, 'plan', { mode: 'unbounded' });
+    return pingData;
+  });
+  onTestFinished(() => h.dispose());
+  const reply = await h.request('cancelOperation', body);
+  const data = reply.data as Record<string, unknown>;
+  assert.equal(data.state, 'unknown');
+  assert.equal(data.neverStarted, false);
+  assert.equal(data.cancellationRequested, true);
 });
 
 test('a bound operation survives restart and exposes the upstream terminal proof', async () => {

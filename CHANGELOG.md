@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.2 - 2026-10-05
+
+- Fix TaskExecute and plan-exec launches rejected with `RPC spawn workflowScript was removed`. Both paths now send inline workflow text through the public RPC `script` field; capability names, task parameters, lifetimes, and operation identity remain unchanged.
+- Stop reporting `neverStarted: true` when cancellation finds an existing unbound dispatch. Only a newly created cancellation fence proves dispatch was prevented. Unknown operations remain blocked across restart; no automatic retries or journal rewrites.
+- Test against the real pi-subagents 0.76.0 RPC validator and an isolated Pi integration that completes both launch paths, checks replay/lookup, and observes native workflow terminal proof.
+
+### Upgrade
+
+Install pi-subagents 0.76.x before updating Bridge, then reload Pi. Older pi-subagents versions are no longer supported. Existing unresolved launches still need controller-owned reconciliation; upgrading or repeating `/exec resume` does not establish no-start proof. Do not delete journals or launch replacement workers to clear ambiguity.
+
 ## 0.5.1 - 2026-10-04
 
 - Validate against Pi 1.0.2, including isolated RPC startup with a version-5 operation journal. Bound the host peer contract and development dependency to `^1.0.2`; RPC, cancellation, and durable journal behavior are unchanged.

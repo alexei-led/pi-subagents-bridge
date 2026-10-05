@@ -358,7 +358,7 @@ test('plan-exec spawn forwards actual pi-subagents parameters and coalesces a du
   assert.equal(upstream.version, 1);
   assert.equal(upstream.method, 'spawn');
   assert.deepEqual(upstream.params, {
-    workflowScript:
+    script:
       'return runs.run("main", {"agent":"worker","task":"Implement the task.","completionGuard":false})',
     async: true,
     context: 'fresh',
@@ -425,7 +425,7 @@ test('plan-exec accepts cwd from params and rejects conflicting cwd values', asy
   assert.equal(upstream.params.cwd, '/tmp/params-worktree');
   assert.equal(upstream.params.async, true);
   assert.equal(
-    upstream.params.workflowScript,
+    upstream.params.script,
     'return runs.run("main", {"agent":"worker","task":"Use the requested worktree."})',
   );
   assert.equal(Object.hasOwn(upstream.params, 'agent'), false);
@@ -1502,7 +1502,7 @@ test('plan-exec v2 fails closed for absent, pending, unknown, and malformed work
   assert.ok(isRecord(missingReply));
   assert.equal(missingReply.success, false);
   assert.ok(isRecord(missingReply.error));
-  assert.match(String(missingReply.error.message), /pi-subagents.*0\.71\.0/);
+  assert.match(String(missingReply.error.message), /pi-subagents.*0\.76\.0/);
 
   await bindV2Run(bus, 'default-workflow');
   const defaultStatus = once(bus, v2ReplyEvent('wf-status-default-missing'));

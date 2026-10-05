@@ -44,7 +44,6 @@ jobs:
             core.setOutput("name", pkg.name);
             core.setOutput("version", pkg.version);
             core.setOutput("tag", tag);
-            core.setOutput("release_name", `${pkg.name} ${pkg.version}`);
             core.setOutput("prerelease", String(pkg.version.includes("-")));
       - name: Ensure tag is on main
         run: |
@@ -97,20 +96,19 @@ jobs:
         env:
           PACKAGE_NAME: ${{ steps.metadata.outputs.name }}
           PACKAGE_VERSION: ${{ steps.metadata.outputs.version }}
-          RELEASE_NAME: ${{ steps.metadata.outputs.release_name }}
           RELEASE_TAG: ${{ steps.metadata.outputs.tag }}
           PRERELEASE: ${{ steps.metadata.outputs.prerelease }}
         with:
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
             const tag = process.env.RELEASE_TAG;
-            const body = [
-              "## Package",
-              `- Name: \`${process.env.PACKAGE_NAME}\``,
-              `- Version: \`${process.env.PACKAGE_VERSION}\``,
-              `- Tag: \`${tag}\``,
-              `- Commit: \`${process.env.GITHUB_SHA}\``,
-            ].join("\n");
+            const fs = require("node:fs");
+            const lines = fs.readFileSync("CHANGELOG.md", "utf8").split("\n");
+            const start = lines.findIndex(line => line.startsWith(`## ${process.env.PACKAGE_VERSION} - `));
+            if (start < 0) throw new Error("Release changelog section is missing.");
+            const next = lines.findIndex((line, index) => index > start && line.startsWith("## "));
+            const body = lines.slice(start + 1, next < 0 ? undefined : next).join("\n").trim();
+            if (!body) throw new Error("Release changelog section is empty.");
 
             try {
               const { data: existing } = await github.rest.repos.getReleaseByTag({
@@ -133,9 +131,9 @@ jobs:
               repo,
               tag_name: tag,
               target_commitish: process.env.GITHUB_SHA,
-              name: process.env.RELEASE_NAME,
+              name: tag,
               body,
-              generate_release_notes: true,
+              generate_release_notes: false,
               prerelease: process.env.PRERELEASE === "true",
               make_latest: process.env.PRERELEASE === "true" ? "false" : "true",
             });

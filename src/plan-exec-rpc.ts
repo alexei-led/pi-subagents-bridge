@@ -438,7 +438,7 @@ function validateSpawn(
   } = params;
   const forwarded: Record<string, unknown> = {
     ...workflowDefaults,
-    workflowScript: singleChildWorkflowScript(agent, task, {
+    script: singleChildWorkflowScript(agent, task, {
       ...(completionGuard === undefined ? {} : { completionGuard }),
     }),
     async: true,
@@ -606,7 +606,7 @@ function normalizeObservation(
 }
 
 const WORKFLOW_PROOF_UNAVAILABLE_MESSAGE =
-  'Closed workflow has no native terminal proof in this status snapshot. Check pi-subagents >=0.71.0 and durable async status/proof artifacts; reload the active extension if needed.';
+  'Closed workflow has no native terminal proof in this status snapshot. Check pi-subagents >=0.76.0 and durable async status/proof artifacts; reload the active extension if needed.';
 
 function closedWorkflowLacksNativeProof(
   upstream: unknown,
@@ -1447,20 +1447,22 @@ export function registerPlanExecRpc(
         await nativeCapabilities();
         if (!state.journal)
           throw new Error('cancelOperation requires a durable journal');
-        const cancelled = state.journal.requestNativeCancel(
-          request.operationId,
-          request.requestDigest,
-          request.ownerRunId,
-        );
+        const { record: cancelled, created } =
+          state.journal.requestNativeCancel(
+            request.operationId,
+            request.requestDigest,
+            request.ownerRunId,
+          );
         if (!cancelled.runId) {
           return {
             success: true,
             data: {
               operationId: cancelled.operationId,
               requestDigest: cancelled.requestDigest,
-              state: 'cancelled',
+              // Only a fence inserted before any dispatch record proves no launch.
+              state: created ? 'cancelled' : 'unknown',
               cancellationRequested: true,
-              neverStarted: true,
+              neverStarted: created,
               replaySafe: false,
             },
           };

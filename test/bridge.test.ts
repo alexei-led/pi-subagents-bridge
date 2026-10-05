@@ -96,7 +96,7 @@ test('spawn forwards the normalized pi-tasks request and returns the launched ru
   assert.equal(request.version, 1);
   assert.equal(request.method, 'spawn');
   assert.deepEqual(request.params, {
-    workflowScript:
+    script:
       'return runs.run("main", {"agent":"delegate","task":"Do the task","control":{"enabled":false}})',
     async: true,
     context: 'fresh',
@@ -172,7 +172,7 @@ test('spawn supports documented aliases, keeps custom agent names unchanged, and
     assert.ok(isRecord(request));
     assert.ok(isRecord(request.params));
     assert.equal(
-      request.params.workflowScript,
+      request.params.script,
       `return runs.run("main", {"agent":"${expectedAgent}","task":"Do the task","control":{"enabled":false}})`,
     );
     assert.equal(Object.hasOwn(request.params, 'agent'), false);

@@ -5,8 +5,8 @@ Update it incrementally when either upstream package changes.
 
 ## Scope and versions checked
 
-- Pi extension API contract tested with `@earendil-works/pi-coding-agent 0.87.0`; minimum supported Pi version is `0.86.1`.
-- `pi-subagents` supported runtime contract: `0.71.0`.
+- Pi extension API contract tested with `@earendil-works/pi-coding-agent 1.0.2`; supported Pi range is `^1.0.2`.
+- `pi-subagents` tested runtime: `0.76.0`; supported range: `>=0.76.0 <0.77.0`.
 - The bridge v2 capability probe checks async spawn and process-terminal support; upstream ping does not attest workflow-proof availability or the version of the active Pi extension.
 - Packed files matched installed files for:
   - `src/extension/rpc.ts`
@@ -69,12 +69,14 @@ Evidence:
 - Reply envelope includes `version`, `requestId`, optional `method`, and either `success: true, data` or `success: false, error: { code, message }`: lines `32-47`.
 - `dataFromToolResult` exposes text and `details` from the subagent tool result: lines `128-132`.
 - Target params for status/interrupt/stop accept `id`, `runId`, `dir`, `index`: lines `141-147`.
-- `spawnParams` rejects management actions, `async:false`, and `clarify:true`, then forces `{ async: true, clarify: false }`: lines `193-204`.
+- In released `src/extension/rpc.js:375-407`, `spawnParams` accepts inline text as `script`, rejects own `workflowScript` and `workflowScriptPath` with `invalid_params`, then maps `script` to the internal `workflowScript` carrier before validation and execution. The breaking public change shipped in 0.74.0; Bridge tests pin 0.76.0. Management actions, `async:false`, and the removed public `clarify` field are rejected.
 - `stopAsyncRun` resolves the target async run, requires the run to be live/running in the active session, and returns `{ runId, asyncDir, previousState, state: "stopping", message }`: lines `207-267`.
 
 Bridge decisions:
 
-- Forward spawn as v1 RPC on `subagents:rpc:v1:request`.
+- Forward both TaskExecute and plan-exec spawn as v1 RPC on `subagents:rpc:v1:request` with `script`. Keep the bridge capability `workflowScriptSpawn` and native internal carriers unchanged.
+- A deterministic `invalid_params` response happens before the upstream executor runs. Bridge does not persist a typed no-start receipt, so failed unbound operations remain `unknown` across lookup, cancellation, and restart. Never classify a dispatch record as never-started merely because it lacks a run ID.
+- `requestNativeCancel` returns whether its transaction created a new fence. Only that result proves cancellation preceded dispatch; an earlier read outside the transaction cannot prove it.
 - Use v1 reply channel `subagents:rpc:v1:reply:<requestId>`.
 - Read async spawn id from `data.details.runId` first, then `data.details.asyncId`, with top-level fallbacks for resilience.
 - Override spawn acceptance to `{ level: "none", reason: ... }` because pi-tasks has no structured acceptance-report channel and should not inherit pi-subagents' async acceptance gate.

@@ -518,7 +518,7 @@ export class OperationJournal {
     operationId: string,
     requestDigest: string,
     ownerRunId?: string,
-  ): OperationJournalRecord {
+  ): { created: boolean; record: OperationJournalRecord } {
     return this.#transaction(() => {
       const existing = this.get(operationId);
       if (
@@ -550,7 +550,7 @@ export class OperationJournal {
       const record = this.get(operationId);
       if (!record)
         throw new Error('Native cancellation intent could not be persisted');
-      return record;
+      return { created: !existing, record };
     });
   }
 

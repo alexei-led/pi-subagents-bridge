@@ -27,6 +27,12 @@ npm run publish:dry
 
 `npm run test:all` is the local pre-release gate.
 
+`test/upstream-rpc.test.ts` loads the pinned pi-subagents RPC validator directly.
+`test/rpc-integration.test.ts` starts local Pi with Bridge and pi-subagents in
+isolated HOME, agent, workspace, and temporary directories. It uses a local HTTP
+model fixture, not credentials or globally installed extensions, and completes
+both launch paths with native proof and replay checks.
+
 ## Release
 
 Target package:
@@ -49,7 +55,8 @@ Use `npm version patch` or `npm version minor` only when it makes the intended
 version change; do not bump an already versioned release a second time.
 
 The GitHub release workflow runs on pushed `v*` tags.
-It verifies the tag matches `package.json`, checks it is on `main`, runs the validation gate, then publishes with npm provenance.
+It verifies the tag matches `package.json`, checks it is on `main`, runs the validation gate, then publishes with npm provenance. The same workflow creates the GitHub release
+with the tag as its title and the matching `CHANGELOG.md` section as its notes.
 
 Configure npm trusted publishing after the first package publish:
 

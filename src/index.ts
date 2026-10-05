@@ -7,13 +7,13 @@ import { OperationJournal } from './operation-journal.js';
 import { registerPlanExecRpc } from './plan-exec-rpc.js';
 import { singleChildWorkflowScript } from './workflow-spawn.js';
 
-// Protocol evidence (installed sources verified against pi-subagents@0.60.0
+// Protocol evidence (installed sources verified against pi-subagents@0.76.0
 // and @tintinweb/pi-tasks@0.9.0):
 // - @tintinweb/pi-tasks src/index.ts:103-119 reply channel/envelope,
 //   126-133 spawn/stop params, 137-157 strict PROTOCOL_VERSION=2,
 //   207-260 completed/failed/stopped fields.
-// - pi-subagents src/extension/rpc.ts exposes the v1 channel and async-only spawn;
-//   public-execution.ts requires workflowScript and rejects clarify entirely.
+// - pi-subagents src/extension/rpc.js exposes the v1 channel and async-only spawn;
+//   inline scripts use the public script field, not the internal workflowScript carrier.
 // - pi-subagents src/runs/background/result-watcher.ts:49-57 result file fields,
 //   141-164 child output/status normalization, 193-204 async-complete payload;
 //   subagent-runner.ts:3066-3073 complete/failed/paused state values.
@@ -816,11 +816,9 @@ export function registerBridge(
         ? optionsRaw.maxTurns
         : defaultMaxTurns;
     const spawnParams: Record<string, unknown> = {
-      workflowScript: singleChildWorkflowScript(
-        resolveAgentType(agentType),
-        prompt,
-        { control: BRIDGE_CONTROL_CONFIG },
-      ),
+      script: singleChildWorkflowScript(resolveAgentType(agentType), prompt, {
+        control: BRIDGE_CONTROL_CONFIG,
+      }),
       async: true,
       context: 'fresh',
       acceptance: BRIDGE_ACCEPTANCE_CONFIG,

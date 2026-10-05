@@ -39,7 +39,7 @@ sequenceDiagram
   Bridge-->>Tasks: version 2
 
   Tasks->>Bridge: spawn(type, prompt, options)
-  Bridge->>Subs: spawn(workflowScript, async: true)
+  Bridge->>Subs: spawn(script, async: true)
   Subs-->>Bridge: runId
   Bridge-->>Tasks: id = runId
 
@@ -67,7 +67,7 @@ Requirements:
 
 - Node `>= 22.19.0`
 - Pi `^1.0.2` with extension loading enabled; tested with Pi `1.0.2`
-- `pi-subagents >= 0.71.0` for native workflow and process-terminal proofs
+- `pi-subagents >= 0.76.0 < 0.77.0`; tested with `0.76.0` for RPC `script` input and native terminal proofs
 
 The npm peer requirement does not verify which Pi extension is active. If a
 closed workflow status has no native proof field, the bridge reports an error
@@ -116,12 +116,13 @@ A read-only agent can still be useful for read-only tasks such as review or meta
 
 Spawned runs are always forwarded as:
 
-- one-child `workflowScript` execution
+- one-child workflow execution through RPC `script`
 - `async: true`
 - `context: "fresh"`
 - `control: { enabled: false }` on the outer workflow and its child
 
-The bridge does not send the removed public `clarify` field.
+The bridge does not send the removed public `workflowScript` or `clarify` fields.
+The plan-exec capability name `workflowScriptSpawn` is unchanged; it is not an RPC input field.
 
 The bridge returns the spawned run ID back to `pi-tasks` and tracks that run as bridge-owned state. It runs at most **two** bridge-owned tasks at once. A task without an explicit `maxTurns` receives a **12-turn** budget.
 
@@ -147,54 +148,36 @@ Version 2 uses `plan-exec:bridge:v2:request` and `plan-exec:bridge:v2:reply:<req
 - `operation` never starts work. Version 2 returns `operationId`, `requestDigest`, and `absent`, `pending`, `found`, `cancelled`, or `unknown` binding state. It redelivers a durable cancellation intent when needed.
 - `status` and `adopt` include a validated native `processTerminal` value when `pi-subagents` returns one. Only an `observed` proof with the matching run ID proves process termination.
 - `result` uses the native status RPC because `pi-subagents` has no separate result RPC. `stop` delegates to the native stop RPC.
-- `adopt` is observational. It does not silently transfer session ownership. Native correlated runs use durable lookup for `status`, `result`, and `adopt`, and durable cancellation for `stop`, including after the originating session changes.
+- `adopt` is observational. It does not silently transfer session ownership. Status and stop use native run IDs; the native runtime still enforces its session restrictions.
 
 Explicit execution lifetimes require v2. Set `params.executionLifetime` to
 `{ mode: "unbounded" }` or `{ mode: "bounded", timeoutMs: 1800000 }`.
-Do not combine this field with legacy `timeout` or `timeoutMs`. The bridge sends
-the agent and task directly to the native async executor with
-`executionOwnership: { mode: "kernel" }`, includes the lifetime in the durable
-digest, and verifies the native `effectiveExecutionLifetime` reply. Explicit
-lifetimes do not accept arbitrary workflow scripts. The exact native launch
-parameters are frozen in the journal and reused after restart.
-Omitting the field preserves legacy behavior.
+Do not combine this field with legacy `timeout` or `timeoutMs`. Both paths wrap
+the agent and task in a one-child async workflow sent through RPC `script`.
+A bounded lifetime becomes `timeoutMs`; an unbounded request forwards no timeout.
+The lifetime is included in the caller digest and echoed as
+`effectiveExecutionLifetime`; this is bridge intent, not native attestation.
+Explicit lifetimes do not accept caller workflow scripts.
 
-`ping` advertises `executionLifetime: { version: 1, modes: ["unbounded", "bounded"] }`
-only when the native runtime also supports durable lookup, replay, and cancellation
-fences. An incompatible runtime is rejected before spawn. Explicit requests use
-native `operationId` and `digest` correlation: `operation` can recover a lost spawn
-reply after restart, and replay keeps the original identity. `cancelOperation`
-takes the same `operationId` and owner, installs a native cancellation fence, and
-can return `cancelled` without a run ID when dispatch was prevented. A cancellation
-request or RPC timeout does not prove that a running child exited. Reconcile the
-native `processTerminalProof` (also exposed as `processTerminal`) and lifecycle
-observations before starting replacement work. Pending or unknown process-terminal
-states are diagnostic only and do not confirm exit. A workflow uses the native
-`workflowTerminalProof`: dispatch must be closed, and each child must be observed
-or explicitly marked not-started. Pending, unknown, malformed, or absent workflow
-proofs do not establish completion. The workflow's hosting Pi process can remain
-alive.
+`ping` advertises lifetime support when native async spawn and stop are available.
+Ownership is bridge-supervised with best-effort escaped-descendant handling,
+not kernel containment. The bridge journal owns operation identity and replay
+protection; the released upstream RPC has no operation-ID lookup. A bound run
+can be recovered from the journal. A lost spawn reply without a binding remains
+`unknown`, including after restart.
 
-Explicit launches also require `processTreeOwnership` to advertise
-`scope: "owned-process-tree"`, `escapedDescendants: "contained"`,
-`routes: ["single-async"]`, and `requestMode: "kernel"`. A provider must establish
-these capabilities on the current host before the bridge dispatches work. A
-POSIX process-group-only provider remains unsupported, and its weaker descriptor
-is preserved for diagnostics. The bridge never upgrades group exit into full
-process-tree proof. Cancellation and lookup remain available for existing runs
-when the owned execution route becomes unavailable.
+`cancelOperation` records cancellation intent. It reports `neverStarted: true`
+only when its atomic journal transaction creates a new fence before any dispatch
+record exists. An existing unbound operation returns `unknown` and
+`neverStarted: false`, including repeat cancellation of an old fence.
+It is not safe to infer non-start from a missing run ID or a timeout.
+A known run is stopped through native RPC; a stop request is not exit proof.
 
-The pinned native backend supports this route on macOS arm64/x64 with the current
-user's launchd GUI domain and `/usr/bin/clang`. Its first probe builds the private
-helper in the runtime artifact directory. Unsupported hosts fail preflight before
-spawn. `singleAgentSpawn` identifies this supported direct route;
-`workflowScriptSpawn` describes the separate legacy wrapper capability.
-
-Observed kernel proofs include three distinct bindings: the bridge's
-`callerBinding`, the native RPC's `nativeOperation`, and the prepared kernel
-request's `kernelBinding`. The bridge validates their persisted relationship
-without equating unrelated digests. A missing or ambiguous run-ID mapping returns
-`unknown`; it cannot attest a foreign terminal proof.
+Reconcile native `processTerminalProof` (also exposed as `processTerminal`)
+before starting replacement work. A workflow uses native `workflowTerminalProof`:
+dispatch must be closed and each child observed or explicitly not-started.
+Pending, unknown, malformed, or absent proofs do not establish completion.
+The workflow's hosting Pi process can remain alive.
 
 When native `diagnosticGuidance` advertises durable, idempotent `follow_up`
 guidance for confirmed tool failures, `diagnoseOperation` accepts
@@ -207,11 +190,20 @@ operation, request digest, diagnostic ID, and tool-call ID, with
 An enqueue receipt does not confirm a repair. Cancellation fences late guidance;
 this method does not start or revive a worker.
 
-The Vitest suite covers the bridge protocol against capability fixtures. The
-installed end-to-end path (controller, Bridge, native RPC, owned workers,
-checks, review, promotion, archive) is exercised from pi-plan-exec with
-`npm run test:runtime-smoke`; that smoke run also covers the real client's
-capability negotiation against the released runtime.
+The Vitest suite checks the released RPC validator, not only capability mocks.
+An isolated Pi integration test completes both Bridge paths against real
+pi-subagents workflows and child runtimes, using only a local fixture HTTP model.
+It verifies lookup, replay identity, native workflow proof, and task completion.
+
+### Upgrade and unresolved launches
+
+Update pi-subagents to the supported range before installing Bridge 0.5.2, then
+reload Pi. The fix applies to new launches; it does not rewrite old journal rows.
+A previous `invalid_params` failure still looks `unknown` if no authoritative
+binding or durable no-start evidence was stored. Do not delete the journal,
+cancel to manufacture no-start proof, or launch a replacement worker.
+Use the owning controller's diagnostic/recovery path; `/exec resume` alone may
+remain blocked until that operation is reconciled.
 
 The journal defaults to `~/.pi/pi-subagents-bridge/plan-exec-operations.sqlite`. SQLite transactions provide crash recovery and cross-process serialization without a stale application lock. Version 1 clients retain their existing response shape and also benefit from durable bound-operation lookup. Operation identity rows are retained as idempotency records; automatic pruning could make an old operation ID dispatch again. Remove the database only after all referenced plan runs are permanently retired and duplicate-launch protection is no longer needed. Existing v1 accepted-run rows migrate fail-closed with no session identity; they require explicit manual recovery rather than unsafe cross-session delivery.
 
