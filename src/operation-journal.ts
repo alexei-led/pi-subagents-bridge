@@ -6,9 +6,9 @@ import {
   parseExecutionLifetime,
 } from './execution-lifetime.js';
 
-const JOURNAL_VERSION = 6;
+const JOURNAL_VERSION = 7;
 // Legacy versions migrate without manufacturing launch evidence.
-const COMPATIBLE_JOURNAL_VERSIONS = [0, 1, 2, 3, 4, 5, JOURNAL_VERSION];
+const COMPATIBLE_JOURNAL_VERSIONS = [0, 1, 2, 3, 4, 5, 6, JOURNAL_VERSION];
 const BUSY_TIMEOUT_MS = 2_000;
 
 export type OperationBinding = 'dispatching' | 'bound' | 'unknown';
@@ -63,6 +63,7 @@ export interface OperationJournalRecord {
   executionLifetime?: ExecutionLifetime;
   nativeCorrelated?: boolean;
   cancelRequested?: boolean;
+  stopReceiptState?: 'stopping' | 'stopped';
   nativeParams?: Record<string, unknown>;
   operationId: string;
   requestDigest: string;
@@ -80,6 +81,7 @@ interface OperationRow {
   execution_lifetime: string | null;
   native_correlated: number;
   cancel_requested: number;
+  stop_receipt_state: 'stopping' | 'stopped' | null;
   native_params: string | null;
   operation_id: string;
   request_digest: string;
@@ -139,6 +141,9 @@ function operationRecord(row: OperationRow): OperationJournalRecord {
     ...(rejection ? { launchRejection: rejection as LaunchRejection } : {}),
     ...(row.native_correlated ? { nativeCorrelated: true } : {}),
     ...(row.cancel_requested ? { cancelRequested: true } : {}),
+    ...(row.stop_receipt_state
+      ? { stopReceiptState: row.stop_receipt_state }
+      : {}),
     ...(nativeParams
       ? { nativeParams: nativeParams as Record<string, unknown> }
       : {}),
@@ -254,6 +259,7 @@ export class OperationJournal {
         execution_lifetime TEXT,
         native_correlated INTEGER NOT NULL DEFAULT 0,
         cancel_requested INTEGER NOT NULL DEFAULT 0,
+        stop_receipt_state TEXT CHECK (stop_receipt_state IN ('stopping', 'stopped')),
         native_params TEXT,
         launch_rejection TEXT,
         binding TEXT NOT NULL CHECK (binding IN ('dispatching', 'bound', 'unknown')),
@@ -313,12 +319,19 @@ export class OperationJournal {
         this.#db.exec(
           'ALTER TABLE operations ADD COLUMN launch_rejection TEXT',
         );
+        this.#db.exec(
+          "ALTER TABLE operations ADD COLUMN stop_receipt_state TEXT CHECK (stop_receipt_state IN ('stopping', 'stopped'))",
+        );
         this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
       });
-    } else if (version === 5) {
+    } else if (version === 5 || version === 6) {
       this.#transaction(() => {
+        if (version === 5)
+          this.#db.exec(
+            'ALTER TABLE operations ADD COLUMN launch_rejection TEXT',
+          );
         this.#db.exec(
-          'ALTER TABLE operations ADD COLUMN launch_rejection TEXT',
+          "ALTER TABLE operations ADD COLUMN stop_receipt_state TEXT CHECK (stop_receipt_state IN ('stopping', 'stopped'))",
         );
         this.#db.exec(`PRAGMA user_version = ${JOURNAL_VERSION}`);
       });
@@ -532,7 +545,7 @@ export class OperationJournal {
   get(operationId: string): OperationJournalRecord | undefined {
     const row = this.#db
       .prepare(
-        `SELECT operation_id, request_digest, owner_run_id, execution_lifetime, native_correlated, cancel_requested, native_params, launch_rejection, binding, run_id,
+        `SELECT operation_id, request_digest, owner_run_id, execution_lifetime, native_correlated, cancel_requested, stop_receipt_state, native_params, launch_rejection, binding, run_id,
                 async_dir, error, created_at, updated_at
            FROM operations
           WHERE operation_id = ?`,
@@ -620,6 +633,26 @@ export class OperationJournal {
         throw new Error('Native cancellation intent could not be persisted');
       return { created: !existing, record };
     });
+  }
+
+  markCancellationDelivered(
+    record: OperationJournalRecord,
+    nativeState: 'stopping' | 'stopped',
+  ): void {
+    const result = this.#db
+      .prepare(
+        'UPDATE operations SET stop_receipt_state = ? WHERE operation_id = ? AND request_digest = ? AND run_id = ? AND cancel_requested = 1',
+      )
+      .run(
+        nativeState,
+        record.operationId,
+        record.requestDigest,
+        record.runId ?? null,
+      );
+    if (result.changes !== 1)
+      throw new Error(
+        'Stop receipt does not match a cancelled bound operation',
+      );
   }
 
   getByRpcRequestId(requestId: string): OperationJournalRecord | undefined {

@@ -66,8 +66,8 @@ pi install npm:@alexeiled/pi-subagents-bridge
 Requirements:
 
 - Node `>= 22.19.0`
-- Pi `^1.0.2` with extension loading enabled; tested with Pi `1.0.2`
-- `pi-subagents >= 0.76.0 < 0.77.0`; tested with `0.76.0` for RPC `script` input and native terminal proofs
+- Pi `^1.0.2` with extension loading enabled; tested with Pi `1.0.4`
+- `pi-subagents >= 0.76.0 < 0.77.0`; tested with `0.76.1` for RPC `script` input and native terminal proofs
 
 The npm peer requirement does not verify which Pi extension is active. If a
 closed workflow status has no native proof field, the bridge reports an error
@@ -77,10 +77,11 @@ claiming that the worker exited.
 The bridge uses Pi's public extension event API. Future Pi releases still need
 validation if that API or the upstream subagent protocol changes.
 
-The operation journal migrates schemas 1–5 to schema 6, preserving identity,
-bindings, cancellation and native fields. Migration never creates rejection
-evidence for old rows. Bridge 0.5.2 and earlier cannot reopen schema 6; keep a
-compatible Bridge installed. Unknown versions are rejected before database changes.
+The operation journal migrates schemas 1–6 to schema 7, preserving identity,
+bindings, cancellation and native fields. Migration never creates rejection or
+stop-delivery evidence for old rows. Bridge 0.5.4 and earlier cannot reopen
+schema 7. Stop journal owners and back up the journal before upgrading; keep a
+compatible Bridge installed afterward. Unknown versions are rejected before database changes.
 
 ## Usage
 
@@ -184,18 +185,75 @@ Other native-correlated unbound operations return `unknown` and
 Uncorrelated legacy rows without rejection evidence reject cancellation instead.
 Neither response establishes no-start.
 It is not safe to infer non-start from a missing run ID or a timeout.
-A known run is stopped through native RPC; a stop request is not exit proof.
+With `cancellationDelivery: true` advertised by v2 ping, cancellation replies
+distinguish `cancellationDelivery: "pending"` (intent persisted, delivery unconfirmed)
+from `"delivered"` (an exact whole-run native stop receipt persisted).
+Exact never-started fences omit this field. Controllers must retry pending
+delivery with the same operation, digest and owner; generic success is not a
+delivered stop. Retry reconciles late native bindings, and failed stops remain
+retryable. Concurrent calls coalesce within one registration. Persisted delivery
+receipts prevent another stop on replay or restart; neither receipts nor
+`nativeState` prove retirement. A lost receipt or failed persistence can cause
+redelivery to the same immutable run. Bridge does not scan all journals or run
+a background cancellation loop; the caller owns retry cadence.
 Controllers that explicitly quarantine an execution target can use the identity-bound
 `cancellationRequested: true` acknowledgement as a no-redispatch fence, never as
 old-worker termination. If native stop fails after the fence commits, the reply
 keeps that acknowledgement with `state: "unknown"`, `neverStarted: false`, and
-an error diagnostic. An unknown old worker may still run in its old target.
+an error diagnostic with `upstreamCode` when available. An unknown old worker
+may still run in its old target.
+
+In pi-subagents 0.76.1, RPC stop still rejects paused and queued runs with
+`invalid_state`, despite the model-facing paused-stop fix. Cross-host workflow
+stop also needs the original live controller and active session. Bridge reports
+these refusals as pending delivery; it does not call a different protocol,
+resume the worker, or manufacture terminal proof. Preserve ownership until the
+owning controller obtains native terminal evidence.
 
 Reconcile native `processTerminalProof` (also exposed as `processTerminal`)
 before starting replacement work. A workflow uses native `workflowTerminalProof`:
 dispatch must be closed and each child observed or explicitly not-started.
 Pending, unknown, malformed, or absent proofs do not establish completion.
 The workflow's hosting Pi process can remain alive.
+
+### Advisory activity
+
+V2 ping advertises `advisoryObservation: { version: 1 }`. Status, result and
+adopt may return the following separate, display-only field:
+
+```typescript
+advisoryObservation: {
+  version: 1;
+  source: 'pi-subagents.async-status-snapshot';
+  runId: string;
+  generatedAt: number;
+  activity?: {
+    state?: string;
+    currentTool?: string;
+    lastActivityAt?: number;
+    currentToolStartedAt?: number;
+    turnCount?: number;
+    toolCount?: number;
+  };
+  omitted: { runs: number; children: number; byteLimitExceeded: boolean };
+}
+```
+
+Bridge accepts only one exact root-run match in native snapshot v1 (at most
+20 roots). Native RPC filters its snapshot to the active session; the snapshot
+itself has no session ID. Its generation time must fall within the status
+request/receipt window and be no more than 30 seconds old. Counters and timestamps
+must be nonnegative safe integers, activity times cannot exceed generation time,
+and text is limited to 160 characters without control/format characters.
+Missing, stale, foreign, ambiguous or malformed observations stay absent.
+Omission flags are preserved; missing data is not zero activity.
+
+Workflow step IDs may be display keys rather than child run IDs, so Bridge does
+not infer child activity from their position, name or key. No usage, cost,
+failure or expiry fields are synthesized. Keep this advisory field separate
+from verified progress, ownership, retirement and execution-lifetime decisions.
+
+### Diagnostic guidance
 
 When native `diagnosticGuidance` advertises durable, idempotent `follow_up`
 guidance for confirmed tool failures, `diagnoseOperation` accepts
@@ -230,9 +288,11 @@ Replaying the rejected identity never dispatches, including after restart.
 Spawn failures retain `error.code: "upstream_error"` and add `upstreamCode`
 when a structured upstream code is available.
 
-Install pi-subagents 0.76.x before updating Bridge, then reload Pi.
+Install pi-subagents 0.76.x before updating Bridge, then restart Pi after updating
+already-loaded packages. A `/reload` is enough for local Bridge source edits, not
+for mixing newly installed upstream packages with modules already loaded in Pi.
 Back up the journal while its owners are stopped before the schema upgrade;
-do not downgrade over schema 6. The fix applies to newly captured rejection
+do not downgrade over schema 7. The fix applies to newly captured rejection
 evidence only. **An old unresolved launch is not repaired by this update.**
 An old error string, missing run ID, dead controller PID, clean worktree, or
 elapsed time does not prove that dispatch never happened.

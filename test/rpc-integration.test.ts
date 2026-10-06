@@ -155,4 +155,6 @@ test('isolated Pi and released subagents complete both Bridge RPC paths', {
   assert.match(report.task.result, /BRIDGE_SMOKE_OK/);
   assert.equal(childModelRequests, 2);
   assert.equal(report.plan.proof.children.length, 1);
+  assert.equal(report.plan.advisory.runId, report.plan.runId);
+  assert.equal(report.plan.advisory.version, 1);
 });

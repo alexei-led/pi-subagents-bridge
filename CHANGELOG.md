@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.5 - 2026-10-06
+
+- Distinguish pending cancellation intent from confirmed native stop delivery. Retry pending operations with the same identity after late binding or failure; persist exact delivery receipts to avoid repeated stops after restart. Delivery never proves worker exit.
+- Expose bounded, versioned advisory activity for exact native root-run matches. Stale, foreign or malformed snapshots stay absent; activity is not progress, usage, expiry or ownership proof.
+- Start session timers only at session start and dispose terminal-proof subscriptions on shutdown/reload, retaining in-flight launch recovery.
+- Validate against Pi 1.0.4 and pi-subagents 0.76.1. Native RPC still refuses paused/queued stops; Bridge reports pending delivery and the upstream error without changing protocols.
+
+### Upgrade
+
+Stop journal owners and back up the journal before upgrading to schema 7.
+Older Bridge versions cannot reopen it. Restart Pi after updating already-loaded
+upstream packages. Controllers must retry pending cancellation instead of
+treating generic success as stop delivery. Existing unknown launches remain fenced.
+
+[Changes since v0.5.4](https://github.com/alexei-led/pi-subagents-bridge/compare/v0.5.4...v0.5.5)
+
 ## 0.5.4 - 2026-10-05
 
 - Persist native RPC request IDs before dispatch. Recover the same child after reply loss or restart through exact native tool-call lookup, without launching another worker.

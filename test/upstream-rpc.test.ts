@@ -272,6 +272,81 @@ for (const lifetime of [
   });
 }
 
+for (const state of ['paused', 'queued']) {
+  test(`released RPC refuses ${state} stop without claiming cancellation delivery or retirement`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-paused-rpc-'));
+    onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
+    const bus = new Bus();
+    const sessionManager = SessionManager.inMemory(root);
+    const asyncDir = path.join(root, 'async', 'native-paused');
+    fs.mkdirSync(asyncDir, { recursive: true });
+    const statusPath = path.join(asyncDir, 'status.json');
+    fs.writeFileSync(
+      statusPath,
+      JSON.stringify({
+        runId: 'native-paused',
+        sessionId: sessionManager.getSessionId(),
+        mode: 'single',
+        state,
+        startedAt: Date.now(),
+        steps: [],
+      }),
+    );
+    const before = fs.readFileSync(statusPath, 'utf8');
+    const native = registerSubagentRpcBridge({
+      events: bus,
+      getContext: () =>
+        ({ cwd: root, sessionManager }) as unknown as ExtensionContext,
+      asyncDirRoot: path.join(root, 'async'),
+      resultsDir: path.join(root, 'results'),
+      execute: async () => {
+        throw new Error('stop must not switch to tool execution');
+      },
+    });
+    onTestFinished(() => native.dispose());
+    const journal = new OperationJournal(path.join(root, 'operations.sqlite'));
+    journal.begin(
+      'op',
+      'sha256:op',
+      'owner',
+      { mode: 'unbounded' },
+      { rpcRequestId: 'request' },
+    );
+    journal.bind('op', 'sha256:op', 'native-paused', asyncDir);
+    const bridge = registerPlanExecRpc(bus, { timeoutMs: 1000, journal });
+    onTestFinished(() => bridge.dispose());
+    const reply = await request(
+      bus,
+      'plan-exec:bridge:v2:request',
+      'plan-exec:bridge:v2:reply:',
+      {
+        version: 2,
+        method: 'cancelOperation',
+        operationId: 'op',
+        owner: {
+          kind: 'pi-plan-exec',
+          runId: 'owner',
+          key: 'op',
+          requestDigest: 'sha256:op',
+        },
+      },
+    );
+    assert.ok(isRecord(reply) && isRecord(reply.data), JSON.stringify(reply));
+    assert.equal(reply.success, true);
+    assert.equal(reply.data.cancellationDelivery, 'pending');
+    assert.equal(reply.data.upstreamCode, 'invalid_state');
+    assert.match(
+      String(reply.data.error),
+      /stop only supports running async runs/,
+    );
+    assert.equal(reply.data.neverStarted, false);
+    assert.equal(reply.data.processTerminalProof, undefined);
+    assert.equal(reply.data.workflowTerminalProof, undefined);
+    assert.equal(journal.get('op')?.cancelRequested, true);
+    assert.equal(fs.readFileSync(statusPath, 'utf8'), before);
+  });
+}
+
 function digest(value: unknown): string {
   const canonical = (value: unknown): string => {
     if (isRecord(value))

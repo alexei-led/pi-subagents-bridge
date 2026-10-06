@@ -1160,5 +1160,4 @@ export default function bridgeExtension(pi: ExtensionAPI): void {
     registration = undefined;
     sessionId = undefined;
   });
-  register();
 }

@@ -48,6 +48,8 @@ test('plan-exec v2 exposes durable lookup and native terminal proof', async () =
         workflowScriptSpawn: true,
         durableOperationLookup: { version: 1 },
         prelaunchRejection: { version: 1 },
+        cancellationDelivery: true,
+        advisoryObservation: { version: 1 },
         processTerminalProof: { version: 1 },
       },
       methods: [

@@ -8,7 +8,11 @@ npm run test:all
 pi install /absolute/path/to/pi-subagents-bridge
 ```
 
-Reload Pi after changing the extension:
+Reload Pi after local Bridge source changes. Restart Pi after updating an
+already-loaded Pi or pi-subagents package; `/reload` can retain mixed upstream
+module versions.
+
+For local edits:
 
 ```text
 /reload
@@ -27,7 +31,11 @@ npm run publish:dry
 
 `npm run test:all` is the local pre-release gate.
 
-`test/upstream-rpc.test.ts` loads the pinned pi-subagents RPC validator directly.
+The pinned development stack is Pi 1.0.4 and pi-subagents 0.76.1.
+`test/upstream-rpc.test.ts` loads the pinned pi-subagents RPC validator directly,
+including its paused/queued stop refusal. Cancellation-delivery tests cover
+late binding, retries and durable receipts; session-lifecycle tests cover
+factory loading without a session and repeated start/shutdown.
 `test/rpc-integration.test.ts` starts local Pi with Bridge and pi-subagents in
 isolated HOME, agent, workspace, and temporary directories. It uses a local HTTP
 model fixture, not credentials or globally installed extensions, and completes

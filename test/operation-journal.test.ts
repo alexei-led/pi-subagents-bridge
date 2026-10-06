@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { onTestFinished, test } from 'vitest';
 import { OperationJournal } from '../src/operation-journal.js';
 
-for (const version of [4, 5]) {
+for (const version of [4, 5, 6]) {
   test(`operation journal preserves v${version} records and newer fields`, () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-bridge-newer-'));
     const journalPath = path.join(root, 'operations.sqlite');
@@ -32,9 +32,11 @@ for (const version of [4, 5]) {
     db.exec(`
       UPDATE operations SET execution_lifetime = '{"mode":"unbounded"}',
         native_correlated = 1, cancel_requested = 1;
-      ALTER TABLE operations DROP COLUMN launch_rejection;
+      ALTER TABLE operations DROP COLUMN stop_receipt_state;
       PRAGMA user_version = ${version};
     `);
+    if (version < 6)
+      db.exec('ALTER TABLE operations DROP COLUMN launch_rejection;');
     if (version === 4) {
       // Schema 4 predates native_params; reopening migrates it to the current schema.
       db.exec('ALTER TABLE operations DROP COLUMN native_params;');
@@ -52,7 +54,7 @@ for (const version of [4, 5]) {
       journal.ownsAcceptedRun('accepted-run', 'instance-a', 'session-a'),
       true,
     );
-    assert.equal(db.prepare('PRAGMA user_version').get()?.user_version, 6);
+    assert.equal(db.prepare('PRAGMA user_version').get()?.user_version, 7);
     const row = db
       .prepare("SELECT * FROM operations WHERE operation_id = 'existing'")
       .get();
@@ -60,9 +62,11 @@ for (const version of [4, 5]) {
     assert.equal(row.execution_lifetime, '{"mode":"unbounded"}');
     assert.equal(row.native_correlated, 1);
     assert.equal(row.cancel_requested, 1);
+    assert.equal(row.stop_receipt_state, null);
+    assert.equal(journal.get('existing')?.stopReceiptState, undefined);
     assert.equal(
       row.native_params,
-      version === 5 ? '{"task":"preserved"}' : null,
+      version >= 5 ? '{"task":"preserved"}' : null,
     );
   });
 }
@@ -73,14 +77,14 @@ test('operation journal rejects unknown versions without modifying the database'
   onTestFinished(() => fs.rmSync(root, { recursive: true, force: true }));
   const db = new DatabaseSync(journalPath);
   db.exec(
-    "CREATE TABLE future_data (value TEXT); INSERT INTO future_data VALUES ('preserved'); PRAGMA user_version = 7;",
+    "CREATE TABLE future_data (value TEXT); INSERT INTO future_data VALUES ('preserved'); PRAGMA user_version = 8;",
   );
   db.close();
   const before = fs.readFileSync(journalPath);
 
   assert.throws(
     () => new OperationJournal(journalPath),
-    /Unsupported operation journal version '7'.*Update.*extension/,
+    /Unsupported operation journal version '8'.*Update.*extension/,
   );
   assert.deepEqual(fs.readFileSync(journalPath), before);
   assert.equal(fs.existsSync(`${journalPath}-wal`), false);

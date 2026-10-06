@@ -86,11 +86,27 @@ export default function smoke(pi: ExtensionAPI): void {
         assert.ok(isRecord(replay.data));
         assert.equal(replay.data.runId, runId);
         let terminal: Record<string, unknown> | undefined;
+        let advisory: Record<string, unknown> | undefined;
+        const capabilityReply = await plan('ping', {});
+        assert.ok(
+          isRecord(capabilityReply.data) &&
+            isRecord(capabilityReply.data.capabilities),
+        );
+        assert.equal(
+          capabilityReply.data.capabilities.cancellationDelivery,
+          true,
+        );
+        assert.deepEqual(
+          capabilityReply.data.capabilities.advisoryObservation,
+          { version: 1 },
+        );
         const deadline = Date.now() + 40_000;
         while (Date.now() < deadline) {
           const status = await plan('status', { params: { runId } });
           assert.equal(status.success, true, JSON.stringify(status));
           assert.ok(isRecord(status.data));
+          if (isRecord(status.data.advisoryObservation))
+            advisory = status.data.advisoryObservation;
           if (
             isRecord(status.data.workflowTerminalProof) &&
             status.data.workflowTerminalProof.state === 'observed'
@@ -102,11 +118,16 @@ export default function smoke(pi: ExtensionAPI): void {
         }
         assert.ok(terminal, 'Missing native workflow terminal proof');
         assert.match(String(terminal.text), /completed/i);
+        assert.ok(advisory, 'Missing exact-root native advisory snapshot');
+        assert.equal(advisory.version, 1);
+        assert.equal(advisory.runId, runId);
+        assert.equal(advisory.source, 'pi-subagents.async-status-snapshot');
         report.plan = {
           runId,
           lookup: 'found',
           replay: 'same-run',
           proof: terminal.workflowTerminalProof,
+          advisory,
         };
 
         const completion = new Promise<unknown>((resolve, reject) => {

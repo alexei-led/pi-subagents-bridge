@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import {
+  type AdvisoryObservation,
+  advisoryObservation,
+} from './advisory-observation.js';
+import {
   type ExecutionLifetime,
   parseExecutionLifetime,
 } from './execution-lifetime.js';
@@ -96,6 +100,7 @@ interface RunRequest {
 
 interface Observation {
   runId: string;
+  advisoryObservation?: AdvisoryObservation;
   observed?: true;
   state?: string;
   asyncDir?: string;
@@ -579,6 +584,7 @@ function normalizeObservation(
   upstream: unknown,
   observed = false,
   includeProcessTerminal = false,
+  requestedAt?: number,
 ): Observation {
   const text = isRecord(upstream) ? nonEmptyString(upstream.text) : undefined;
   const state = text
@@ -610,8 +616,18 @@ function normalizeObservation(
     if (processTerminal) lifecycleStatus.processTerminal = processTerminal;
     else delete lifecycleStatus.processTerminal;
   }
+  const advisory =
+    requestedAt !== undefined && isRecord(upstream)
+      ? advisoryObservation(
+          upstream.asyncSnapshot,
+          request.runId,
+          requestedAt,
+          Date.now(),
+        )
+      : undefined;
   return {
     runId: request.runId,
+    ...(advisory ? { advisoryObservation: advisory } : {}),
     ...(observed ? { observed: true } : {}),
     ...(state ? { state } : {}),
     ...(asyncDir ? { asyncDir } : {}),
@@ -912,6 +928,10 @@ export function registerPlanExecRpc(
 
   const transientControllers = new Set<AbortController>();
   const nativeLaunches = new Set<string>();
+  const cancellationDeliveries = new Map<
+    string,
+    Promise<'stopping' | 'stopped'>
+  >();
   let disposed = false;
 
   const nativeRequest = async (
@@ -939,7 +959,7 @@ export function registerPlanExecRpc(
   const subscribeToTerminalProofs = (
     upstream: Record<string, unknown> | undefined,
   ): void => {
-    if (proofUnsubscribe) return;
+    if (disposed || proofUnsubscribe) return;
     const eventRecord = isRecord(upstream?.events)
       ? upstream.events
       : isRecord(upstream?.capabilities) &&
@@ -951,7 +971,7 @@ export function registerPlanExecRpc(
       : undefined;
     if (!event) return;
     const unsubscribe = events.on(event, (raw: unknown) => {
-      if (!isRecord(raw)) return;
+      if (disposed || !isRecord(raw)) return;
       const runId = nonEmptyString(raw.runId);
       if (!runId) return;
       const proof = attestUpstreamTerminalProof(raw, runId);
@@ -974,6 +994,45 @@ export function registerPlanExecRpc(
       );
     }
     subscribeToTerminalProofs(upstream);
+  };
+
+  const deliverCancellation = (
+    record: OperationJournalRecord,
+  ): Promise<'stopping' | 'stopped'> => {
+    const pending = cancellationDeliveries.get(record.operationId);
+    if (pending !== undefined) return pending;
+    if (record.stopReceiptState)
+      return Promise.resolve(record.stopReceiptState);
+    const delivery = (async (): Promise<'stopping' | 'stopped'> => {
+      if (
+        disposed ||
+        !state.journal ||
+        !record.cancelRequested ||
+        !record.runId
+      )
+        throw new Error(
+          'Cancellation requires an active registration and exact bound operation',
+        );
+      // Never turn a generic successful RPC envelope into a delivery receipt.
+      const result = await nativeRequest('stop', {
+        id: record.runId,
+        ...(record.asyncDir ? { dir: record.asyncDir } : {}),
+      });
+      if (
+        !isRecord(result) ||
+        result.runId !== record.runId ||
+        result.childId !== undefined ||
+        (result.state !== 'stopping' && result.state !== 'stopped') ||
+        (result.asyncDir !== undefined &&
+          record.asyncDir !== undefined &&
+          result.asyncDir !== record.asyncDir)
+      )
+        throw new Error('Native stop receipt does not match the bound run');
+      state.journal.markCancellationDelivered(record, result.state);
+      return result.state;
+    })().finally(() => cancellationDeliveries.delete(record.operationId));
+    cancellationDeliveries.set(record.operationId, delivery);
+    return delivery;
   };
 
   const recoverNativeBinding = async (
@@ -1429,6 +1488,7 @@ export function registerPlanExecRpc(
             version: 2,
             protocol: 'plan-exec-bridge',
             capabilities: {
+              advisoryObservation: { version: 1 },
               workflowScriptSpawn: capabilities?.asyncSpawn === true,
               ...(asyncRuntime && state.journal
                 ? { singleAgentSpawn: true }
@@ -1445,7 +1505,12 @@ export function registerPlanExecRpc(
                   }
                 : {}),
               durableOperationLookup: state.journal ? { version: 1 } : false,
-              ...(state.journal ? { prelaunchRejection: { version: 1 } } : {}),
+              ...(state.journal
+                ? {
+                    prelaunchRejection: { version: 1 },
+                    cancellationDelivery: true,
+                  }
+                : {}),
               processTerminalProof:
                 isRecord(terminalCapability) && terminalCapability.version === 1
                   ? { version: 1 }
@@ -1685,6 +1750,9 @@ export function registerPlanExecRpc(
                 created || cancelled.launchRejection ? 'cancelled' : 'unknown',
               cancellationRequested: true,
               neverStarted: created || Boolean(cancelled.launchRejection),
+              ...(!created && !cancelled.launchRejection
+                ? { cancellationDelivery: 'pending' }
+                : {}),
               ...(cancelled.launchRejection
                 ? { launchRejection: cancelled.launchRejection }
                 : {}),
@@ -1692,14 +1760,7 @@ export function registerPlanExecRpc(
             },
           };
         }
-        const result = await nativeRequest('stop', {
-          id: cancelled.runId,
-          ...(cancelled.asyncDir ? { dir: cancelled.asyncDir } : {}),
-        });
-        const stopRequest: RunRequest = {
-          runId: cancelled.runId,
-          ...(cancelled.asyncDir ? { asyncDir: cancelled.asyncDir } : {}),
-        };
+        const nativeState = await deliverCancellation(cancelled);
         return {
           success: true,
           data: {
@@ -1710,7 +1771,8 @@ export function registerPlanExecRpc(
             cancellationRequested: true,
             neverStarted: false,
             ...(cancelled.asyncDir ? { asyncDir: cancelled.asyncDir } : {}),
-            nativeState: normalizeStop(stopRequest, result).state,
+            cancellationDelivery: 'delivered',
+            nativeState,
             replaySafe: false,
           },
         };
@@ -1730,6 +1792,10 @@ export function registerPlanExecRpc(
               neverStarted: false,
               replaySafe: false,
               error: message,
+              cancellationDelivery: 'pending',
+              ...(error instanceof UpstreamRpcError && error.code
+                ? { upstreamCode: error.code }
+                : {}),
             },
           };
         }
@@ -1910,6 +1976,7 @@ export function registerPlanExecRpc(
           operation.requestDigest,
           operation.ownerRunId,
         );
+      const requestedAt = Date.now();
       const upstream = await requestSubagents(
         events,
         'status',
@@ -1931,6 +1998,7 @@ export function registerPlanExecRpc(
         upstream,
         method === 'adopt',
         protocolVersion === 2,
+        protocolVersion === 2 ? requestedAt : undefined,
       );
       const proof =
         observed.processTerminalProof ??
@@ -2048,6 +2116,8 @@ export function registerPlanExecRpc(
       if (disposed) return;
       disposed = true;
       if (bindingReconcileTimer) clearInterval(bindingReconcileTimer);
+      proofUnsubscribe?.();
+      proofUnsubscribe = undefined;
       for (const unsubscribe of unsubscribes) unsubscribe?.();
       if (state.registration === registration) {
         delete state.registration;

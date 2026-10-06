@@ -1,6 +1,6 @@
 {
   "name": "@alexeiled/pi-subagents-bridge",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Protocol adapter that lets @tintinweb/pi-tasks TaskExecute spawn nicobailon/pi-subagents.",
   "keywords": [
     "bridge",
@@ -25,7 +25,8 @@
     "src/plan-exec-rpc.ts",
     "src/workflow-spawn.ts",
     "src/execution-lifetime.ts",
-    "src/native-proof.ts"
+    "src/native-proof.ts",
+    "src/advisory-observation.ts"
   ],
   "type": "module",
   "main": "./src/index.ts",
@@ -47,11 +48,11 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.14",
-    "@earendil-works/pi-coding-agent": "^1.0.2",
+    "@earendil-works/pi-coding-agent": "1.0.4",
     "@tintinweb/pi-tasks": "0.9.0",
     "@types/node": "^24.10.0",
     "jiti": "^2.7.0",
-    "pi-subagents": "0.76.0",
+    "pi-subagents": "0.76.1",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1"
   },
